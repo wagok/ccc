@@ -660,13 +660,112 @@ func runClaude(prompt string) (string, error) {
 	return strings.TrimSpace(output), err
 }
 
-// Setup
+// Setup - complete setup process
+
+func installService() error {
+	home, _ := os.UserHomeDir()
+
+	// Detect OS and install appropriate service
+	if _, err := os.Stat("/Library"); err == nil {
+		// macOS - use launchd
+		return installLaunchdService(home)
+	}
+	// Linux - use systemd
+	return installSystemdService(home)
+}
+
+func installLaunchdService(home string) error {
+	plistDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(plistDir, 0755); err != nil {
+		return fmt.Errorf("failed to create LaunchAgents dir: %w", err)
+	}
+
+	plistPath := filepath.Join(plistDir, "com.ccc.plist")
+	logPath := filepath.Join(home, ".ccc.log")
+
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ccc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>%s</string>
+        <string>listen</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>%s</string>
+    <key>StandardErrorPath</key>
+    <string>%s</string>
+</dict>
+</plist>
+`, cccPath, logPath, logPath)
+
+	if err := os.WriteFile(plistPath, []byte(plist), 0644); err != nil {
+		return fmt.Errorf("failed to write plist: %w", err)
+	}
+
+	// Unload if exists, then load
+	exec.Command("launchctl", "unload", plistPath).Run()
+	if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
+		return fmt.Errorf("failed to load service: %w", err)
+	}
+
+	fmt.Println("✅ Service installed and started (launchd)")
+	return nil
+}
+
+func installSystemdService(home string) error {
+	serviceDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(serviceDir, 0755); err != nil {
+		return fmt.Errorf("failed to create systemd dir: %w", err)
+	}
+
+	servicePath := filepath.Join(serviceDir, "ccc.service")
+	service := fmt.Sprintf(`[Unit]
+Description=Claude Code Companion
+After=network.target
+
+[Service]
+ExecStart=%s listen
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+`, cccPath)
+
+	if err := os.WriteFile(servicePath, []byte(service), 0644); err != nil {
+		return fmt.Errorf("failed to write service file: %w", err)
+	}
+
+	// Reload and start
+	exec.Command("systemctl", "--user", "daemon-reload").Run()
+	exec.Command("systemctl", "--user", "enable", "ccc").Run()
+	if err := exec.Command("systemctl", "--user", "start", "ccc").Run(); err != nil {
+		return fmt.Errorf("failed to start service: %w", err)
+	}
+
+	fmt.Println("✅ Service installed and started (systemd)")
+	return nil
+}
 
 func setup(botToken string) error {
+	fmt.Println("🚀 Claude Code Companion Setup")
+	fmt.Println("==============================")
+	fmt.Println()
+
 	config := &Config{BotToken: botToken, Sessions: make(map[string]int64)}
 
-	fmt.Println("Bot token saved. Now send any message to your bot in Telegram...")
-	fmt.Println("Waiting for your message...")
+	// Step 1: Get chat ID
+	fmt.Println("Step 1/4: Connecting to Telegram...")
+	fmt.Println("📱 Send any message to your bot in Telegram")
+	fmt.Println("   Waiting...")
 
 	offset := 0
 	for {
@@ -694,19 +793,92 @@ func setup(botToken string) error {
 				if err := saveConfig(config); err != nil {
 					return fmt.Errorf("failed to save config: %w", err)
 				}
-				fmt.Printf("Got your chat ID: %d (from @%s)\n", config.ChatID, update.Message.From.Username)
-				fmt.Println("Setup complete!")
-				fmt.Println("\nNext steps:")
-				fmt.Println("1. Create a group and enable Topics (group settings)")
-				fmt.Println("2. Add the bot to the group as admin")
-				fmt.Println("3. Send a message in the group")
-				fmt.Println("4. Run: ccc setgroup")
-				return nil
+				fmt.Printf("✅ Connected! (User: @%s)\n\n", update.Message.From.Username)
+				goto step2
 			}
 		}
 
 		time.Sleep(time.Second)
 	}
+
+step2:
+	// Step 2: Group setup (optional)
+	fmt.Println("Step 2/4: Group setup (optional)")
+	fmt.Println("   For session topics, create a Telegram group with Topics enabled,")
+	fmt.Println("   add your bot as admin, and send a message there.")
+	fmt.Println("   Or press Enter to skip...")
+
+	// Non-blocking check for group message with timeout
+	fmt.Println("   Waiting 30 seconds for group message...")
+
+	client := &http.Client{Timeout: 35 * time.Second}
+	deadline := time.Now().Add(30 * time.Second)
+
+	for time.Now().Before(deadline) {
+		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=5", config.BotToken, offset)
+		resp, err := client.Get(reqURL)
+		if err != nil {
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var updates TelegramUpdate
+		json.Unmarshal(body, &updates)
+
+		for _, update := range updates.Result {
+			offset = update.UpdateID + 1
+			chat := update.Message.Chat
+			if chat.Type == "supergroup" {
+				config.GroupID = chat.ID
+				saveConfig(config)
+				fmt.Printf("✅ Group configured!\n\n")
+				goto step3
+			}
+		}
+	}
+	fmt.Println("⏭️  Skipped (you can run 'ccc setgroup' later)")
+
+step3:
+	// Step 3: Install Claude hook
+	fmt.Println("Step 3/4: Installing Claude hook...")
+	if err := installHook(); err != nil {
+		fmt.Printf("⚠️  Hook installation failed: %v\n", err)
+		fmt.Println("   You can install it later with: ccc install")
+	} else {
+		fmt.Println()
+	}
+
+	// Step 4: Install service
+	fmt.Println("Step 4/4: Installing background service...")
+	if err := installService(); err != nil {
+		fmt.Printf("⚠️  Service installation failed: %v\n", err)
+		fmt.Println("   You can start manually with: ccc listen")
+	} else {
+		fmt.Println()
+	}
+
+	// Done!
+	fmt.Println("==============================")
+	fmt.Println("✅ Setup complete!")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  ccc           Start Claude Code in current directory")
+	fmt.Println("  ccc -c        Continue previous session")
+	fmt.Println()
+	if config.GroupID != 0 {
+		fmt.Println("Telegram commands (in your group):")
+		fmt.Println("  /new <name>   Create new session")
+		fmt.Println("  /list         List sessions")
+	} else {
+		fmt.Println("To enable Telegram session topics:")
+		fmt.Println("  1. Create a group with Topics enabled")
+		fmt.Println("  2. Add bot as admin")
+		fmt.Println("  3. Run: ccc setgroup")
+	}
+
+	return nil
 }
 
 func setGroup(config *Config) error {
@@ -1040,10 +1212,10 @@ USAGE:
     ccc <message>           Send notification (if away mode is on)
 
 COMMANDS:
-    setup <token>           Setup bot with Telegram bot token
-    setgroup                Configure Telegram group for topics
-    listen                  Start the Telegram bot listener
-    install                 Install Claude hook for notifications
+    setup <token>           Complete setup (bot, hook, service - all in one!)
+    setgroup                Configure Telegram group for topics (if skipped during setup)
+    listen                  Start the Telegram bot listener manually
+    install                 Install Claude hook manually
     run                     Run Claude directly (used by tmux sessions)
     hook                    Handle Claude hook (internal)
 
