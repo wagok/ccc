@@ -80,42 +80,28 @@ ccc --version
 2. Send `/newbot` and follow the prompts
 3. Save the bot token (looks like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
 
-### 2. Initial Setup
+### 2. Run Setup
 
 ```bash
 ccc setup YOUR_BOT_TOKEN
-# Then send any message to your bot in Telegram
 ```
 
-### 3. Configure Group with Topics
+This single command does everything:
+- Connects to Telegram (send any message to your bot when prompted)
+- Optionally configures a group with topics for multiple sessions
+- Installs the Claude hook for notifications
+- Installs and starts the background service
 
-For the best experience, create a Telegram group where each session gets its own topic:
-
-1. Create a new Telegram group
-2. Go to group settings → Enable "Topics"
-3. Add your bot to the group and make it admin
-4. Run:
+### 3. Start Using
 
 ```bash
-ccc setgroup
-# Send a message in the group to complete setup
+cd ~/myproject
+ccc
 ```
 
-### 4. Install Claude Hook
+That's it! You're ready to control Claude Code from Telegram.
 
-This enables Claude to send responses back to Telegram:
-
-```bash
-ccc install
-```
-
-### 5. Start the Bot Listener
-
-```bash
-ccc listen
-```
-
-> **Tip**: Run this as a service for 24/7 availability (see [Service Setup](#service-setup))
+> **Optional**: For session topics, create a Telegram group with Topics enabled, add your bot as admin, and run `ccc setgroup`
 
 ## Usage
 
@@ -165,6 +151,8 @@ ccc
 ```
 
 ## Service Setup
+
+> **Note**: `ccc setup` automatically installs and starts the service. The info below is only needed for manual setup or troubleshooting.
 
 For the bot to run continuously, set it up as a system service.
 
