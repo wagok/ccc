@@ -118,26 +118,65 @@ func telegramAPI(config *Config, method string, params url.Values) (*TelegramRes
 
 func sendMessage(config *Config, chatID int64, threadID int64, text string) error {
 	const maxLen = 4000
-	if len(text) > maxLen {
-		text = text[:maxLen] + "\n... (truncated)"
-	}
 
-	params := url.Values{
-		"chat_id": {fmt.Sprintf("%d", chatID)},
-		"text":    {text},
-	}
-	if threadID > 0 {
-		params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
-	}
+	// Split long messages
+	messages := splitMessage(text, maxLen)
 
-	result, err := telegramAPI(config, "sendMessage", params)
-	if err != nil {
-		return err
-	}
-	if !result.OK {
-		return fmt.Errorf("telegram error: %s", result.Description)
+	for _, msg := range messages {
+		params := url.Values{
+			"chat_id": {fmt.Sprintf("%d", chatID)},
+			"text":    {msg},
+		}
+		if threadID > 0 {
+			params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
+		}
+
+		result, err := telegramAPI(config, "sendMessage", params)
+		if err != nil {
+			return err
+		}
+		if !result.OK {
+			return fmt.Errorf("telegram error: %s", result.Description)
+		}
+
+		// Small delay between messages to maintain order
+		if len(messages) > 1 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 	return nil
+}
+
+func splitMessage(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
+	}
+
+	var messages []string
+	remaining := text
+
+	for len(remaining) > 0 {
+		if len(remaining) <= maxLen {
+			messages = append(messages, remaining)
+			break
+		}
+
+		// Find a good split point (newline or space)
+		splitAt := maxLen
+
+		// Try to split at a newline first
+		if idx := strings.LastIndex(remaining[:maxLen], "\n"); idx > maxLen/2 {
+			splitAt = idx + 1
+		} else if idx := strings.LastIndex(remaining[:maxLen], " "); idx > maxLen/2 {
+			// Fall back to space
+			splitAt = idx + 1
+		}
+
+		messages = append(messages, strings.TrimRight(remaining[:splitAt], " \n"))
+		remaining = remaining[splitAt:]
+	}
+
+	return messages
 }
 
 func createForumTopic(config *Config, name string) (int64, error) {
