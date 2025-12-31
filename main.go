@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,12 +46,23 @@ type TelegramMessage struct {
 	ReplyToMessage *TelegramMessage `json:"reply_to_message,omitempty"`
 }
 
+// CallbackQuery represents a Telegram callback query (button press)
+type CallbackQuery struct {
+	ID   string `json:"id"`
+	From struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
+	Message *TelegramMessage `json:"message"`
+	Data    string           `json:"data"`
+}
+
 // TelegramUpdate represents an update from Telegram
 type TelegramUpdate struct {
 	OK     bool `json:"ok"`
 	Result []struct {
-		UpdateID int             `json:"update_id"`
-		Message  TelegramMessage `json:"message"`
+		UpdateID      int             `json:"update_id"`
+		Message       TelegramMessage `json:"message"`
+		CallbackQuery *CallbackQuery  `json:"callback_query"`
 	} `json:"result"`
 }
 
@@ -72,6 +84,19 @@ type HookData struct {
 	Cwd            string `json:"cwd"`
 	TranscriptPath string `json:"transcript_path"`
 	SessionID      string `json:"session_id"`
+	HookEventName  string `json:"hook_event_name"`
+	ToolName       string `json:"tool_name"`
+	ToolInput      struct {
+		Questions []struct {
+			Question    string `json:"question"`
+			Header      string `json:"header"`
+			MultiSelect bool   `json:"multiSelect"`
+			Options     []struct {
+				Label       string `json:"label"`
+				Description string `json:"description"`
+			} `json:"options"`
+		} `json:"questions"`
+	} `json:"tool_input"`
 }
 
 func getConfigPath() string {
@@ -145,6 +170,44 @@ func sendMessage(config *Config, chatID int64, threadID int64, text string) erro
 		}
 	}
 	return nil
+}
+
+// InlineKeyboardButton represents a Telegram inline keyboard button
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+func sendMessageWithKeyboard(config *Config, chatID int64, threadID int64, text string, buttons [][]InlineKeyboardButton) error {
+	keyboard := map[string]interface{}{
+		"inline_keyboard": buttons,
+	}
+	keyboardJSON, _ := json.Marshal(keyboard)
+
+	params := url.Values{
+		"chat_id":      {fmt.Sprintf("%d", chatID)},
+		"text":         {text},
+		"reply_markup": {string(keyboardJSON)},
+	}
+	if threadID > 0 {
+		params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
+	}
+
+	result, err := telegramAPI(config, "sendMessage", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("telegram error: %s", result.Description)
+	}
+	return nil
+}
+
+func answerCallbackQuery(config *Config, callbackID string) {
+	params := url.Values{
+		"callback_query_id": {callbackID},
+	}
+	telegramAPI(config, "answerCallbackQuery", params)
 }
 
 func splitMessage(text string, maxLen int) []string {
@@ -506,6 +569,61 @@ func handleHook() error {
 	}
 
 	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+}
+
+func handlePermissionHook() error {
+	config, err := loadConfig()
+	if err != nil {
+		return nil
+	}
+
+	// Read hook data from stdin
+	var hookData HookData
+	decoder := json.NewDecoder(os.Stdin)
+	if err := decoder.Decode(&hookData); err != nil {
+		return nil
+	}
+
+	// Find session by matching cwd suffix
+	var sessionName string
+	var topicID int64
+	home, _ := os.UserHomeDir()
+	for name, tid := range config.Sessions {
+		expectedPath := filepath.Join(home, name)
+		if hookData.Cwd == expectedPath || strings.HasSuffix(hookData.Cwd, "/"+name) {
+			sessionName = name
+			topicID = tid
+			break
+		}
+	}
+	if sessionName == "" || config.GroupID == 0 {
+		return nil
+	}
+
+	// Handle AskUserQuestion (plan approval, etc.)
+	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
+		for qIdx, q := range hookData.ToolInput.Questions {
+			// Build message
+			msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+
+			// Build inline keyboard buttons
+			var buttons [][]InlineKeyboardButton
+			for i, opt := range q.Options {
+				// Callback data format: session:questionIndex:optionIndex
+				callbackData := fmt.Sprintf("%s:%d:%d", sessionName, qIdx, i)
+				buttons = append(buttons, []InlineKeyboardButton{
+					{Text: opt.Label, CallbackData: callbackData},
+				})
+			}
+
+			sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
+		}
+		return nil
+	}
+
+	// Generic permission request
+	msg := fmt.Sprintf("🔐 Permission requested: %s", hookData.ToolName)
+	return sendMessage(config, config.GroupID, topicID, msg)
 }
 
 func getLastAssistantMessage(transcriptPath string) string {
@@ -1191,6 +1309,38 @@ func listen() error {
 
 		for _, update := range updates.Result {
 			offset = update.UpdateID + 1
+
+			// Handle callback queries (button presses)
+			if update.CallbackQuery != nil {
+				cb := update.CallbackQuery
+				// Only accept from authorized user
+				if cb.From.ID != config.ChatID {
+					continue
+				}
+
+				answerCallbackQuery(config, cb.ID)
+
+				// Parse callback data: session:questionIndex:optionIndex
+				parts := strings.Split(cb.Data, ":")
+				if len(parts) == 3 {
+					sessionName := parts[0]
+					// questionIndex := parts[1] // for multi-question support
+					optionIndex, _ := strconv.Atoi(parts[2])
+
+					tmuxName := "claude-" + sessionName
+					if tmuxSessionExists(tmuxName) {
+						// Send arrow down keys to select option, then Enter
+						for i := 0; i < optionIndex; i++ {
+							exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", tmuxName, "Down").Run()
+							time.Sleep(50 * time.Millisecond)
+						}
+						exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", tmuxName, "Enter").Run()
+						fmt.Printf("[callback] Selected option %d for %s\n", optionIndex, sessionName)
+					}
+				}
+				continue
+			}
+
 			msg := update.Message
 
 			// Only accept from authorized user
@@ -1509,6 +1659,12 @@ func main() {
 
 	case "hook":
 		if err := handleHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-permission":
+		if err := handlePermissionHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
