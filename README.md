@@ -48,11 +48,13 @@ Ever wanted to:
 
 ## Requirements
 
-- macOS or Linux
+- macOS, Linux, or Windows (WSL)
 - Go 1.21+
 - [tmux](https://github.com/tmux/tmux)
 - [Claude Code](https://claude.ai/claude-code) installed
 - Telegram account
+
+> **Windows users**: Use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu. Claude Code and ccc both work best on Linux. Install WSL, then follow the Linux instructions.
 
 ## Installation
 
