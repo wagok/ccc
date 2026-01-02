@@ -58,8 +58,9 @@ type CallbackQuery struct {
 
 // TelegramUpdate represents an update from Telegram
 type TelegramUpdate struct {
-	OK     bool `json:"ok"`
-	Result []struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description"`
+	Result      []struct {
 		UpdateID      int             `json:"update_id"`
 		Message       TelegramMessage `json:"message"`
 		CallbackQuery *CallbackQuery  `json:"callback_query"`
@@ -86,6 +87,7 @@ type HookData struct {
 	SessionID      string `json:"session_id"`
 	HookEventName  string `json:"hook_event_name"`
 	ToolName       string `json:"tool_name"`
+	Prompt         string `json:"prompt"` // For UserPromptSubmit hook
 	ToolInput      struct {
 		Questions []struct {
 			Question    string `json:"question"`
@@ -208,6 +210,26 @@ func answerCallbackQuery(config *Config, callbackID string) {
 		"callback_query_id": {callbackID},
 	}
 	telegramAPI(config, "answerCallbackQuery", params)
+}
+
+func editMessageRemoveKeyboard(config *Config, chatID int64, messageID int, newText string) {
+	params := url.Values{
+		"chat_id":    {fmt.Sprintf("%d", chatID)},
+		"message_id": {fmt.Sprintf("%d", messageID)},
+		"text":       {newText},
+	}
+	telegramAPI(config, "editMessageText", params)
+}
+
+func sendTypingAction(config *Config, chatID int64, threadID int64) {
+	params := url.Values{
+		"chat_id": {fmt.Sprintf("%d", chatID)},
+		"action":  {"typing"},
+	}
+	if threadID > 0 {
+		params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
+	}
+	telegramAPI(config, "sendChatAction", params)
 }
 
 func splitMessage(text string, maxLen int) []string {
@@ -629,6 +651,7 @@ func handlePermissionHook() error {
 	}
 
 	// Handle AskUserQuestion (plan approval, etc.) - in goroutine to not block
+	fmt.Fprintf(os.Stderr, "hook-permission: tool=%s questions=%d\n", hookData.ToolName, len(hookData.ToolInput.Questions))
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
 		go func() {
 			defer func() { recover() }()
@@ -713,6 +736,117 @@ func getLastAssistantMessage(transcriptPath string) string {
 	return lastMessage
 }
 
+func handlePromptHook() error {
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hook-prompt: no config\n")
+		return nil
+	}
+
+	var hookData HookData
+	decoder := json.NewDecoder(os.Stdin)
+	if err := decoder.Decode(&hookData); err != nil {
+		fmt.Fprintf(os.Stderr, "hook-prompt: decode error: %v\n", err)
+		return nil
+	}
+
+	if hookData.Prompt == "" {
+		fmt.Fprintf(os.Stderr, "hook-prompt: empty prompt\n")
+		return nil
+	}
+
+	// Find session by matching cwd suffix
+	var topicID int64
+	home, _ := os.UserHomeDir()
+	for name, tid := range config.Sessions {
+		expectedPath := filepath.Join(home, name)
+		if hookData.Cwd == expectedPath || strings.HasSuffix(hookData.Cwd, "/"+name) {
+			topicID = tid
+			break
+		}
+	}
+
+	if topicID == 0 || config.GroupID == 0 {
+		fmt.Fprintf(os.Stderr, "hook-prompt: no topic found for cwd=%s\n", hookData.Cwd)
+		return nil
+	}
+
+	// Send typing action
+	sendTypingAction(config, config.GroupID, topicID)
+
+	// Send the prompt to Telegram
+	prompt := hookData.Prompt
+	if len(prompt) > 500 {
+		prompt = prompt[:500] + "..."
+	}
+	fmt.Fprintf(os.Stderr, "hook-prompt: sending to topic %d\n", topicID)
+	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", prompt))
+}
+
+func handleQuestionHook() error {
+	config, err := loadConfig()
+	if err != nil {
+		return nil
+	}
+
+	rawData, _ := io.ReadAll(os.Stdin)
+	if len(rawData) == 0 {
+		return nil
+	}
+
+	var hookData HookData
+	if err := json.Unmarshal(rawData, &hookData); err != nil {
+		return nil
+	}
+
+	// Find session by matching cwd suffix
+	var sessionName string
+	var topicID int64
+	home, _ := os.UserHomeDir()
+	for name, tid := range config.Sessions {
+		expectedPath := filepath.Join(home, name)
+		if hookData.Cwd == expectedPath || strings.HasSuffix(hookData.Cwd, "/"+name) {
+			sessionName = name
+			topicID = tid
+			break
+		}
+	}
+
+	if sessionName == "" || config.GroupID == 0 || topicID == 0 {
+		return nil
+	}
+
+	// Send questions to Telegram
+	for qIdx, q := range hookData.ToolInput.Questions {
+		if q.Question == "" {
+			continue
+		}
+		msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+
+		var buttons [][]InlineKeyboardButton
+		for i, opt := range q.Options {
+			if opt.Label == "" {
+				continue
+			}
+			callbackData := fmt.Sprintf("%s:%d:%d", sessionName, qIdx, i)
+			if len(callbackData) > 64 {
+				callbackData = callbackData[:64]
+			}
+			buttons = append(buttons, []InlineKeyboardButton{
+				{Text: opt.Label, CallbackData: callbackData},
+			})
+		}
+
+		if len(buttons) > 0 {
+			sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
+		} else {
+			sendMessage(config, config.GroupID, topicID, msg)
+		}
+	}
+
+	return nil
+}
+
 // Install hook in Claude settings
 
 func installHook() error {
@@ -764,6 +898,7 @@ func setBotCommands(botToken string) {
 			{"command": "ping", "description": "Check if bot is alive"},
 			{"command": "away", "description": "Toggle away mode"},
 			{"command": "new", "description": "Create/restart session: /new <name>"},
+			{"command": "continue", "description": "Continue session: /continue <name>"},
 			{"command": "kill", "description": "Kill session: /kill <name>"},
 			{"command": "list", "description": "List active sessions"},
 			{"command": "c", "description": "Execute shell command: /c <cmd>"}
@@ -1309,6 +1444,16 @@ func send(message string) error {
 // Main listen loop
 
 func listen() error {
+	// Kill any other ccc listen instances to avoid Telegram API conflicts
+	myPid := os.Getpid()
+	cmd := exec.Command("pgrep", "-f", "ccc listen")
+	output, _ := cmd.Output()
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if pid, err := strconv.Atoi(line); err == nil && pid != myPid {
+			syscall.Kill(pid, syscall.SIGTERM)
+		}
+	}
+
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("not configured. Run: ccc setup <bot_token>")
@@ -1352,7 +1497,7 @@ func listen() error {
 		}
 
 		if !updates.OK {
-			fmt.Fprintf(os.Stderr, "Telegram API error\n")
+			fmt.Fprintf(os.Stderr, "Telegram API error: %s\n", updates.Description)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -1376,6 +1521,13 @@ func listen() error {
 					sessionName := parts[0]
 					// questionIndex := parts[1] // for multi-question support
 					optionIndex, _ := strconv.Atoi(parts[2])
+
+					// Edit message to show selection and remove buttons
+					if cb.Message != nil {
+						originalText := cb.Message.Text
+						newText := fmt.Sprintf("%s\n\n✓ Selected option %d", originalText, optionIndex+1)
+						editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID, newText)
+					}
 
 					tmuxName := "claude-" + sessionName
 					if tmuxSessionExists(tmuxName) {
@@ -1469,16 +1621,28 @@ func listen() error {
 				continue
 			}
 
-			// /new command - create new session or restart existing
-			if strings.HasPrefix(text, "/new") && isGroup {
+			// /new and /continue commands - create/restart session
+			isNewCmd := strings.HasPrefix(text, "/new")
+			isContinueCmd := strings.HasPrefix(text, "/continue")
+			if (isNewCmd || isContinueCmd) && isGroup {
 				config, _ = loadConfig()
-				arg := strings.TrimSpace(strings.TrimPrefix(text, "/new"))
+				continueSession := isContinueCmd
+				var arg string
+				if isNewCmd {
+					arg = strings.TrimSpace(strings.TrimPrefix(text, "/new"))
+				} else {
+					arg = strings.TrimSpace(strings.TrimPrefix(text, "/continue"))
+				}
+				cmdName := "/new"
+				if continueSession {
+					cmdName = "/continue"
+				}
 
-				// /new <name> - create brand new session + topic
+				// /new <name> or /continue <name> - create brand new session + topic
 				if arg != "" {
 					// Check if session already exists
 					if _, exists := config.Sessions[arg]; exists {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists", arg))
+						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists. Use %s without args in that topic to restart.", arg, cmdName))
 						continue
 					}
 					// Create Telegram topic
@@ -1498,7 +1662,7 @@ func listen() error {
 					}
 					// Create tmux session
 					tmuxName := "claude-" + arg
-					if err := createTmuxSession(tmuxName, workDir, false); err != nil {
+					if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
 						sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
 					} else {
 						// Verify session is actually running
@@ -1512,17 +1676,18 @@ func listen() error {
 					continue
 				}
 
-				// /new without args - restart session in current topic
+				// Without args - restart session in current topic
 				if threadID > 0 {
 					sessionName := getSessionByTopic(config, threadID)
 					if sessionName == "" {
-						sendMessage(config, chatID, threadID, "❌ No session mapped to this topic. Use /new <name> to create one.")
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ No session mapped to this topic. Use %s <name> to create one.", cmdName))
 						continue
 					}
 					tmuxName := "claude-" + sessionName
+					// Kill existing session if running
 					if tmuxSessionExists(tmuxName) {
-						sendMessage(config, chatID, threadID, "⚠️ Session already running")
-						continue
+						killTmuxSession(tmuxName)
+						time.Sleep(300 * time.Millisecond)
 					}
 					// Find work directory
 					home, _ := os.UserHomeDir()
@@ -1530,18 +1695,22 @@ func listen() error {
 					if _, err := os.Stat(workDir); os.IsNotExist(err) {
 						workDir = home
 					}
-					if err := createTmuxSession(tmuxName, workDir, false); err != nil {
+					if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
 					} else {
 						time.Sleep(500 * time.Millisecond)
 						if tmuxSessionExists(tmuxName) {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' started", sessionName))
+							action := "restarted"
+							if continueSession {
+								action = "continued"
+							}
+							sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' %s", sessionName, action))
 						} else {
 							sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session died immediately"))
 						}
 					}
 				} else {
-					sendMessage(config, chatID, threadID, "Usage: /new <name> to create a new session")
+					sendMessage(config, chatID, threadID, fmt.Sprintf("Usage: %s <name> to create a new session", cmdName))
 				}
 				continue
 			}
@@ -1559,7 +1728,7 @@ func listen() error {
 							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
 						}
 					} else {
-						sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new to restart.")
+						sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
 					}
 					continue
 				}
@@ -1627,7 +1796,9 @@ TELEGRAM COMMANDS:
     /ping                   Check if bot is alive
     /away                   Toggle away mode
     /new <name>             Create new session with topic
-    /new                    Restart session in current topic
+    /new                    Restart session in current topic (kills if running)
+    /continue <name>        Create new session with -c flag
+    /continue               Restart session with -c flag (kills if running)
     /kill <name>            Kill a session
     /list                   List active sessions
     /c <cmd>                Execute shell command
@@ -1715,6 +1886,18 @@ func main() {
 
 	case "hook-permission":
 		if err := handlePermissionHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-prompt":
+		if err := handlePromptHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-question":
+		if err := handleQuestionHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
