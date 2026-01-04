@@ -301,7 +301,24 @@ var (
 
 func init() {
 	// Find tmux socket path using current UID
-	tmuxSocket = fmt.Sprintf("/private/tmp/tmux-%d/default", os.Getuid())
+	// macOS uses /private/tmp, Linux uses /tmp
+	uid := os.Getuid()
+	macOSSocket := fmt.Sprintf("/private/tmp/tmux-%d/default", uid)
+	linuxSocket := fmt.Sprintf("/tmp/tmux-%d/default", uid)
+
+	// Check which socket exists, prefer Linux path first (more common in headless)
+	if _, err := os.Stat(linuxSocket); err == nil {
+		tmuxSocket = linuxSocket
+	} else if _, err := os.Stat(macOSSocket); err == nil {
+		tmuxSocket = macOSSocket
+	} else {
+		// Default based on OS
+		if _, err := os.Stat("/private"); err == nil {
+			tmuxSocket = macOSSocket
+		} else {
+			tmuxSocket = linuxSocket
+		}
+	}
 
 	// Find tmux binary
 	if path, err := exec.LookPath("tmux"); err == nil {
@@ -321,16 +338,20 @@ func init() {
 		cccPath = exe
 	}
 
-	// Find claude binary
-	home, _ := os.UserHomeDir()
-	claudePaths := []string{
-		filepath.Join(home, ".claude", "local", "claude"),
-		"/usr/local/bin/claude",
-	}
-	for _, p := range claudePaths {
-		if _, err := os.Stat(p); err == nil {
-			claudePath = p
-			break
+	// Find claude binary - first try PATH, then fallback paths
+	if path, err := exec.LookPath("claude"); err == nil {
+		claudePath = path
+	} else {
+		home, _ := os.UserHomeDir()
+		claudePaths := []string{
+			filepath.Join(home, ".claude", "local", "claude"),
+			"/usr/local/bin/claude",
+		}
+		for _, p := range claudePaths {
+			if _, err := os.Stat(p); err == nil {
+				claudePath = p
+				break
+			}
 		}
 	}
 }
@@ -347,9 +368,8 @@ func createTmuxSession(name string, workDir string, continueSession bool) error 
 		cccCmd += " -c"
 	}
 
-	// Use login shell to get proper environment
-	args := []string{"-S", tmuxSocket, "new-session", "-d", "-s", name, "-c", workDir, "/bin/zsh", "-l", "-c", cccCmd}
-
+	// Create tmux session with a login shell (don't run command directly - it kills session on exit)
+	args := []string{"-S", tmuxSocket, "new-session", "-d", "-s", name, "-c", workDir}
 	cmd := exec.Command(tmuxPath, args...)
 	if err := cmd.Run(); err != nil {
 		return err
@@ -357,6 +377,10 @@ func createTmuxSession(name string, workDir string, continueSession bool) error 
 
 	// Enable mouse mode for this session (allows scrolling)
 	exec.Command(tmuxPath, "-S", tmuxSocket, "set-option", "-t", name, "mouse", "on").Run()
+
+	// Send the command to the session via send-keys (preserves TTY properly)
+	time.Sleep(200 * time.Millisecond)
+	exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", name, cccCmd, "C-m").Run()
 
 	return nil
 }
@@ -511,7 +535,8 @@ func createSession(config *Config, name string) error {
 	home, _ := os.UserHomeDir()
 	workDir := filepath.Join(home, name)
 	if _, err := os.Stat(workDir); os.IsNotExist(err) {
-		workDir = home // Fall back to home if folder doesn't exist
+		// Create project directory
+		os.MkdirAll(workDir, 0755)
 	}
 
 	if err := createTmuxSession(sessionName(name), workDir, false); err != nil {
@@ -1723,7 +1748,7 @@ func listen() error {
 					home, _ := os.UserHomeDir()
 					workDir := filepath.Join(home, arg)
 					if _, err := os.Stat(workDir); os.IsNotExist(err) {
-						workDir = home
+						os.MkdirAll(workDir, 0755)
 					}
 					// Create tmux session
 					tmuxName := "claude-" + arg
@@ -1758,7 +1783,7 @@ func listen() error {
 					home, _ := os.UserHomeDir()
 					workDir := filepath.Join(home, sessionName)
 					if _, err := os.Stat(workDir); os.IsNotExist(err) {
-						workDir = home
+						os.MkdirAll(workDir, 0755)
 					}
 					if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
