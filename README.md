@@ -429,51 +429,63 @@ Run Claude Code sessions on remote machines (laptops, workstations) while contro
 **On the server** (where `ccc listen` runs):
 
 ```bash
-# Add a remote host
-ccc host add laptop user@192.168.1.100
+# Add a remote host (CLI or Telegram)
+ccc host add laptop user@192.168.1.100 ~/Projects
 
-# Set projects directory for the host
-/setdir laptop:~/Projects
+# Or via Telegram:
+/host add laptop user@192.168.1.100 ~/Projects
 
 # Create a session on the laptop
 /new laptop:myproject
 ```
 
-**On the laptop** (optional client mode):
+**On the laptop** (client mode for responses):
 
 ```bash
-# Configure client mode to forward hooks to server
-ccc client set server user@server
+# Install ccc from your fork
+git clone -b develop git@github.com:your-user/ccc.git
+cd ccc && make install
+source ~/.bashrc  # adds ~/bin to PATH
+
+# Configure client mode (auto-installs Claude hook)
+ccc client set server user@server-ip
 ccc client set name laptop
 ccc client enable
+
+# Verify
+ccc client
 ```
 
 ### Server Setup
 
 #### 1. Configure SSH Access
 
-Ensure passwordless SSH from server to each remote host:
+Ensure **bidirectional** passwordless SSH:
 
 ```bash
-# Generate key if needed
+# Server → Laptop (for commands)
 ssh-keygen -t ed25519
-
-# Copy to remote host
 ssh-copy-id user@laptop
-
-# Test connection
 ssh user@laptop "echo ok"
+
+# Laptop → Server (for hook responses)
+# On laptop:
+ssh-copy-id user@server
+ssh user@server "echo ok"
 ```
 
 #### 2. Add Remote Hosts
 
 ```bash
-# Via Telegram
-/host add laptop user@192.168.1.100
-/host add workstation user@192.168.1.101 ~/Code
+# Via CLI
+ccc host add laptop user@192.168.1.100 ~/Projects
+ccc host list
+ccc host del laptop
 
-# Check connectivity
+# Via Telegram
+/host add laptop user@192.168.1.100 ~/Projects
 /host check laptop
+/host list
 ```
 
 #### 3. Create Remote Sessions
@@ -504,26 +516,40 @@ ssh user@laptop "echo ok"
 | `/host check <name>` | Check host connectivity |
 | `/host del <name>` | Remove host |
 
-### Client Mode (Optional)
+### Client Mode (Required for Responses)
 
-Client mode allows laptops to forward Claude's responses back to Telegram through the server. This is useful when you want real-time updates from sessions running on laptops.
+Client mode forwards Claude's responses from the laptop back to Telegram through the server. **Without client mode, you won't see Claude's responses in Telegram.**
 
 **On the laptop:**
 
 ```bash
-# Configure client
-ccc client set server user@homeserver
-ccc client set name laptop
-ccc client enable
+# 1. Install dependencies
+sudo apt install tmux golang-go
 
-# Verify configuration
+# 2. Install Claude Code
+npm install -g @anthropic-ai/claude-code
+claude  # authenticate once
+
+# 3. Install ccc
+git clone -b develop git@github.com:your-user/ccc.git ~/ccc
+cd ~/ccc && make install
+source ~/.bashrc
+
+# 4. Configure client mode
+ccc client set server user@server-ip
+ccc client set name laptop   # must match name used in /host add
+ccc client enable            # auto-installs Claude hook
+
+# 5. Verify
 ccc client
+cat ~/.claude/settings.json  # should show Stop hook
 ```
 
 When client mode is enabled:
-- Claude hooks forward messages to the server via SSH
+- `ccc client enable` automatically installs the Claude Stop hook
+- Claude responses are forwarded to the server via SSH
 - Server sends them to the appropriate Telegram topic
-- You get real-time responses even when session runs on laptop
+- You get real-time responses in Telegram
 
 **Disable client mode:**
 
@@ -535,18 +561,20 @@ ccc client disable
 
 Each remote machine needs:
 
-1. **SSH access** from server (passwordless)
+1. **Bidirectional SSH access** (server↔laptop, passwordless)
 2. **tmux** installed
 3. **Claude Code** installed and authenticated
-4. **ccc** binary (only if using client mode)
+4. **ccc** binary with client mode configured
+
+**Important:** If Claude is installed via nvm, it will be detected correctly (ccc uses interactive shell for SSH).
 
 Verify with:
 ```bash
 /host check laptop
-# ✅ laptop (user@192.168.1.100)
-#   SSH: ok
-#   tmux: ok
-#   claude: ok
+# ✅ SSH connection: OK
+# ✅ tmux: /usr/bin/tmux
+# ✅ claude: /home/user/.nvm/versions/node/v20.x/bin/claude
+# ✅ projects_dir: ~/Projects (exists)
 ```
 
 ### Example Workflow
