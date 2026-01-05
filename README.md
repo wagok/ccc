@@ -405,6 +405,218 @@ The `/kill` command performs a **soft delete**:
 
 > **Tip**: Telegram topics can be archived (hidden) or deleted via UI. Deleting a topic removes all message history permanently.
 
+## Remote Sessions
+
+Run Claude Code sessions on remote machines (laptops, workstations) while controlling everything from your phone via Telegram. The server manages all sessions and routes messages to the appropriate machine via SSH.
+
+### Architecture
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Telegram   │────▶│   Server    │────▶│   Laptop    │
+│   (phone)   │◀────│ ccc listen  │◀────│ claude-code │
+└─────────────┘     └─────────────┘     └─────────────┘
+                          │ SSH              │
+                          ▼                  │
+                    ┌─────────────┐          │
+                    │ Workstation │◀─────────┘
+                    │ claude-code │   hooks via SSH
+                    └─────────────┘
+```
+
+### Quick Start
+
+**On the server** (where `ccc listen` runs):
+
+```bash
+# Add a remote host
+ccc host add laptop user@192.168.1.100
+
+# Set projects directory for the host
+/setdir laptop:~/Projects
+
+# Create a session on the laptop
+/new laptop:myproject
+```
+
+**On the laptop** (optional client mode):
+
+```bash
+# Configure client mode to forward hooks to server
+ccc client set server user@server
+ccc client set name laptop
+ccc client enable
+```
+
+### Server Setup
+
+#### 1. Configure SSH Access
+
+Ensure passwordless SSH from server to each remote host:
+
+```bash
+# Generate key if needed
+ssh-keygen -t ed25519
+
+# Copy to remote host
+ssh-copy-id user@laptop
+
+# Test connection
+ssh user@laptop "echo ok"
+```
+
+#### 2. Add Remote Hosts
+
+```bash
+# Via Telegram
+/host add laptop user@192.168.1.100
+/host add workstation user@192.168.1.101 ~/Code
+
+# Check connectivity
+/host check laptop
+```
+
+#### 3. Create Remote Sessions
+
+```bash
+# Create session on laptop
+/new laptop:myproject
+
+# Create with custom path
+/new laptop:~/experiments/test
+
+# Continue existing conversation
+/continue laptop:myproject
+```
+
+### Telegram Commands for Remote
+
+| Command | Description |
+|---------|-------------|
+| `/new laptop:name` | Create session on remote host |
+| `/continue laptop:name` | Continue session with history |
+| `/kill laptop:name` | Kill remote session |
+| `/list` | List all sessions with status (🟢/⚪) |
+| `/setdir laptop:~/path` | Set projects directory for host |
+| `/rc laptop <cmd>` | Execute command on remote host |
+| `/host add <name> <addr>` | Add remote host |
+| `/host list` | List configured hosts |
+| `/host check <name>` | Check host connectivity |
+| `/host del <name>` | Remove host |
+
+### Client Mode (Optional)
+
+Client mode allows laptops to forward Claude's responses back to Telegram through the server. This is useful when you want real-time updates from sessions running on laptops.
+
+**On the laptop:**
+
+```bash
+# Configure client
+ccc client set server user@homeserver
+ccc client set name laptop
+ccc client enable
+
+# Verify configuration
+ccc client
+```
+
+When client mode is enabled:
+- Claude hooks forward messages to the server via SSH
+- Server sends them to the appropriate Telegram topic
+- You get real-time responses even when session runs on laptop
+
+**Disable client mode:**
+
+```bash
+ccc client disable
+```
+
+### Requirements for Remote Hosts
+
+Each remote machine needs:
+
+1. **SSH access** from server (passwordless)
+2. **tmux** installed
+3. **Claude Code** installed and authenticated
+4. **ccc** binary (only if using client mode)
+
+Verify with:
+```bash
+/host check laptop
+# ✅ laptop (user@192.168.1.100)
+#   SSH: ok
+#   tmux: ok
+#   claude: ok
+```
+
+### Example Workflow
+
+```
+📱 Phone (Telegram)              🖥️ Server              💻 Laptop
+─────────────────────────────────────────────────────────────────
+1. /host add laptop user@laptop
+   → Adds host config
+   → Checks SSH/tmux/claude
+
+2. /new laptop:webapp
+   → SSH: creates ~/Projects/webapp
+   → SSH: starts tmux + claude
+   → Creates Telegram topic
+
+3. "Add login page"
+   → SSH: sends to tmux
+                                                    Claude works...
+                                 ← SSH hook ←       Claude responds
+   ← Telegram ←
+
+4. /list
+   🟢 laptop:webapp
+   ⚪ localproject (stopped)
+
+5. /rc laptop git status
+   → SSH: runs command
+   ← Shows output
+```
+
+### Troubleshooting Remote Sessions
+
+**SSH connection fails:**
+```bash
+# Test manually
+ssh -o BatchMode=yes -o ConnectTimeout=5 user@host "echo ok"
+
+# Check SSH key
+ssh-add -l
+```
+
+**Session starts but dies:**
+```bash
+# Check claude on remote
+/rc laptop "which claude"
+/rc laptop "claude --version"
+
+# Check tmux
+/rc laptop "tmux list-sessions"
+```
+
+**Messages not reaching session:**
+```bash
+# Verify session is running
+/list
+
+# Check tmux directly
+/rc laptop "tmux has-session -t claude-myproject && echo running"
+```
+
+**Client mode not forwarding:**
+```bash
+# On laptop, verify config
+ccc client
+
+# Test SSH back to server
+ssh user@server "ccc --version"
+```
+
 ## How It Works
 
 ```
