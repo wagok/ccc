@@ -634,10 +634,11 @@ func sshTmuxNewSession(address string, name string, workDir string, continueSess
 		return err
 	}
 
-	// Send Enter after a delay to confirm bypass permissions prompt (first run only)
+	// Confirm bypass permissions prompt (first run only)
+	// Default is "No, exit" so we need Up arrow to select "Yes", then Enter
 	time.Sleep(2 * time.Second)
-	confirmCmd := fmt.Sprintf("tmux send-keys -t %s Enter", shellQuote(name))
-	runSSH(address, confirmCmd, time.Duration(sshCommandTimeout)*time.Second)
+	selectYesCmd := fmt.Sprintf("tmux send-keys -t %s Up Enter", shellQuote(name))
+	runSSH(address, selectYesCmd, time.Duration(sshCommandTimeout)*time.Second)
 
 	return nil
 }
