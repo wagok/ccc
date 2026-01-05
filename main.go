@@ -2709,12 +2709,13 @@ func listen() error {
 
 			// /rc <host> <cmd> - remote command
 			if strings.HasPrefix(text, "/rc ") {
-				parts := strings.SplitN(strings.TrimPrefix(text, "/rc "), " ", 2)
-				if len(parts) < 2 {
+				remainder := strings.TrimSpace(strings.TrimPrefix(text, "/rc "))
+				parts := strings.SplitN(remainder, " ", 2)
+				if len(parts) < 2 || parts[0] == "" {
 					sendMessage(config, chatID, threadID, "Usage: /rc <host> <command>")
 					continue
 				}
-				hostName := strings.TrimSpace(parts[0])
+				hostName := parts[0]
 				cmdStr := strings.TrimSpace(parts[1])
 
 				// Get host address
