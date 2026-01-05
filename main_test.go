@@ -34,10 +34,10 @@ func TestSessionName(t *testing.T) {
 // TestGetSessionByTopic tests the getSessionByTopic function
 func TestGetSessionByTopic(t *testing.T) {
 	config := &Config{
-		Sessions: map[string]int64{
-			"project1":   100,
-			"project2":   200,
-			"money/shop": 300,
+		Sessions: map[string]*SessionInfo{
+			"project1":   {TopicID: 100},
+			"project2":   {TopicID: 200},
+			"money/shop": {TopicID: 300},
 		},
 	}
 
@@ -93,9 +93,9 @@ func TestConfigSaveLoad(t *testing.T) {
 		BotToken: "test-token-123",
 		ChatID:   12345,
 		GroupID:  -67890,
-		Sessions: map[string]int64{
-			"project1":   100,
-			"money/shop": 200,
+		Sessions: map[string]*SessionInfo{
+			"project1":   {TopicID: 100},
+			"money/shop": {TopicID: 200},
 		},
 		Away: true,
 	}
@@ -133,9 +133,14 @@ func TestConfigSaveLoad(t *testing.T) {
 	if len(loaded.Sessions) != len(config.Sessions) {
 		t.Errorf("Sessions length = %d, want %d", len(loaded.Sessions), len(config.Sessions))
 	}
-	for name, topicID := range config.Sessions {
-		if loaded.Sessions[name] != topicID {
-			t.Errorf("Sessions[%q] = %d, want %d", name, loaded.Sessions[name], topicID)
+	for name, info := range config.Sessions {
+		loadedInfo := loaded.Sessions[name]
+		if loadedInfo == nil || loadedInfo.TopicID != info.TopicID {
+			var loadedTopicID int64
+			if loadedInfo != nil {
+				loadedTopicID = loadedInfo.TopicID
+			}
+			t.Errorf("Sessions[%q].TopicID = %d, want %d", name, loadedTopicID, info.TopicID)
 		}
 	}
 }
@@ -293,8 +298,8 @@ func TestConfigJSON(t *testing.T) {
 		BotToken: "token123",
 		ChatID:   12345,
 		GroupID:  -67890,
-		Sessions: map[string]int64{
-			"test": 100,
+		Sessions: map[string]*SessionInfo{
+			"test": {TopicID: 100},
 		},
 		Away: true,
 	}
@@ -455,7 +460,7 @@ func TestConfigFilePermissions(t *testing.T) {
 	config := &Config{
 		BotToken: "secret-token",
 		ChatID:   12345,
-		Sessions: make(map[string]int64),
+		Sessions: make(map[string]*SessionInfo),
 	}
 
 	if err := saveConfig(config); err != nil {
@@ -478,7 +483,7 @@ func TestConfigFilePermissions(t *testing.T) {
 // TestEmptySessionsMap tests behavior with empty sessions
 func TestEmptySessionsMap(t *testing.T) {
 	config := &Config{
-		Sessions: make(map[string]int64),
+		Sessions: make(map[string]*SessionInfo),
 	}
 
 	result := getSessionByTopic(config, 100)

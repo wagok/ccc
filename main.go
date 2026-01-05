@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,17 +26,32 @@ const version = "1.0.0"
 type SessionInfo struct {
 	TopicID int64  `json:"topic_id"`
 	Path    string `json:"path"`
+	Host    string `json:"host,omitempty"` // Remote host name or "" for local
+}
+
+// HostInfo stores information about a remote host
+type HostInfo struct {
+	Address     string `json:"address"`               // SSH target (user@host)
+	ProjectsDir string `json:"projects_dir,omitempty"` // Base directory for projects on this host
 }
 
 // Config stores bot configuration and session mappings
 type Config struct {
-	BotToken        string                  `json:"bot_token"`
-	ChatID          int64                   `json:"chat_id"`                   // Private chat for simple commands
-	GroupID         int64                   `json:"group_id,omitempty"`        // Group with topics for sessions
-	Sessions        map[string]*SessionInfo `json:"sessions,omitempty"`        // session name -> session info
-	ProjectsDir     string                  `json:"projects_dir,omitempty"`    // Base directory for new projects (default: ~)
-	TranscriptionCmd string                 `json:"transcription_cmd,omitempty"` // Command for audio transcription (receives audio path, outputs text)
-	Away            bool                    `json:"away"`
+	BotToken         string                  `json:"bot_token"`
+	ChatID           int64                   `json:"chat_id"`                     // Private chat for simple commands
+	GroupID          int64                   `json:"group_id,omitempty"`          // Group with topics for sessions
+	Sessions         map[string]*SessionInfo `json:"sessions,omitempty"`          // session name -> session info
+	ProjectsDir      string                  `json:"projects_dir,omitempty"`      // Base directory for new projects (default: ~)
+	TranscriptionCmd string                  `json:"transcription_cmd,omitempty"` // Command for audio transcription
+	Away             bool                    `json:"away"`
+
+	// Remote hosts configuration (server mode)
+	Hosts map[string]*HostInfo `json:"hosts,omitempty"` // host name -> host info
+
+	// Client mode configuration
+	Mode     string `json:"mode,omitempty"`      // "client" or "" (server/standalone)
+	Server   string `json:"server,omitempty"`    // SSH target for server (client mode)
+	HostName string `json:"host_name,omitempty"` // This machine's identifier
 }
 
 // TelegramMessage represents a Telegram message
@@ -494,6 +510,239 @@ func expandPath(path string) string {
 	return path
 }
 
+// SSH utilities for remote host operations
+
+const (
+	sshConnectTimeout = 5  // seconds
+	sshCommandTimeout = 10 // seconds
+)
+
+// runSSH executes a command on a remote host via SSH
+func runSSH(address string, command string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Wrap command in bash login shell for proper PATH
+	wrappedCmd := fmt.Sprintf("bash -l -c %s", shellQuote(command))
+
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-o", "BatchMode=yes",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
+		address,
+		wrappedCmd,
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("timeout after %v", timeout)
+	}
+	if err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return "", fmt.Errorf("%s: %s", err, errMsg)
+		}
+		return "", err
+	}
+
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// shellQuote quotes a string for safe shell usage
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// sshCheckConnection verifies SSH connection to a host
+func sshCheckConnection(address string) error {
+	_, err := runSSH(address, "echo ok", time.Duration(sshConnectTimeout+2)*time.Second)
+	return err
+}
+
+// sshCheckCommand checks if a command exists on remote host, returns path
+func sshCheckCommand(address string, cmdName string) (string, error) {
+	return runSSH(address, "which "+cmdName, time.Duration(sshCommandTimeout)*time.Second)
+}
+
+// sshResolvePath resolves a path on remote host (expands ~, gets absolute path)
+func sshResolvePath(address string, path string) (string, error) {
+	// Use eval to expand ~ and readlink to get absolute path
+	cmd := fmt.Sprintf("eval echo %s | xargs readlink -f 2>/dev/null || eval echo %s", path, path)
+	return runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second)
+}
+
+// sshMkdir creates a directory on remote host
+func sshMkdir(address string, path string) error {
+	_, err := runSSH(address, "mkdir -p "+shellQuote(path), time.Duration(sshCommandTimeout)*time.Second)
+	return err
+}
+
+// sshDirExists checks if a directory exists on remote host
+func sshDirExists(address string, path string) bool {
+	_, err := runSSH(address, "test -d "+shellQuote(path), time.Duration(sshCommandTimeout)*time.Second)
+	return err == nil
+}
+
+// sshTmuxHasSession checks if a tmux session exists on remote host
+func sshTmuxHasSession(address string, sessionName string) bool {
+	_, err := runSSH(address, "tmux has-session -t "+shellQuote(sessionName), time.Duration(sshCommandTimeout)*time.Second)
+	return err == nil
+}
+
+// sshTmuxNewSession creates a new tmux session on remote host
+func sshTmuxNewSession(address string, name string, workDir string, continueSession bool) error {
+	// Create session
+	cmd := fmt.Sprintf("tmux new-session -d -s %s -c %s", shellQuote(name), shellQuote(workDir))
+	if _, err := runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second); err != nil {
+		return fmt.Errorf("failed to create tmux session: %w", err)
+	}
+
+	// Enable mouse mode
+	runSSH(address, fmt.Sprintf("tmux set-option -t %s mouse on", shellQuote(name)), time.Duration(sshCommandTimeout)*time.Second)
+
+	// Start claude
+	claudeCmd := "claude --dangerously-skip-permissions"
+	if continueSession {
+		claudeCmd += " -c"
+	}
+	sendCmd := fmt.Sprintf("tmux send-keys -t %s %s C-m", shellQuote(name), shellQuote(claudeCmd))
+	_, err := runSSH(address, sendCmd, time.Duration(sshCommandTimeout)*time.Second)
+	return err
+}
+
+// sshTmuxSendKeys sends text to a tmux session on remote host using Base64
+func sshTmuxSendKeys(address string, sessionName string, text string) error {
+	// Encode text as Base64 to avoid escaping issues
+	encoded := base64.StdEncoding.EncodeToString([]byte(text))
+
+	// Decode on remote and send to tmux
+	cmd := fmt.Sprintf(
+		"echo %s | base64 -d | xargs -0 tmux send-keys -t %s -l",
+		encoded, shellQuote(sessionName),
+	)
+	if _, err := runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second); err != nil {
+		return err
+	}
+
+	// Send Enter twice (Claude needs double Enter)
+	enterCmd := fmt.Sprintf(
+		"tmux send-keys -t %s C-m && sleep 0.05 && tmux send-keys -t %s C-m",
+		shellQuote(sessionName), shellQuote(sessionName),
+	)
+	_, err := runSSH(address, enterCmd, time.Duration(sshCommandTimeout)*time.Second)
+	return err
+}
+
+// sshTmuxKillSession kills a tmux session on remote host
+func sshTmuxKillSession(address string, sessionName string) error {
+	_, err := runSSH(address, "tmux kill-session -t "+shellQuote(sessionName), time.Duration(sshCommandTimeout)*time.Second)
+	return err
+}
+
+// sshRunCommand executes an arbitrary command on remote host (for /rc)
+func sshRunCommand(address string, command string, timeout time.Duration) (string, error) {
+	return runSSH(address, command, timeout)
+}
+
+// Session name parsing utilities
+
+// parseSessionTarget parses "host:name" or "name" format
+// Returns (host, name) where host is empty for local sessions
+func parseSessionTarget(input string) (host string, name string) {
+	// Check for host:name format
+	// But be careful: ~/path and /path are not host prefixes
+	if strings.HasPrefix(input, "~/") || strings.HasPrefix(input, "/") {
+		return "", input
+	}
+
+	idx := strings.Index(input, ":")
+	if idx > 0 {
+		host = input[:idx]
+		name = input[idx+1:]
+		return host, name
+	}
+
+	return "", input
+}
+
+// fullSessionName creates full session name from host and name
+func fullSessionName(host string, name string) string {
+	if host == "" {
+		return name
+	}
+	return host + ":" + name
+}
+
+// getHostAddress returns SSH address for a host, or empty if local/not found
+func getHostAddress(config *Config, hostName string) string {
+	if hostName == "" {
+		return ""
+	}
+	if config.Hosts == nil {
+		return ""
+	}
+	if host, ok := config.Hosts[hostName]; ok {
+		return host.Address
+	}
+	return ""
+}
+
+// getHostProjectsDir returns projects dir for a host
+func getHostProjectsDir(config *Config, hostName string) string {
+	if hostName == "" {
+		return getProjectsDir(config)
+	}
+	if config.Hosts != nil {
+		if host, ok := config.Hosts[hostName]; ok && host.ProjectsDir != "" {
+			return host.ProjectsDir
+		}
+	}
+	return "~"
+}
+
+// resolveSessionPath resolves project path for a session
+// For local: uses config.ProjectsDir
+// For remote: uses host's projects_dir and resolves via SSH
+func resolveSessionPath(config *Config, hostName string, nameOrPath string) (string, error) {
+	// Check if it's already an absolute or home-relative path
+	if strings.HasPrefix(nameOrPath, "/") || strings.HasPrefix(nameOrPath, "~/") {
+		if hostName == "" {
+			// Local: expand ~ and return
+			return expandPath(nameOrPath), nil
+		}
+		// Remote: resolve via SSH
+		address := getHostAddress(config, hostName)
+		if address == "" {
+			return "", fmt.Errorf("host '%s' not found", hostName)
+		}
+		return sshResolvePath(address, nameOrPath)
+	}
+
+	// Relative name - use projects_dir
+	projectsDir := getHostProjectsDir(config, hostName)
+	fullPath := filepath.Join(projectsDir, nameOrPath)
+
+	if hostName == "" {
+		// Local
+		return expandPath(fullPath), nil
+	}
+
+	// Remote: resolve via SSH
+	address := getHostAddress(config, hostName)
+	if address == "" {
+		return "", fmt.Errorf("host '%s' not found", hostName)
+	}
+	return sshResolvePath(address, fullPath)
+}
+
+// extractProjectName extracts project name from path
+func extractProjectName(path string) string {
+	return filepath.Base(path)
+}
+
 func createForumTopic(config *Config, name string) (int64, error) {
 	if config.GroupID == 0 {
 		return 0, fmt.Errorf("no group configured. Add bot to a group with topics enabled and run: ccc setgroup")
@@ -794,12 +1043,24 @@ func createSession(config *Config, name string) error {
 }
 
 func killSession(config *Config, name string) error {
-	if _, exists := config.Sessions[name]; !exists {
+	sessionInfo, exists := config.Sessions[name]
+	if !exists {
 		return fmt.Errorf("session '%s' not found", name)
 	}
 
-	// Kill tmux session
-	killTmuxSession(sessionName(name))
+	// Extract project name for tmux session (without host prefix)
+	_, projectName := parseSessionTarget(name)
+	tmuxName := "claude-" + extractProjectName(projectName)
+
+	// Kill tmux session (remote or local)
+	if sessionInfo != nil && sessionInfo.Host != "" {
+		address := getHostAddress(config, sessionInfo.Host)
+		if address != "" {
+			sshTmuxKillSession(address, tmuxName)
+		}
+	} else {
+		killTmuxSession(tmuxName)
+	}
 
 	// Remove from config
 	delete(config.Sessions, name)
@@ -819,6 +1080,27 @@ func getSessionByTopic(config *Config, topicID int64) string {
 
 // Hook handling
 
+// forwardToServer forwards a message to the server in client mode
+// Returns true if forwarded (client mode), false otherwise
+func forwardToServer(config *Config, cwd string, message string) bool {
+	if config.Mode != "client" || config.Server == "" || config.HostName == "" {
+		return false
+	}
+
+	// Forward to server via SSH
+	// Use base64 to safely encode the message
+	encoded := base64.StdEncoding.EncodeToString([]byte(message))
+	cmd := fmt.Sprintf("cd %s && ccc --from=%s \"$(echo %s | base64 -d)\"",
+		shellQuote(cwd), shellQuote(config.HostName), encoded)
+
+	fmt.Fprintf(os.Stderr, "hook: forwarding to server %s\n", config.Server)
+	_, err := runSSH(config.Server, cmd, 10*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hook: forward error: %v\n", err)
+	}
+	return true
+}
+
 func handleHook() error {
 	config, err := loadConfig()
 	if err != nil {
@@ -835,6 +1117,19 @@ func handleHook() error {
 	}
 
 	fmt.Fprintf(os.Stderr, "hook: cwd=%s transcript=%s\n", hookData.Cwd, hookData.TranscriptPath)
+
+	// Read last message from transcript
+	lastMessage := "Session ended"
+	if hookData.TranscriptPath != "" {
+		if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
+			lastMessage = msg
+		}
+	}
+
+	// In client mode, forward to server
+	if forwardToServer(config, hookData.Cwd, lastMessage) {
+		return nil
+	}
 
 	// Find session by matching cwd with saved path
 	var sessionName string
@@ -856,15 +1151,6 @@ func handleHook() error {
 	}
 
 	fmt.Fprintf(os.Stderr, "hook: session=%s topic=%d\n", sessionName, topicID)
-
-	// Read last message from transcript
-	lastMessage := "Session ended"
-	if hookData.TranscriptPath != "" {
-		if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
-			lastMessage = msg
-		}
-	}
-
 	fmt.Fprintf(os.Stderr, "hook: sending message to telegram\n")
 	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
 }
@@ -1029,6 +1315,17 @@ func handlePromptHook() error {
 		return nil
 	}
 
+	// Prepare prompt message
+	prompt := hookData.Prompt
+	if len(prompt) > 500 {
+		prompt = prompt[:500] + "..."
+	}
+
+	// In client mode, forward to server
+	if forwardToServer(config, hookData.Cwd, fmt.Sprintf("💬 %s", prompt)) {
+		return nil
+	}
+
 	// Find session by matching cwd suffix
 	var topicID int64
 	for name, info := range config.Sessions {
@@ -1049,11 +1346,6 @@ func handlePromptHook() error {
 	// Send typing action
 	sendTypingAction(config, config.GroupID, topicID)
 
-	// Send the prompt to Telegram
-	prompt := hookData.Prompt
-	if len(prompt) > 500 {
-		prompt = prompt[:500] + "..."
-	}
 	fmt.Fprintf(os.Stderr, "hook-prompt: sending to topic %d\n", topicID)
 	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", prompt))
 }
@@ -1083,6 +1375,25 @@ func handleOutputHook() error {
 		return nil
 	}
 
+	// Get last message from transcript
+	var msg string
+	if hookData.TranscriptPath != "" {
+		msg = getLastAssistantMessage(hookData.TranscriptPath)
+	}
+	if msg == "" {
+		return nil
+	}
+
+	// Truncate long messages
+	if len(msg) > 1000 {
+		msg = msg[:1000] + "..."
+	}
+
+	// In client mode, forward to server
+	if forwardToServer(config, hookData.Cwd, msg) {
+		return nil
+	}
+
 	// Find session
 	var sessionName string
 	var topicID int64
@@ -1101,25 +1412,15 @@ func handleOutputHook() error {
 		return nil
 	}
 
-	// Get last message from transcript
-	if hookData.TranscriptPath != "" {
-		if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
-			// Check cache to avoid duplicate messages
-			cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
-			lastSent, _ := os.ReadFile(cacheFile)
-			if string(lastSent) == msg {
-				return nil // Skip duplicate
-			}
-			os.WriteFile(cacheFile, []byte(msg), 0600)
-
-			// Truncate long messages
-			if len(msg) > 1000 {
-				msg = msg[:1000] + "..."
-			}
-			sendMessage(config, config.GroupID, topicID, msg)
-		}
+	// Check cache to avoid duplicate messages
+	cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
+	lastSent, _ := os.ReadFile(cacheFile)
+	if string(lastSent) == msg {
+		return nil // Skip duplicate
 	}
+	os.WriteFile(cacheFile, []byte(msg), 0600)
 
+	sendMessage(config, config.GroupID, topicID, msg)
 	return nil
 }
 
@@ -1238,12 +1539,14 @@ func setBotCommands(botToken string) {
 		"commands": [
 			{"command": "ping", "description": "Check if bot is alive"},
 			{"command": "away", "description": "Toggle away mode"},
-			{"command": "new", "description": "Create/restart session: /new <name>"},
-			{"command": "continue", "description": "Continue session: /continue <name>"},
+			{"command": "new", "description": "Create/restart session: /new [host:]<name>"},
+			{"command": "continue", "description": "Continue session: /continue [host:]<name>"},
 			{"command": "kill", "description": "Kill session: /kill <name>"},
 			{"command": "list", "description": "List active sessions"},
-			{"command": "setdir", "description": "Set projects directory: /setdir ~/Projects"},
-			{"command": "c", "description": "Execute shell command: /c <cmd>"}
+			{"command": "setdir", "description": "Set projects dir: /setdir [host:]~/path"},
+			{"command": "c", "description": "Execute local command: /c <cmd>"},
+			{"command": "rc", "description": "Execute remote command: /rc <host> <cmd>"},
+			{"command": "host", "description": "Manage remote hosts: /host add|del|list"}
 		]
 	}`
 
@@ -1805,6 +2108,231 @@ func send(message string) error {
 	return sendMessage(config, config.ChatID, 0, message)
 }
 
+// handleRemoteMessage handles messages forwarded from remote clients via --from flag
+func handleRemoteMessage(fromHost string, message string) error {
+	config, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("not configured: %v", err)
+	}
+
+	// Get current working directory (passed from remote via hook)
+	cwd, _ := os.Getwd()
+
+	// Find session matching fromHost and path
+	for name, info := range config.Sessions {
+		if info == nil {
+			continue
+		}
+		// Check if this is a session from the specified host
+		if info.Host != fromHost {
+			continue
+		}
+		// Check if path matches
+		if info.Path == cwd {
+			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
+			return sendMessage(config, config.GroupID, info.TopicID, message)
+		}
+	}
+
+	// No matching session found, send to private chat as fallback
+	fmt.Printf("[remote] from=%s no matching session for path=%s\n", fromHost, cwd)
+	return sendMessage(config, config.ChatID, 0, fmt.Sprintf("[%s] %s", fromHost, message))
+}
+
+// handleHostCommand handles /host subcommands
+func handleHostCommand(config *Config, chatID int64, threadID int64, text string) {
+	args := strings.Fields(text)
+	if len(args) < 2 {
+		sendMessage(config, chatID, threadID, `Host management commands:
+/host add <name> <address> [projects_dir]
+/host set <name> <address>
+/host del <name>
+/host list
+/host check <name>`)
+		return
+	}
+
+	subCmd := args[1]
+
+	switch subCmd {
+	case "add":
+		// /host add <name> <address> [projects_dir]
+		if len(args) < 4 {
+			sendMessage(config, chatID, threadID, "Usage: /host add <name> <address> [projects_dir]\nExample: /host add laptop wlad@192.168.1.50 ~/Dev")
+			return
+		}
+		name := args[2]
+		address := args[3]
+		projectsDir := "~"
+		if len(args) >= 5 {
+			projectsDir = args[4]
+		}
+
+		// Check if host already exists
+		if config.Hosts != nil {
+			if _, exists := config.Hosts[name]; exists {
+				sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' already exists. Use /host set to update.", name))
+				return
+			}
+		}
+
+		sendMessage(config, chatID, threadID, fmt.Sprintf("🔄 Checking connection to %s...", address))
+
+		// Check SSH connection
+		if err := sshCheckConnection(address); err != nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Cannot connect to %s: %v\nCheck SSH key setup.", address, err))
+			return
+		}
+
+		// Check tmux
+		tmuxPath, err := sshCheckCommand(address, "tmux")
+		if err != nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ tmux not found on %s", name))
+			tmuxPath = "not found"
+		}
+
+		// Check claude
+		claudePath, err := sshCheckCommand(address, "claude")
+		if err != nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ claude not found on %s", name))
+			claudePath = "not found"
+		}
+
+		// Save host
+		if config.Hosts == nil {
+			config.Hosts = make(map[string]*HostInfo)
+		}
+		config.Hosts[name] = &HostInfo{
+			Address:     address,
+			ProjectsDir: projectsDir,
+		}
+		saveConfig(config)
+
+		msg := fmt.Sprintf(`✅ Host '%s' added!
+
+Address: %s
+Projects dir: %s
+tmux: %s
+claude: %s`, name, address, projectsDir, tmuxPath, claudePath)
+		sendMessage(config, chatID, threadID, msg)
+
+	case "set":
+		// /host set <name> <address>
+		if len(args) < 4 {
+			sendMessage(config, chatID, threadID, "Usage: /host set <name> <address>")
+			return
+		}
+		name := args[2]
+		address := args[3]
+
+		if config.Hosts == nil || config.Hosts[name] == nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not found", name))
+			return
+		}
+
+		sendMessage(config, chatID, threadID, fmt.Sprintf("🔄 Checking connection to %s...", address))
+
+		// Check SSH connection
+		if err := sshCheckConnection(address); err != nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Cannot connect to %s: %v", address, err))
+			return
+		}
+
+		config.Hosts[name].Address = address
+		saveConfig(config)
+		sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Host '%s' updated to %s", name, address))
+
+	case "del":
+		// /host del <name>
+		if len(args) < 3 {
+			sendMessage(config, chatID, threadID, "Usage: /host del <name>")
+			return
+		}
+		name := args[2]
+
+		if config.Hosts == nil || config.Hosts[name] == nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not found", name))
+			return
+		}
+
+		// Check if there are active sessions on this host
+		for sessName, info := range config.Sessions {
+			if info != nil && info.Host == name {
+				sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Cannot delete: session '%s' uses this host", sessName))
+				return
+			}
+		}
+
+		delete(config.Hosts, name)
+		saveConfig(config)
+		sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Host '%s' deleted", name))
+
+	case "list":
+		// /host list
+		if config.Hosts == nil || len(config.Hosts) == 0 {
+			sendMessage(config, chatID, threadID, "No hosts configured.\nUse /host add <name> <address> to add one.")
+			return
+		}
+
+		var lines []string
+		for name, info := range config.Hosts {
+			lines = append(lines, fmt.Sprintf("• %s → %s (%s)", name, info.Address, info.ProjectsDir))
+		}
+		sendMessage(config, chatID, threadID, "Configured hosts:\n"+strings.Join(lines, "\n"))
+
+	case "check":
+		// /host check <name>
+		if len(args) < 3 {
+			sendMessage(config, chatID, threadID, "Usage: /host check <name>")
+			return
+		}
+		name := args[2]
+
+		if config.Hosts == nil || config.Hosts[name] == nil {
+			sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not found", name))
+			return
+		}
+
+		host := config.Hosts[name]
+		sendMessage(config, chatID, threadID, fmt.Sprintf("🔄 Checking %s (%s)...", name, host.Address))
+
+		var results []string
+
+		// Check SSH
+		if err := sshCheckConnection(host.Address); err != nil {
+			results = append(results, fmt.Sprintf("❌ SSH connection: %v", err))
+		} else {
+			results = append(results, "✅ SSH connection: OK")
+		}
+
+		// Check tmux
+		if tmuxPath, err := sshCheckCommand(host.Address, "tmux"); err != nil {
+			results = append(results, "❌ tmux: not found")
+		} else {
+			results = append(results, fmt.Sprintf("✅ tmux: %s", tmuxPath))
+		}
+
+		// Check claude
+		if claudePath, err := sshCheckCommand(host.Address, "claude"); err != nil {
+			results = append(results, "❌ claude: not found")
+		} else {
+			results = append(results, fmt.Sprintf("✅ claude: %s", claudePath))
+		}
+
+		// Check projects_dir
+		if sshDirExists(host.Address, host.ProjectsDir) {
+			results = append(results, fmt.Sprintf("✅ projects_dir: %s (exists)", host.ProjectsDir))
+		} else {
+			results = append(results, fmt.Sprintf("⚠️ projects_dir: %s (will be created)", host.ProjectsDir))
+		}
+
+		sendMessage(config, chatID, threadID, strings.Join(results, "\n"))
+
+	default:
+		sendMessage(config, chatID, threadID, fmt.Sprintf("Unknown subcommand: %s\nUse /host for help.", subCmd))
+	}
+}
+
 // Main listen loop
 
 func listen() error {
@@ -1923,8 +2451,30 @@ func listen() error {
 				config, _ = loadConfig()
 				sessionName := getSessionByTopic(config, threadID)
 				if sessionName != "" {
-					tmuxName := "claude-" + sessionName
-					if tmuxSessionExists(tmuxName) {
+					// Get session info to check if remote
+					sessionInfo := config.Sessions[sessionName]
+					hostName := ""
+					if sessionInfo != nil {
+						hostName = sessionInfo.Host
+					}
+
+					// Extract project name for tmux session
+					_, projectName := parseSessionTarget(sessionName)
+					tmuxName := "claude-" + extractProjectName(projectName)
+
+					// Check if session is running
+					sessionRunning := false
+					var address string
+					if hostName != "" {
+						address = getHostAddress(config, hostName)
+						if address != "" {
+							sessionRunning = sshTmuxHasSession(address, tmuxName)
+						}
+					} else {
+						sessionRunning = tmuxSessionExists(tmuxName)
+					}
+
+					if sessionRunning {
 						sendMessage(config, chatID, threadID, "🎤 Transcribing...")
 						// Download and transcribe
 						audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("voice_%d.ogg", time.Now().UnixNano()))
@@ -1938,7 +2488,12 @@ func listen() error {
 							} else if transcription != "" {
 								fmt.Printf("[voice] @%s: %s\n", msg.From.Username, transcription)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("📝 %s", transcription))
-								sendToTmux(tmuxName, transcription)
+								// Send to appropriate tmux
+								if hostName != "" {
+									sshTmuxSendKeys(address, tmuxName, transcription)
+								} else {
+									sendToTmux(tmuxName, transcription)
+								}
 							}
 						}
 					}
@@ -1951,7 +2506,23 @@ func listen() error {
 				config, _ = loadConfig()
 				sessionName := getSessionByTopic(config, threadID)
 				if sessionName != "" {
-					tmuxName := "claude-" + sessionName
+					// Get session info to check if remote
+					sessionInfo := config.Sessions[sessionName]
+					hostName := ""
+					if sessionInfo != nil {
+						hostName = sessionInfo.Host
+					}
+
+					// Photos for remote sessions not yet supported
+					if hostName != "" {
+						sendMessage(config, chatID, threadID, "⚠️ Photos not yet supported for remote sessions. Send as text or use voice.")
+						continue
+					}
+
+					// Extract project name for tmux session
+					_, projectName := parseSessionTarget(sessionName)
+					tmuxName := "claude-" + extractProjectName(projectName)
+
 					if tmuxSessionExists(tmuxName) {
 						// Get largest photo (last in array)
 						photo := msg.Photo[len(msg.Photo)-1]
@@ -2008,12 +2579,51 @@ func listen() error {
 				continue
 			}
 
+			// Handle /host commands
+			if strings.HasPrefix(text, "/host") {
+				handleHostCommand(config, chatID, threadID, text)
+				config, _ = loadConfig() // Reload after potential changes
+				continue
+			}
+
 			if text == "/list" {
-				sessions, _ := listTmuxSessions()
-				if len(sessions) == 0 {
-					sendMessage(config, chatID, threadID, "No active sessions")
+				var lines []string
+
+				// List configured sessions with status
+				for name, info := range config.Sessions {
+					if info == nil {
+						continue
+					}
+
+					// Check if tmux session is running
+					_, projectName := parseSessionTarget(name)
+					tmuxName := "claude-" + extractProjectName(projectName)
+
+					var status string
+					if info.Host != "" {
+						// Remote session
+						address := getHostAddress(config, info.Host)
+						if address != "" && sshTmuxHasSession(address, tmuxName) {
+							status = "🟢"
+						} else {
+							status = "⚪"
+						}
+					} else {
+						// Local session
+						if tmuxSessionExists(tmuxName) {
+							status = "🟢"
+						} else {
+							status = "⚪"
+						}
+					}
+
+					lines = append(lines, fmt.Sprintf("%s %s", status, name))
+				}
+
+				if len(lines) == 0 {
+					sendMessage(config, chatID, threadID, "No sessions configured")
 				} else {
-					sendMessage(config, chatID, threadID, "Sessions:\n• "+strings.Join(sessions, "\n• "))
+					sendMessage(config, chatID, threadID, "Sessions:\n"+strings.Join(lines, "\n"))
 				}
 				continue
 			}
@@ -2021,13 +2631,41 @@ func listen() error {
 			if strings.HasPrefix(text, "/setdir") {
 				arg := strings.TrimSpace(strings.TrimPrefix(text, "/setdir"))
 				if arg == "" {
-					currentDir := getProjectsDir(config)
-					sendMessage(config, chatID, threadID, fmt.Sprintf("📁 Projects directory: %s\n\nUsage: /setdir ~/Projects", currentDir))
+					// Show current projects directories
+					var msg strings.Builder
+					msg.WriteString(fmt.Sprintf("📁 Local projects directory: %s\n", getProjectsDir(config)))
+					if config.Hosts != nil && len(config.Hosts) > 0 {
+						msg.WriteString("\n📁 Remote hosts:\n")
+						for hostName, hostInfo := range config.Hosts {
+							dir := hostInfo.ProjectsDir
+							if dir == "" {
+								dir = "~ (default)"
+							}
+							msg.WriteString(fmt.Sprintf("  %s: %s\n", hostName, dir))
+						}
+					}
+					msg.WriteString("\nUsage: /setdir ~/path or /setdir host:~/path")
+					sendMessage(config, chatID, threadID, msg.String())
 				} else {
-					config.ProjectsDir = arg
-					saveConfig(config)
-					resolvedPath := getProjectsDir(config)
-					sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Projects directory set to: %s", resolvedPath))
+					// Parse host:path format
+					hostName, dirPath := parseSessionTarget(arg)
+
+					if hostName != "" {
+						// Set for remote host
+						if config.Hosts == nil || config.Hosts[hostName] == nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not found. Use /host add to configure it.", hostName))
+							continue
+						}
+						config.Hosts[hostName].ProjectsDir = dirPath
+						saveConfig(config)
+						sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Projects directory for %s set to: %s", hostName, dirPath))
+					} else {
+						// Set for local
+						config.ProjectsDir = arg
+						saveConfig(config)
+						resolvedPath := getProjectsDir(config)
+						sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Projects directory set to: %s", resolvedPath))
+					}
 				}
 				continue
 			}
@@ -2054,6 +2692,34 @@ func listen() error {
 				continue
 			}
 
+			// /rc <host> <cmd> - remote command
+			if strings.HasPrefix(text, "/rc ") {
+				parts := strings.SplitN(strings.TrimPrefix(text, "/rc "), " ", 2)
+				if len(parts) < 2 {
+					sendMessage(config, chatID, threadID, "Usage: /rc <host> <command>")
+					continue
+				}
+				hostName := strings.TrimSpace(parts[0])
+				cmdStr := strings.TrimSpace(parts[1])
+
+				// Get host address
+				if config.Hosts == nil || config.Hosts[hostName] == nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not found. Use /host add to configure it.", hostName))
+					continue
+				}
+				address := config.Hosts[hostName].Address
+
+				output, err := sshRunCommand(address, cmdStr, 30*time.Second)
+				if err != nil {
+					output = fmt.Sprintf("⚠️ %s\n\nExit: %v", output, err)
+				}
+				if output == "" {
+					output = "(no output)"
+				}
+				sendMessage(config, chatID, threadID, fmt.Sprintf("📤 %s:\n%s", hostName, output))
+				continue
+			}
+
 			// /new and /continue commands - create/restart session
 			isNewCmd := strings.HasPrefix(text, "/new")
 			isContinueCmd := strings.HasPrefix(text, "/continue")
@@ -2072,40 +2738,89 @@ func listen() error {
 				}
 
 				// /new <name> or /continue <name> - create brand new session + topic
+				// Supports host:name format for remote sessions
 				if arg != "" {
+					// Parse host:name format
+					hostName, projectName := parseSessionTarget(arg)
+
+					// Validate host if specified
+					if hostName != "" {
+						if config.Hosts == nil || config.Hosts[hostName] == nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not found. Use /host add to configure it.", hostName))
+							continue
+						}
+					}
+
+					// Build full session name (host:name or just name)
+					fullName := fullSessionName(hostName, projectName)
+
 					// Check if session already exists
-					if _, exists := config.Sessions[arg]; exists {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists. Use %s without args in that topic to restart.", arg, cmdName))
+					if _, exists := config.Sessions[fullName]; exists {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists. Use %s without args in that topic to restart.", fullName, cmdName))
 						continue
 					}
+
 					// Create Telegram topic
-					topicID, err := createForumTopic(config, arg)
+					topicID, err := createForumTopic(config, fullName)
 					if err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
 						continue
 					}
-					// Resolve and create work directory
-					workDir := resolveProjectPath(config, arg)
+
+					// Resolve work directory path
+					workDir, err := resolveSessionPath(config, hostName, projectName)
+					if err != nil {
+						sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to resolve path: %v", err))
+						continue
+					}
+
 					// Save mapping with full path
-					config.Sessions[arg] = &SessionInfo{
+					config.Sessions[fullName] = &SessionInfo{
 						TopicID: topicID,
 						Path:    workDir,
+						Host:    hostName,
 					}
 					saveConfig(config)
-					if _, err := os.Stat(workDir); os.IsNotExist(err) {
-						os.MkdirAll(workDir, 0755)
-					}
-					// Create tmux session
-					tmuxName := "claude-" + arg
-					if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
-						sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
-					} else {
-						// Verify session is actually running
-						time.Sleep(500 * time.Millisecond)
-						if tmuxSessionExists(tmuxName) {
-							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🚀 Session '%s' started!\n\nSend messages here to interact with Claude.", arg))
+
+					// Create work directory and tmux session
+					tmuxName := "claude-" + extractProjectName(projectName)
+
+					if hostName != "" {
+						// Remote session
+						address := getHostAddress(config, hostName)
+
+						// Create directory on remote host
+						if err := sshMkdir(address, workDir); err != nil {
+							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to create directory: %v", err))
+							continue
+						}
+
+						// Create tmux session on remote host
+						if err := sshTmuxNewSession(address, tmuxName, workDir, continueSession); err != nil {
+							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
 						} else {
-							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if ~/bin/ccc works.", arg))
+							time.Sleep(500 * time.Millisecond)
+							if sshTmuxHasSession(address, tmuxName) {
+								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🚀 Session '%s' started on %s!\n\nSend messages here to interact with Claude.", fullName, hostName))
+							} else {
+								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if claude works on %s.", fullName, hostName))
+							}
+						}
+					} else {
+						// Local session
+						if _, err := os.Stat(workDir); os.IsNotExist(err) {
+							os.MkdirAll(workDir, 0755)
+						}
+
+						if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
+							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
+						} else {
+							time.Sleep(500 * time.Millisecond)
+							if tmuxSessionExists(tmuxName) {
+								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🚀 Session '%s' started!\n\nSend messages here to interact with Claude.", fullName))
+							} else {
+								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if ~/bin/ccc works.", fullName))
+							}
 						}
 					}
 					continue
@@ -2118,29 +2833,87 @@ func listen() error {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ No session mapped to this topic. Use %s <name> to create one.", cmdName))
 						continue
 					}
-					tmuxName := "claude-" + sessionName
-					// Kill existing session if running
-					if tmuxSessionExists(tmuxName) {
-						killTmuxSession(tmuxName)
-						time.Sleep(300 * time.Millisecond)
+
+					// Get session info to check if remote
+					sessionInfo := config.Sessions[sessionName]
+					hostName := ""
+					if sessionInfo != nil {
+						hostName = sessionInfo.Host
 					}
-					// Resolve and create work directory
-					workDir := resolveProjectPath(config, sessionName)
-					if _, err := os.Stat(workDir); os.IsNotExist(err) {
-						os.MkdirAll(workDir, 0755)
+
+					// Extract project name for tmux session (without host prefix)
+					_, projectName := parseSessionTarget(sessionName)
+					tmuxName := "claude-" + extractProjectName(projectName)
+
+					// Get work directory from stored session info
+					workDir := ""
+					if sessionInfo != nil && sessionInfo.Path != "" {
+						workDir = sessionInfo.Path
 					}
-					if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
-					} else {
-						time.Sleep(500 * time.Millisecond)
-						if tmuxSessionExists(tmuxName) {
-							action := "restarted"
-							if continueSession {
-								action = "continued"
-							}
-							sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' %s", sessionName, action))
+
+					if hostName != "" {
+						// Remote session
+						address := getHostAddress(config, hostName)
+						if address == "" {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not configured", hostName))
+							continue
+						}
+
+						// Kill existing session if running
+						if sshTmuxHasSession(address, tmuxName) {
+							sshTmuxKillSession(address, tmuxName)
+							time.Sleep(300 * time.Millisecond)
+						}
+
+						// Create directory if needed
+						if workDir != "" {
+							sshMkdir(address, workDir)
+						}
+
+						// Create tmux session on remote
+						if err := sshTmuxNewSession(address, tmuxName, workDir, continueSession); err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
 						} else {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session died immediately"))
+							time.Sleep(500 * time.Millisecond)
+							if sshTmuxHasSession(address, tmuxName) {
+								action := "restarted"
+								if continueSession {
+									action = "continued"
+								}
+								sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' %s on %s", sessionName, action, hostName))
+							} else {
+								sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session died immediately"))
+							}
+						}
+					} else {
+						// Local session
+						// Kill existing session if running
+						if tmuxSessionExists(tmuxName) {
+							killTmuxSession(tmuxName)
+							time.Sleep(300 * time.Millisecond)
+						}
+
+						// Get work directory
+						if workDir == "" {
+							workDir = resolveProjectPath(config, sessionName)
+						}
+						if _, err := os.Stat(workDir); os.IsNotExist(err) {
+							os.MkdirAll(workDir, 0755)
+						}
+
+						if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
+						} else {
+							time.Sleep(500 * time.Millisecond)
+							if tmuxSessionExists(tmuxName) {
+								action := "restarted"
+								if continueSession {
+									action = "continued"
+								}
+								sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' %s", sessionName, action))
+							} else {
+								sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session died immediately"))
+							}
 						}
 					}
 				} else {
@@ -2155,14 +2928,41 @@ func listen() error {
 				config, _ = loadConfig()
 				sessionName := getSessionByTopic(config, threadID)
 				if sessionName != "" {
-					// Send to tmux session
-					tmuxName := "claude-" + sessionName
-					if tmuxSessionExists(tmuxName) {
-						if err := sendToTmux(tmuxName, text); err != nil {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
+					// Get session info to check if remote
+					sessionInfo := config.Sessions[sessionName]
+					hostName := ""
+					if sessionInfo != nil {
+						hostName = sessionInfo.Host
+					}
+
+					// Extract project name for tmux session (without host prefix)
+					_, projectName := parseSessionTarget(sessionName)
+					tmuxName := "claude-" + extractProjectName(projectName)
+
+					if hostName != "" {
+						// Remote session
+						address := getHostAddress(config, hostName)
+						if address == "" {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not configured", hostName))
+							continue
+						}
+
+						if sshTmuxHasSession(address, tmuxName) {
+							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
+								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
+							}
+						} else {
+							sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
 						}
 					} else {
-						sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
+						// Local session
+						if tmuxSessionExists(tmuxName) {
+							if err := sendToTmux(tmuxName, text); err != nil {
+								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
+							}
+						} else {
+							sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
+						}
 					}
 					continue
 				}
@@ -2231,15 +3031,26 @@ COMMANDS:
 TELEGRAM COMMANDS:
     /ping                   Check if bot is alive
     /away                   Toggle away mode
-    /new <name>             Create new session with topic (in projects_dir)
+    /new [host:]<name>      Create new session (on host or local)
     /new ~/path/name        Create session with custom path
-    /new                    Restart session in current topic (kills if running)
-    /continue <name>        Create new session with -c flag
-    /continue               Restart session with -c flag (kills if running)
+    /new                    Restart session in current topic
+    /continue [host:]<name> Create new session with -c flag
+    /continue               Restart session with -c flag
     /kill <name>            Kill a session
-    /list                   List active sessions
-    /setdir <path>          Set base directory for projects
-    /c <cmd>                Execute shell command
+    /list                   List sessions with status
+    /setdir [host:]<path>   Set base directory for projects
+    /c <cmd>                Execute local shell command
+    /rc <host> <cmd>        Execute remote shell command
+    /host add <name> <addr> Add remote host
+    /host list              List configured hosts
+    /host check <name>      Check host connectivity
+
+CLIENT MODE:
+    client                  Show client mode config
+    client enable           Enable client mode (for laptops)
+    client disable          Disable client mode
+    client set server <host>  Set server address
+    client set name <name>    Set this machine's name
 
 FLAGS:
     -h, --help              Show this help
@@ -2391,10 +3202,94 @@ func main() {
 			os.Exit(1)
 		}
 
-	default:
-		if err := send(strings.Join(os.Args[1:], " ")); err != nil {
+	case "client":
+		// Client mode configuration
+		config, err := loadConfig()
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
+		}
+		if len(os.Args) < 3 {
+			// Show current config
+			fmt.Println("Client mode configuration:")
+			fmt.Printf("  mode: %s\n", config.Mode)
+			fmt.Printf("  server: %s\n", config.Server)
+			fmt.Printf("  host_name: %s\n", config.HostName)
+			fmt.Println("\nUsage:")
+			fmt.Println("  ccc client set server <user@host>  - Set server address")
+			fmt.Println("  ccc client set name <hostname>     - Set this machine's name")
+			fmt.Println("  ccc client enable                  - Enable client mode")
+			fmt.Println("  ccc client disable                 - Disable client mode")
+			os.Exit(0)
+		}
+		subCmd := os.Args[2]
+		switch subCmd {
+		case "set":
+			if len(os.Args) < 5 {
+				fmt.Println("Usage: ccc client set <key> <value>")
+				os.Exit(1)
+			}
+			key, value := os.Args[3], os.Args[4]
+			switch key {
+			case "server":
+				config.Server = value
+				saveConfig(config)
+				fmt.Printf("✅ Server set to: %s\n", value)
+			case "name":
+				config.HostName = value
+				saveConfig(config)
+				fmt.Printf("✅ Host name set to: %s\n", value)
+			default:
+				fmt.Fprintf(os.Stderr, "Unknown key: %s\n", key)
+				os.Exit(1)
+			}
+		case "enable":
+			config.Mode = "client"
+			saveConfig(config)
+			fmt.Println("✅ Client mode enabled")
+			if config.Server == "" || config.HostName == "" {
+				fmt.Println("⚠️  Don't forget to set server and name:")
+				fmt.Println("   ccc client set server user@server")
+				fmt.Println("   ccc client set name laptop")
+			}
+		case "disable":
+			config.Mode = ""
+			saveConfig(config)
+			fmt.Println("✅ Client mode disabled")
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown subcommand: %s\n", subCmd)
+			os.Exit(1)
+		}
+
+	default:
+		// Check for --from flag (used by client mode to forward messages)
+		var fromHost string
+		args := os.Args[1:]
+		filteredArgs := []string{}
+		for i := 0; i < len(args); i++ {
+			if strings.HasPrefix(args[i], "--from=") {
+				fromHost = strings.TrimPrefix(args[i], "--from=")
+			} else if args[i] == "--from" && i+1 < len(args) {
+				fromHost = args[i+1]
+				i++ // skip next arg
+			} else {
+				filteredArgs = append(filteredArgs, args[i])
+			}
+		}
+
+		if fromHost != "" {
+			// Message from remote client
+			message := strings.Join(filteredArgs, " ")
+			if err := handleRemoteMessage(fromHost, message); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			// Regular message send
+			if err := send(strings.Join(os.Args[1:], " ")); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 }
