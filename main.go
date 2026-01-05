@@ -29,12 +29,13 @@ type SessionInfo struct {
 
 // Config stores bot configuration and session mappings
 type Config struct {
-	BotToken    string                  `json:"bot_token"`
-	ChatID      int64                   `json:"chat_id"`                // Private chat for simple commands
-	GroupID     int64                   `json:"group_id,omitempty"`     // Group with topics for sessions
-	Sessions    map[string]*SessionInfo `json:"sessions,omitempty"`     // session name -> session info
-	ProjectsDir string                  `json:"projects_dir,omitempty"` // Base directory for new projects (default: ~)
-	Away        bool                    `json:"away"`
+	BotToken        string                  `json:"bot_token"`
+	ChatID          int64                   `json:"chat_id"`                   // Private chat for simple commands
+	GroupID         int64                   `json:"group_id,omitempty"`        // Group with topics for sessions
+	Sessions        map[string]*SessionInfo `json:"sessions,omitempty"`        // session name -> session info
+	ProjectsDir     string                  `json:"projects_dir,omitempty"`    // Base directory for new projects (default: ~)
+	TranscriptionCmd string                 `json:"transcription_cmd,omitempty"` // Command for audio transcription (receives audio path, outputs text)
+	Away            bool                    `json:"away"`
 }
 
 // TelegramMessage represents a Telegram message
@@ -437,13 +438,38 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 	return err
 }
 
-// Transcribe audio file using whisper
-func transcribeAudio(audioPath string) (string, error) {
-	// Use whisper with small model for speed (full path for launchd)
-	cmd := exec.Command("/opt/homebrew/bin/whisper", audioPath, "--model", "small", "--output_format", "txt", "--output_dir", filepath.Dir(audioPath))
+// Transcribe audio file using configured command or fallback to whisper
+func transcribeAudio(config *Config, audioPath string) (string, error) {
+	// Use configured transcription command if set
+	if config.TranscriptionCmd != "" {
+		cmdPath := expandPath(config.TranscriptionCmd)
+		cmd := exec.Command(cmdPath, audioPath)
+		output, err := cmd.Output()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				return "", fmt.Errorf("%s: %s", err, string(exitErr.Stderr))
+			}
+			return "", err
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+
+	// Fallback: try to find whisper in PATH or known locations
+	whisperPath := "whisper"
+	if _, err := exec.LookPath("whisper"); err != nil {
+		// Try common locations
+		for _, p := range []string{"/opt/homebrew/bin/whisper", "/usr/local/bin/whisper"} {
+			if _, err := os.Stat(p); err == nil {
+				whisperPath = p
+				break
+			}
+		}
+	}
+
+	cmd := exec.Command(whisperPath, audioPath, "--model", "small", "--output_format", "txt", "--output_dir", filepath.Dir(audioPath))
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return "", err
+		return "", fmt.Errorf("whisper failed: %w (set transcription_cmd in config for custom transcription)", err)
 	}
 
 	// Read the transcription
@@ -457,6 +483,15 @@ func transcribeAudio(audioPath string) (string, error) {
 	os.Remove(txtPath)
 
 	return strings.TrimSpace(string(content)), nil
+}
+
+// expandPath expands ~ to home directory
+func expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, path[2:])
+	}
+	return path
 }
 
 func createForumTopic(config *Config, name string) (int64, error) {
@@ -1711,15 +1746,25 @@ func doctor() {
 		}
 	}
 
-	// Check whisper (optional)
-	fmt.Print("whisper........... ")
-	if whisperPath, err := exec.LookPath("whisper"); err == nil {
-		fmt.Printf("✅ %s\n", whisperPath)
+	// Check transcription (optional)
+	fmt.Print("transcription..... ")
+	if config != nil && config.TranscriptionCmd != "" {
+		cmdPath := expandPath(config.TranscriptionCmd)
+		if _, err := os.Stat(cmdPath); err == nil {
+			fmt.Printf("✅ %s\n", cmdPath)
+		} else if _, err := exec.LookPath(config.TranscriptionCmd); err == nil {
+			fmt.Printf("✅ %s (in PATH)\n", config.TranscriptionCmd)
+		} else {
+			fmt.Printf("❌ %s not found\n", config.TranscriptionCmd)
+			fmt.Println("   Check transcription_cmd in ~/.ccc.json")
+		}
+	} else if whisperPath, err := exec.LookPath("whisper"); err == nil {
+		fmt.Printf("✅ %s (fallback)\n", whisperPath)
 	} else if _, err := os.Stat("/opt/homebrew/bin/whisper"); err == nil {
-		fmt.Println("✅ /opt/homebrew/bin/whisper")
+		fmt.Println("✅ /opt/homebrew/bin/whisper (fallback)")
 	} else {
-		fmt.Println("⚠️  not found (optional, for voice messages)")
-		fmt.Println("   Install: brew install openai-whisper")
+		fmt.Println("⚠️  not configured (optional, for voice messages)")
+		fmt.Println("   Set transcription_cmd in ~/.ccc.json or install whisper")
 	}
 
 	fmt.Println()
@@ -1886,7 +1931,7 @@ func listen() error {
 						if err := downloadTelegramFile(config, msg.Voice.FileID, audioPath); err != nil {
 							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
 						} else {
-							transcription, err := transcribeAudio(audioPath)
+							transcription, err := transcribeAudio(config, audioPath)
 							os.Remove(audioPath)
 							if err != nil {
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Transcription failed: %v", err))

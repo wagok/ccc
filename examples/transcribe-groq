@@ -1,0 +1,33 @@
+#!/bin/bash
+# Transcription using Groq Whisper API (fast & cheap)
+# Requires: GROQ_API_KEY environment variable
+# Usage: transcribe-groq /path/to/audio.ogg
+
+set -e
+
+AUDIO_FILE="$1"
+if [ -z "$AUDIO_FILE" ]; then
+    echo "Usage: $0 <audio_file>" >&2
+    exit 1
+fi
+
+if [ -z "$GROQ_API_KEY" ]; then
+    echo "Error: GROQ_API_KEY not set" >&2
+    exit 1
+fi
+
+# Call Groq Whisper API (OpenAI-compatible endpoint)
+# Available models: whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en
+RESPONSE=$(curl -s "https://api.groq.com/openai/v1/audio/transcriptions" \
+    -H "Authorization: Bearer $GROQ_API_KEY" \
+    -F "file=@$AUDIO_FILE" \
+    -F "model=whisper-large-v3-turbo" \
+    -F "response_format=text")
+
+# Check for errors
+if echo "$RESPONSE" | grep -q '"error"'; then
+    echo "Error: $RESPONSE" >&2
+    exit 1
+fi
+
+echo "$RESPONSE"

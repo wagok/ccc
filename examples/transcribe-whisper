@@ -1,0 +1,35 @@
+#!/bin/bash
+# Transcription using local Whisper (OpenAI)
+# Install: pip install openai-whisper
+# Usage: transcribe-whisper /path/to/audio.ogg
+
+set -e
+
+AUDIO_FILE="$1"
+if [ -z "$AUDIO_FILE" ]; then
+    echo "Usage: $0 <audio_file>" >&2
+    exit 1
+fi
+
+# Find whisper binary
+WHISPER=""
+for path in whisper /opt/homebrew/bin/whisper /usr/local/bin/whisper ~/.local/bin/whisper; do
+    if command -v "$path" &>/dev/null || [ -x "$path" ]; then
+        WHISPER="$path"
+        break
+    fi
+done
+
+if [ -z "$WHISPER" ]; then
+    echo "Error: whisper not found. Install with: pip install openai-whisper" >&2
+    exit 1
+fi
+
+# Transcribe (model options: tiny, base, small, medium, large)
+OUTPUT_DIR=$(dirname "$AUDIO_FILE")
+$WHISPER "$AUDIO_FILE" --model small --output_format txt --output_dir "$OUTPUT_DIR" >&2
+
+# Output transcription
+TXT_FILE="${AUDIO_FILE%.*}.txt"
+cat "$TXT_FILE"
+rm -f "$TXT_FILE"

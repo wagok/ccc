@@ -60,13 +60,12 @@ Ever wanted to:
 
 ### Optional Dependencies
 
-- **[Whisper](https://github.com/openai/whisper)** - For voice message transcription
-  ```bash
-  # macOS
-  brew install openai-whisper
-  # or with pip
-  pip install openai-whisper
-  ```
+- **Voice transcription** - For voice message support (choose one):
+  - Local Whisper: `pip install openai-whisper`
+  - OpenAI API: Set `OPENAI_API_KEY`
+  - Groq API: Set `GROQ_API_KEY` (fastest)
+
+  See [Transcription Setup](#transcription-setup) for configuration.
 
 > **Windows users**: Use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu. Claude Code and ccc both work best on Linux. Install WSL, then follow the Linux instructions.
 
@@ -163,9 +162,10 @@ That's it! You're ready to control Claude Code from Telegram.
 
 ### Voice Messages & Images
 
-**Voice Messages** (requires Whisper):
+**Voice Messages**:
 - Send a voice message in a session topic
-- Bot transcribes using Whisper and sends text to Claude
+- Bot transcribes and sends text to Claude
+- Supports multiple transcription backends (see [Transcription Setup](#transcription-setup))
 
 **Image Attachments**:
 - Send an image in a session topic (with optional caption)
@@ -280,6 +280,7 @@ Config is stored in `~/.ccc.json`:
     }
   },
   "projects_dir": "/home/user/Projects",
+  "transcription_cmd": "~/bin/transcribe-groq",
   "away": false
 }
 ```
@@ -291,6 +292,7 @@ Config is stored in `~/.ccc.json`:
 | `group_id` | Telegram group ID for session topics |
 | `sessions` | Map of session names to topic ID and project path |
 | `projects_dir` | Base directory for new projects (default: `~`) |
+| `transcription_cmd` | Command for voice transcription (optional) |
 | `away` | When true, notifications are sent |
 
 > **Note**: Session paths are stored at creation time. Changing `projects_dir` only affects new sessions.
@@ -315,6 +317,42 @@ Now `/new myproject` creates `~/Projects/myproject`.
 /new ~/experiments/test     → ~/experiments/test
 /new /tmp/quicktest         → /tmp/quicktest
 ```
+
+### Transcription Setup
+
+Voice messages require a transcription backend. Configure via `transcription_cmd` in `~/.ccc.json`:
+
+```json
+{
+  "transcription_cmd": "~/bin/transcribe-groq"
+}
+```
+
+The command receives the audio file path as an argument and should output the transcription to stdout.
+
+**Available backends** (see `examples/` directory):
+
+| Script | Backend | Requirements |
+|--------|---------|--------------|
+| `transcribe-whisper` | Local Whisper | `pip install openai-whisper` |
+| `transcribe-openai` | OpenAI API | `OPENAI_API_KEY` env var |
+| `transcribe-groq` | Groq API (fast) | `GROQ_API_KEY` env var |
+
+**Setup example (Groq - recommended for speed):**
+
+```bash
+# Copy script to your bin
+cp examples/transcribe-groq ~/bin/
+chmod +x ~/bin/transcribe-groq
+
+# Set API key (add to ~/.bashrc or ~/.zshrc)
+export GROQ_API_KEY="your-api-key"
+
+# Configure ccc
+# Add to ~/.ccc.json: "transcription_cmd": "~/bin/transcribe-groq"
+```
+
+**Fallback:** If `transcription_cmd` is not set, ccc tries to use local `whisper` command.
 
 ### Session Lifecycle
 
