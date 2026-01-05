@@ -542,6 +542,8 @@ func runSSH(address string, command string, timeout time.Duration) (string, erro
 
 	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
 		address,
 		wrappedCmd,
