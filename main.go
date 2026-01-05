@@ -1554,17 +1554,22 @@ func installHook() error {
 		}
 	}
 
-	// Create the Stop hook
-	stopHook := map[string]interface{}{
-		"type":    "command",
-		"command": cccPath + " hook",
+	// Create the Stop hook with correct nested format
+	stopHookEntry := map[string]interface{}{
+		"matcher": "",
+		"hooks": []interface{}{
+			map[string]interface{}{
+				"type":    "command",
+				"command": cccPath + " hook",
+			},
+		},
 	}
 
 	hooks, ok := settings["hooks"].(map[string]interface{})
 	if !ok {
 		hooks = make(map[string]interface{})
 	}
-	hooks["Stop"] = []interface{}{stopHook}
+	hooks["Stop"] = []interface{}{stopHookEntry}
 	settings["hooks"] = hooks
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
