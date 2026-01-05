@@ -3303,6 +3303,11 @@ func main() {
 			config.Mode = "client"
 			saveConfig(config)
 			fmt.Println("✅ Client mode enabled")
+			// Install hook automatically
+			if err := installHook(); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Failed to install hook: %v\n", err)
+				fmt.Println("   Run 'ccc install-hook' manually after claude is set up")
+			}
 			if config.Server == "" || config.HostName == "" {
 				fmt.Println("⚠️  Don't forget to set server and name:")
 				fmt.Println("   ccc client set server user@server")
