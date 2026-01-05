@@ -593,13 +593,17 @@ func sshResolvePath(address string, path string) (string, error) {
 
 // sshMkdir creates a directory on remote host
 func sshMkdir(address string, path string) error {
-	_, err := runSSH(address, "mkdir -p "+shellQuote(path), time.Duration(sshCommandTimeout)*time.Second)
+	// Use eval to expand ~ in path
+	cmd := fmt.Sprintf("mkdir -p \"$(eval echo %s)\"", shellQuote(path))
+	_, err := runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second)
 	return err
 }
 
 // sshDirExists checks if a directory exists on remote host
 func sshDirExists(address string, path string) bool {
-	_, err := runSSH(address, "test -d "+shellQuote(path), time.Duration(sshCommandTimeout)*time.Second)
+	// Use eval to expand ~ in path
+	cmd := fmt.Sprintf("test -d \"$(eval echo %s)\"", shellQuote(path))
+	_, err := runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second)
 	return err == nil
 }
 
