@@ -3276,6 +3276,75 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "host":
+		// Host management CLI commands
+		config, err := loadOrCreateConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if len(os.Args) < 3 {
+			fmt.Println("Host management commands:")
+			fmt.Println("  ccc host add <name> <address> [projects_dir]")
+			fmt.Println("  ccc host del <name>")
+			fmt.Println("  ccc host list")
+			os.Exit(0)
+		}
+		subCmd := os.Args[2]
+		switch subCmd {
+		case "add":
+			if len(os.Args) < 5 {
+				fmt.Println("Usage: ccc host add <name> <address> [projects_dir]")
+				fmt.Println("Example: ccc host add laptop wlad@192.168.1.50 ~/Projects")
+				os.Exit(1)
+			}
+			name := os.Args[3]
+			address := os.Args[4]
+			projectsDir := "~"
+			if len(os.Args) >= 6 {
+				projectsDir = os.Args[5]
+			}
+			if config.Hosts == nil {
+				config.Hosts = make(map[string]*HostInfo)
+			}
+			if _, exists := config.Hosts[name]; exists {
+				fmt.Fprintf(os.Stderr, "❌ Host '%s' already exists. Use 'ccc host del %s' first.\n", name, name)
+				os.Exit(1)
+			}
+			config.Hosts[name] = &HostInfo{
+				Address:     address,
+				ProjectsDir: projectsDir,
+			}
+			saveConfig(config)
+			fmt.Printf("✅ Host '%s' added: %s (projects: %s)\n", name, address, projectsDir)
+		case "del":
+			if len(os.Args) < 4 {
+				fmt.Println("Usage: ccc host del <name>")
+				os.Exit(1)
+			}
+			name := os.Args[3]
+			if config.Hosts == nil || config.Hosts[name] == nil {
+				fmt.Fprintf(os.Stderr, "❌ Host '%s' not found\n", name)
+				os.Exit(1)
+			}
+			delete(config.Hosts, name)
+			saveConfig(config)
+			fmt.Printf("✅ Host '%s' deleted\n", name)
+		case "list":
+			if config.Hosts == nil || len(config.Hosts) == 0 {
+				fmt.Println("No hosts configured.")
+				fmt.Println("Use: ccc host add <name> <address>")
+				os.Exit(0)
+			}
+			fmt.Println("Configured hosts:")
+			for name, info := range config.Hosts {
+				fmt.Printf("  • %s → %s (%s)\n", name, info.Address, info.ProjectsDir)
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown subcommand: %s\n", subCmd)
+			os.Exit(1)
+		}
+
 	default:
 		// Check for --from flag (used by client mode to forward messages)
 		var fromHost string
