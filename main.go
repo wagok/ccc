@@ -145,6 +145,21 @@ func getConfigPath() string {
 	return filepath.Join(home, ".ccc.json")
 }
 
+// loadOrCreateConfig loads config or returns empty config if file doesn't exist
+func loadOrCreateConfig() (*Config, error) {
+	config, err := loadConfig()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{
+				Sessions: make(map[string]*SessionInfo),
+				Hosts:    make(map[string]*HostInfo),
+			}, nil
+		}
+		return nil, err
+	}
+	return config, nil
+}
+
 func loadConfig() (*Config, error) {
 	data, err := os.ReadFile(getConfigPath())
 	if err != nil {
@@ -3204,7 +3219,7 @@ func main() {
 
 	case "client":
 		// Client mode configuration
-		config, err := loadConfig()
+		config, err := loadOrCreateConfig()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
