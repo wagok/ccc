@@ -1529,17 +1529,29 @@ func handleQuestionHook() error {
 
 func installHook() error {
 	home, _ := os.UserHomeDir()
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	claudeDir := filepath.Join(home, ".claude")
+	settingsPath := filepath.Join(claudeDir, "settings.json")
 	cccPath := filepath.Join(home, "bin", "ccc")
 
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		return fmt.Errorf("failed to read settings.json: %w", err)
+	// Create .claude directory if it doesn't exist
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		return fmt.Errorf("failed to create .claude directory: %w", err)
 	}
 
 	var settings map[string]interface{}
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return fmt.Errorf("failed to parse settings.json: %w", err)
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Create empty settings if file doesn't exist
+			settings = make(map[string]interface{})
+		} else {
+			return fmt.Errorf("failed to read settings.json: %w", err)
+		}
+	} else {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("failed to parse settings.json: %w", err)
+		}
 	}
 
 	// Create the Stop hook
@@ -3306,7 +3318,7 @@ func main() {
 			// Install hook automatically
 			if err := installHook(); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Failed to install hook: %v\n", err)
-				fmt.Println("   Run 'ccc install-hook' manually after claude is set up")
+				fmt.Println("   Run 'ccc install' manually after claude is set up")
 			}
 			if config.Server == "" || config.HostName == "" {
 				fmt.Println("⚠️  Don't forget to set server and name:")
