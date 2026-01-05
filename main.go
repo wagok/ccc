@@ -1590,16 +1590,17 @@ func installHook() error {
 func setBotCommands(botToken string) {
 	commands := `{
 		"commands": [
-			{"command": "ping", "description": "Check if bot is alive"},
-			{"command": "away", "description": "Toggle away mode"},
-			{"command": "new", "description": "Create/restart session: /new [host:]<name>"},
+			{"command": "help", "description": "Show all commands"},
+			{"command": "new", "description": "Create session: /new [host:]<name>"},
 			{"command": "continue", "description": "Continue session: /continue [host:]<name>"},
 			{"command": "kill", "description": "Kill session: /kill <name>"},
-			{"command": "list", "description": "List active sessions"},
-			{"command": "setdir", "description": "Set projects dir: /setdir [host:]~/path"},
-			{"command": "c", "description": "Execute local command: /c <cmd>"},
-			{"command": "rc", "description": "Execute remote command: /rc <host> <cmd>"},
-			{"command": "host", "description": "Manage remote hosts: /host add|del|list"}
+			{"command": "list", "description": "List sessions with status"},
+			{"command": "host", "description": "Manage hosts: /host add|del|list|check"},
+			{"command": "rc", "description": "Remote command: /rc <host> <cmd>"},
+			{"command": "setdir", "description": "Set projects dir: /setdir [host:]<path>"},
+			{"command": "away", "description": "Toggle notifications"},
+			{"command": "c", "description": "Local command: /c <cmd>"},
+			{"command": "ping", "description": "Check bot status"}
 		]
 	}`
 
@@ -2616,6 +2617,34 @@ func listen() error {
 			fmt.Printf("[%s] @%s: %s\n", msg.Chat.Type, msg.From.Username, text)
 
 			// Handle commands
+			if text == "/help" || text == "/start" {
+				helpText := `📚 *CCC Commands*
+
+*Session Management:*
+• /new \[host:\]<name> — Create new session
+• /new ~/path/name — Create with custom path
+• /new — Restart session in current topic
+• /continue \[host:\]<name> — Create with history
+• /continue — Restart with -c flag
+• /kill <name> — Kill session (keeps topic)
+• /list — List sessions (🟢 running, ⚪ stopped)
+
+*Remote Hosts:*
+• /host add <name> <addr> \[dir\] — Add host
+• /host del <name> — Remove host
+• /host list — List hosts
+• /host check <name> — Check connectivity
+• /rc <host> <cmd> — Run command on host
+
+*Settings:*
+• /setdir \[host:\]<path> — Set projects directory
+• /away — Toggle notifications
+• /c <cmd> — Run local command
+• /ping — Check bot status`
+				sendMessage(config, chatID, threadID, helpText)
+				continue
+			}
+
 			if text == "/ping" {
 				sendMessage(config, chatID, threadID, "pong!")
 				continue
@@ -3101,29 +3130,36 @@ COMMANDS:
     run                     Run Claude directly (used by tmux sessions)
     hook                    Handle Claude hook (internal)
 
+HOST MANAGEMENT (for remote sessions):
+    host add <name> <addr> [dir]  Add remote host
+    host del <name>               Remove remote host
+    host list                     List configured hosts
+
+CLIENT MODE (for laptops):
+    client                  Show client mode config
+    client enable           Enable client mode (auto-installs hook)
+    client disable          Disable client mode
+    client set server <host>  Set server address (user@ip)
+    client set name <name>    Set this machine's name
+
 TELEGRAM COMMANDS:
+    /help                   Show all commands
     /ping                   Check if bot is alive
-    /away                   Toggle away mode
-    /new [host:]<name>      Create new session (on host or local)
+    /away                   Toggle away mode (notifications)
+    /new [host:]<name>      Create new session (remote or local)
     /new ~/path/name        Create session with custom path
     /new                    Restart session in current topic
-    /continue [host:]<name> Create new session with -c flag
-    /continue               Restart session with -c flag
-    /kill <name>            Kill a session
-    /list                   List sessions with status
-    /setdir [host:]<path>   Set base directory for projects
+    /continue [host:]<name> Create session with conversation history
+    /continue               Restart with -c flag in current topic
+    /kill <name>            Kill a session (keeps topic)
+    /list                   List sessions with status (🟢/⚪)
+    /setdir [host:]<path>   Set projects directory
     /c <cmd>                Execute local shell command
-    /rc <host> <cmd>        Execute remote shell command
-    /host add <name> <addr> Add remote host
+    /rc <host> <cmd>        Execute command on remote host
+    /host add <name> <addr> [dir]  Add remote host
+    /host del <name>        Remove remote host
     /host list              List configured hosts
     /host check <name>      Check host connectivity
-
-CLIENT MODE:
-    client                  Show client mode config
-    client enable           Enable client mode (for laptops)
-    client disable          Disable client mode
-    client set server <host>  Set server address
-    client set name <name>    Set this machine's name
 
 FLAGS:
     -h, --help              Show this help
