@@ -635,11 +635,12 @@ func sshTmuxNewSession(address string, name string, workDir string, continueSess
 	}
 
 	// Confirm bypass permissions prompt (first run only)
-	// Default is "No, exit" so we need Up arrow to select "Yes", then Enter
+	// Default is "No, exit" so we need Down arrow to select "Yes", then Enter
+	// Down is safer than Up - if no prompt exists, Down does nothing
 	time.Sleep(2 * time.Second)
-	// Send Up arrow first
-	upCmd := fmt.Sprintf("tmux send-keys -t %s Up", shellQuote(name))
-	runSSH(address, upCmd, time.Duration(sshCommandTimeout)*time.Second)
+	// Send Down arrow first
+	downCmd := fmt.Sprintf("tmux send-keys -t %s Down", shellQuote(name))
+	runSSH(address, downCmd, time.Duration(sshCommandTimeout)*time.Second)
 	time.Sleep(100 * time.Millisecond)
 	// Then send Enter
 	enterCmd := fmt.Sprintf("tmux send-keys -t %s Enter", shellQuote(name))
