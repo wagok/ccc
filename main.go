@@ -630,8 +630,16 @@ func sshTmuxNewSession(address string, name string, workDir string, continueSess
 		claudeCmd += " -c"
 	}
 	sendCmd := fmt.Sprintf("tmux send-keys -t %s %s C-m", shellQuote(name), shellQuote(claudeCmd))
-	_, err := runSSH(address, sendCmd, time.Duration(sshCommandTimeout)*time.Second)
-	return err
+	if _, err := runSSH(address, sendCmd, time.Duration(sshCommandTimeout)*time.Second); err != nil {
+		return err
+	}
+
+	// Send Enter after a delay to confirm bypass permissions prompt (first run only)
+	time.Sleep(2 * time.Second)
+	confirmCmd := fmt.Sprintf("tmux send-keys -t %s Enter", shellQuote(name))
+	runSSH(address, confirmCmd, time.Duration(sshCommandTimeout)*time.Second)
+
+	return nil
 }
 
 // sshTmuxSendKeys sends text to a tmux session on remote host using Base64
