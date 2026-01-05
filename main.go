@@ -1092,9 +1092,9 @@ func killSession(config *Config, name string) error {
 		killTmuxSession(tmuxName)
 	}
 
-	// Remove from config
-	delete(config.Sessions, name)
-	saveConfig(config)
+	// Note: We keep the session in config to preserve the Telegram topic mapping.
+	// This prevents creating duplicate topics when /new is called again.
+	// The session will show as stopped (⚪) in /list since tmux is killed.
 
 	return nil
 }
@@ -2785,36 +2785,55 @@ func listen() error {
 					// Build full session name (host:name or just name)
 					fullName := fullSessionName(hostName, projectName)
 
-					// Check if session already exists
-					if _, exists := config.Sessions[fullName]; exists {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists. Use %s without args in that topic to restart.", fullName, cmdName))
-						continue
-					}
+					var topicID int64
+					var workDir string
 
-					// Create Telegram topic
-					topicID, err := createForumTopic(config, fullName)
-					if err != nil {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
-						continue
-					}
+					// Check if session already exists (may be stopped after /kill)
+					if existingSession, exists := config.Sessions[fullName]; exists {
+						// Reuse existing topic
+						topicID = existingSession.TopicID
+						workDir = existingSession.Path
+					} else {
+						// Create new Telegram topic
+						var err error
+						topicID, err = createForumTopic(config, fullName)
+						if err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
+							continue
+						}
 
-					// Resolve work directory path
-					workDir, err := resolveSessionPath(config, hostName, projectName)
-					if err != nil {
-						sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to resolve path: %v", err))
-						continue
-					}
+						// Resolve work directory path
+						workDir, err = resolveSessionPath(config, hostName, projectName)
+						if err != nil {
+							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to resolve path: %v", err))
+							continue
+						}
 
-					// Save mapping with full path
-					config.Sessions[fullName] = &SessionInfo{
-						TopicID: topicID,
-						Path:    workDir,
-						Host:    hostName,
+						// Save mapping with full path
+						config.Sessions[fullName] = &SessionInfo{
+							TopicID: topicID,
+							Path:    workDir,
+							Host:    hostName,
+						}
+						saveConfig(config)
 					}
-					saveConfig(config)
 
 					// Create work directory and tmux session
 					tmuxName := "claude-" + extractProjectName(projectName)
+
+					// Kill existing tmux session if running (for restart)
+					if hostName != "" {
+						address := getHostAddress(config, hostName)
+						if sshTmuxHasSession(address, tmuxName) {
+							sshTmuxKillSession(address, tmuxName)
+							time.Sleep(300 * time.Millisecond)
+						}
+					} else {
+						if tmuxSessionExists(tmuxName) {
+							killTmuxSession(tmuxName)
+							time.Sleep(300 * time.Millisecond)
+						}
+					}
 
 					if hostName != "" {
 						// Remote session
