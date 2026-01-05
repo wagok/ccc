@@ -537,8 +537,8 @@ func runSSH(address string, command string, timeout time.Duration) (string, erro
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Wrap command in bash login shell for proper PATH
-	wrappedCmd := fmt.Sprintf("bash -l -c %s", shellQuote(command))
+	// Wrap command in interactive login shell for full environment (nvm, etc.)
+	wrappedCmd := fmt.Sprintf("bash -i -l -c %s", shellQuote(command))
 
 	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "BatchMode=yes",
