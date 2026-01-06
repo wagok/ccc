@@ -409,6 +409,8 @@ The `/kill` command performs a **soft delete**:
 
 Run Claude Code sessions on remote machines (laptops, workstations) while controlling everything from your phone via Telegram. The server manages all sessions and routes messages to the appropriate machine via SSH.
 
+> **For detailed technical documentation**, see [Remote Hosts Architecture](docs/remote-hosts.md).
+
 ### Architecture
 
 ```
