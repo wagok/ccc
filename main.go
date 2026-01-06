@@ -1201,6 +1201,84 @@ func getSessionByTopic(config *Config, topicID int64) string {
 	return ""
 }
 
+// Client session management
+
+// startClientSession starts a claude session on the client
+// 1. Determines project path from args or cwd
+// 2. Registers session on server via SSH
+// 3. Starts claude locally
+func startClientSession(config *Config, args []string) error {
+	// Determine project path
+	var projectPath string
+	if len(args) > 0 && args[0] != "" {
+		// Project name or path provided
+		arg := args[0]
+		if strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "~") || strings.HasPrefix(arg, ".") {
+			// Absolute or relative path
+			projectPath = arg
+		} else {
+			// Just a name - create in home directory
+			home, _ := os.UserHomeDir()
+			projectPath = filepath.Join(home, arg)
+		}
+	} else {
+		// Use current directory
+		var err error
+		projectPath, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("cannot get current directory: %v", err)
+		}
+	}
+
+	// Expand ~ if present
+	if strings.HasPrefix(projectPath, "~") {
+		home, _ := os.UserHomeDir()
+		projectPath = filepath.Join(home, projectPath[1:])
+	}
+
+	// Make path absolute
+	absPath, err := filepath.Abs(projectPath)
+	if err != nil {
+		return fmt.Errorf("cannot resolve path: %v", err)
+	}
+	projectPath = absPath
+
+	// Check if directory exists, create if not
+	if _, err := os.Stat(projectPath); os.IsNotExist(err) {
+		fmt.Printf("Creating directory: %s\n", projectPath)
+		if err := os.MkdirAll(projectPath, 0755); err != nil {
+			return fmt.Errorf("cannot create directory: %v", err)
+		}
+	}
+
+	// Register session on server
+	fmt.Printf("Registering session on server...\n")
+	cmd := fmt.Sprintf("ccc register-session %s %s",
+		shellQuote(config.HostName), shellQuote(projectPath))
+
+	output, err := runSSH(config.Server, cmd, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to register session: %v", err)
+	}
+
+	topicID := strings.TrimSpace(output)
+	fmt.Printf("Session registered (topic: %s)\n", topicID)
+
+	// Change to project directory
+	if err := os.Chdir(projectPath); err != nil {
+		return fmt.Errorf("cannot change to directory: %v", err)
+	}
+
+	// Start claude
+	fmt.Printf("Starting claude in %s...\n", projectPath)
+	claudeCmd := exec.Command("claude")
+	claudeCmd.Stdin = os.Stdin
+	claudeCmd.Stdout = os.Stdout
+	claudeCmd.Stderr = os.Stderr
+
+	return claudeCmd.Run()
+}
+
 // Hook handling
 
 // forwardToServer forwards a message to the server in client mode
@@ -3646,10 +3724,20 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			// Regular message send
-			if err := send(strings.Join(os.Args[1:], " ")); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+			// Check if in client mode
+			config, _ := loadOrCreateConfig()
+			if config.Mode == "client" && config.Server != "" && config.HostName != "" {
+				// Client mode: start session
+				if err := startClientSession(config, filteredArgs); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// Server/standalone mode: send message
+				if err := send(strings.Join(os.Args[1:], " ")); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
 			}
 		}
 	}
