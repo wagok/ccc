@@ -26,7 +26,8 @@ const version = "1.0.0"
 type SessionInfo struct {
 	TopicID int64  `json:"topic_id"`
 	Path    string `json:"path"`
-	Host    string `json:"host,omitempty"` // Remote host name or "" for local
+	Host    string `json:"host,omitempty"`    // Remote host name or "" for local
+	Deleted bool   `json:"deleted,omitempty"` // Soft-deleted (killed but topic preserved)
 }
 
 // HostInfo stores information about a remote host
@@ -805,6 +806,92 @@ func createForumTopic(config *Config, name string) (int64, error) {
 	return topic.MessageThreadID, nil
 }
 
+// editForumTopic renames a topic and verifies it exists
+func editForumTopic(config *Config, topicID int64, name string) error {
+	if config.GroupID == 0 {
+		return fmt.Errorf("no group configured")
+	}
+
+	params := url.Values{
+		"chat_id":           {fmt.Sprintf("%d", config.GroupID)},
+		"message_thread_id": {fmt.Sprintf("%d", topicID)},
+		"name":              {name},
+	}
+
+	result, err := telegramAPI(config, "editForumTopic", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("failed to edit topic: %s", result.Description)
+	}
+
+	return nil
+}
+
+// deleteForumTopic deletes a topic
+func deleteForumTopic(config *Config, topicID int64) error {
+	if config.GroupID == 0 {
+		return fmt.Errorf("no group configured")
+	}
+
+	params := url.Values{
+		"chat_id":           {fmt.Sprintf("%d", config.GroupID)},
+		"message_thread_id": {fmt.Sprintf("%d", topicID)},
+	}
+
+	result, err := telegramAPI(config, "deleteForumTopic", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("failed to delete topic: %s", result.Description)
+	}
+
+	return nil
+}
+
+// getOrCreateTopic finds existing topic or creates new one
+// Also syncs topic name and updates path if changed
+func getOrCreateTopic(config *Config, fullName string, path string, host string) (int64, error) {
+	// Check if session exists in config (including deleted)
+	if info, exists := config.Sessions[fullName]; exists {
+		// Try to rename topic to verify it exists and sync name
+		err := editForumTopic(config, info.TopicID, fullName)
+		if err != nil {
+			// Topic was deleted by user, create new one
+			fmt.Fprintf(os.Stderr, "Topic %d gone, creating new: %v\n", info.TopicID, err)
+			topicID, err := createForumTopic(config, fullName)
+			if err != nil {
+				return 0, err
+			}
+			info.TopicID = topicID
+		}
+		// Update path and undelete
+		info.Path = path
+		info.Deleted = false
+		saveConfig(config)
+		return info.TopicID, nil
+	}
+
+	// Create new topic
+	topicID, err := createForumTopic(config, fullName)
+	if err != nil {
+		return 0, err
+	}
+
+	// Save to config
+	config.Sessions[fullName] = &SessionInfo{
+		TopicID: topicID,
+		Path:    path,
+		Host:    host,
+		Deleted: false,
+	}
+	saveConfig(config)
+
+	return topicID, nil
+}
+
 // Tmux session management
 
 var (
@@ -1098,9 +1185,9 @@ func killSession(config *Config, name string) error {
 		killTmuxSession(tmuxName)
 	}
 
-	// Note: We keep the session in config to preserve the Telegram topic mapping.
-	// This prevents creating duplicate topics when /new is called again.
-	// The session will show as stopped (⚪) in /list since tmux is killed.
+	// Mark as deleted but keep in config to preserve topic mapping
+	sessionInfo.Deleted = true
+	saveConfig(config)
 
 	return nil
 }
@@ -1126,8 +1213,8 @@ func forwardToServer(config *Config, cwd string, message string) bool {
 	// Forward to server via SSH
 	// Use base64 to safely encode the message
 	encoded := base64.StdEncoding.EncodeToString([]byte(message))
-	cmd := fmt.Sprintf("cd %s && ccc --from=%s \"$(echo %s | base64 -d)\"",
-		shellQuote(cwd), shellQuote(config.HostName), encoded)
+	cmd := fmt.Sprintf("ccc --from=%s --cwd=%s \"$(echo %s | base64 -d)\"",
+		shellQuote(config.HostName), shellQuote(cwd), encoded)
 
 	fmt.Fprintf(os.Stderr, "hook: forwarding to server %s\n", config.Server)
 	_, err := runSSH(config.Server, cmd, 10*time.Second)
@@ -2163,14 +2250,16 @@ func send(message string) error {
 }
 
 // handleRemoteMessage handles messages forwarded from remote clients via --from flag
-func handleRemoteMessage(fromHost string, message string) error {
+func handleRemoteMessage(fromHost string, cwd string, message string) error {
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("not configured: %v", err)
 	}
 
-	// Get current working directory (passed from remote via hook)
-	cwd, _ := os.Getwd()
+	// cwd is passed from remote client via --cwd flag
+	if cwd == "" {
+		return fmt.Errorf("missing --cwd parameter")
+	}
 
 	// Find session matching fromHost and path
 	for name, info := range config.Sessions {
@@ -2188,9 +2277,21 @@ func handleRemoteMessage(fromHost string, message string) error {
 		}
 	}
 
-	// No matching session found, send to private chat as fallback
-	fmt.Printf("[remote] from=%s no matching session for path=%s\n", fromHost, cwd)
-	return sendMessage(config, config.ChatID, 0, fmt.Sprintf("[%s] %s", fromHost, message))
+	// No matching session found - auto-create topic (fallback for client-initiated sessions)
+	fmt.Printf("[remote] from=%s no session for path=%s, creating topic\n", fromHost, cwd)
+
+	// Generate session name: host:projectDir
+	fullName := fromHost + ":" + filepath.Base(cwd)
+
+	topicID, err := getOrCreateTopic(config, fullName, cwd, fromHost)
+	if err != nil {
+		// Fallback to private chat if topic creation fails
+		fmt.Fprintf(os.Stderr, "Failed to create topic: %v\n", err)
+		return sendMessage(config, config.ChatID, 0, fmt.Sprintf("[%s] %s", fromHost, message))
+	}
+
+	fmt.Printf("[remote] created/reused topic %d for session %s\n", topicID, fullName)
+	return sendMessage(config, config.GroupID, topicID, message)
 }
 
 // handleHostCommand handles /host subcommands
@@ -2628,6 +2729,7 @@ func listen() error {
 • /continue — Restart with -c flag
 • /kill <name> — Kill session (keeps topic)
 • /list — List sessions (🟢 running, ⚪ stopped)
+• /movehere <name> — Move session to this topic
 
 *Remote Hosts:*
 • /host add <name> <addr> \[dir\] — Add host
@@ -2671,9 +2773,9 @@ func listen() error {
 			if text == "/list" {
 				var lines []string
 
-				// List configured sessions with status
+				// List configured sessions with status (skip deleted)
 				for name, info := range config.Sessions {
-					if info == nil {
+					if info == nil || info.Deleted {
 						continue
 					}
 
@@ -2761,6 +2863,42 @@ func listen() error {
 					sendMessage(config, chatID, threadID, fmt.Sprintf("🗑️ Session '%s' killed", name))
 					config, _ = loadConfig()
 				}
+				continue
+			}
+
+			// /movehere <session> - move session to current topic (fix duplicates)
+			if strings.HasPrefix(text, "/movehere ") {
+				name := strings.TrimPrefix(text, "/movehere ")
+				name = strings.TrimSpace(name)
+
+				info, exists := config.Sessions[name]
+				if !exists {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Session '%s' not found", name))
+					continue
+				}
+
+				oldTopicID := info.TopicID
+				if oldTopicID == threadID {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("ℹ️ Session '%s' is already in this topic", name))
+					continue
+				}
+
+				// Update session to point to current topic
+				info.TopicID = threadID
+				info.Deleted = false
+				if err := saveConfig(config); err != nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to save: %v", err))
+					continue
+				}
+
+				// Try to delete the old topic
+				deleteErr := deleteForumTopic(config, oldTopicID)
+				if deleteErr != nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Session '%s' moved here\n⚠️ Old topic %d not deleted: %v", name, oldTopicID, deleteErr))
+				} else {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Session '%s' moved here\n🗑️ Old topic deleted", name))
+				}
+				config, _ = loadConfig()
 				continue
 			}
 
@@ -3299,6 +3437,35 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "register-session":
+		// Internal command: register a session from a remote client
+		// Usage: ccc register-session <host> <path>
+		// Returns: topic_id on success, error on failure
+		if len(os.Args) < 4 {
+			fmt.Fprintf(os.Stderr, "Usage: ccc register-session <host> <path>\n")
+			os.Exit(1)
+		}
+		host := os.Args[2]
+		path := os.Args[3]
+
+		config, err := loadConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Generate session name: host:projectDir
+		fullName := host + ":" + filepath.Base(path)
+
+		topicID, err := getOrCreateTopic(config, fullName, path, host)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Output just the topic ID for parsing by client
+		fmt.Println(topicID)
+
 	case "hook-output":
 		if err := handleOutputHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -3445,8 +3612,9 @@ func main() {
 		}
 
 	default:
-		// Check for --from flag (used by client mode to forward messages)
+		// Check for --from and --cwd flags (used by client mode to forward messages)
 		var fromHost string
+		var remoteCwd string
 		args := os.Args[1:]
 		filteredArgs := []string{}
 		for i := 0; i < len(args); i++ {
@@ -3454,6 +3622,11 @@ func main() {
 				fromHost = strings.TrimPrefix(args[i], "--from=")
 			} else if args[i] == "--from" && i+1 < len(args) {
 				fromHost = args[i+1]
+				i++ // skip next arg
+			} else if strings.HasPrefix(args[i], "--cwd=") {
+				remoteCwd = strings.TrimPrefix(args[i], "--cwd=")
+			} else if args[i] == "--cwd" && i+1 < len(args) {
+				remoteCwd = args[i+1]
 				i++ // skip next arg
 			} else {
 				filteredArgs = append(filteredArgs, args[i])
@@ -3463,7 +3636,7 @@ func main() {
 		if fromHost != "" {
 			// Message from remote client
 			message := strings.Join(filteredArgs, " ")
-			if err := handleRemoteMessage(fromHost, message); err != nil {
+			if err := handleRemoteMessage(fromHost, remoteCwd, message); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
