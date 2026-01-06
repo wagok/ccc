@@ -2883,6 +2883,11 @@ func listen() error {
 					continue
 				}
 
+				// Rename current topic to session name
+				if err := editForumTopic(config, threadID, name); err != nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Could not rename topic: %v", err))
+				}
+
 				// Update session to point to current topic
 				info.TopicID = threadID
 				info.Deleted = false
