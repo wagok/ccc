@@ -664,6 +664,11 @@ func sshTmuxSendKeys(address string, sessionName string, text string) error {
 		return err
 	}
 
+	// For long messages, Claude needs more time to process pasted content
+	if len(text) > 200 {
+		time.Sleep(2 * time.Second)
+	}
+
 	// Send Enter twice (Claude needs double Enter)
 	enterCmd := fmt.Sprintf(
 		"tmux send-keys -t %s C-m && sleep 0.05 && tmux send-keys -t %s C-m",
@@ -1084,7 +1089,12 @@ func startSession(continueSession bool) error {
 }
 
 func sendToTmux(session string, text string) error {
-	return sendToTmuxWithDelay(session, text, 50*time.Millisecond)
+	// For long messages, use longer delay for Claude to process pasted content
+	delay := 50 * time.Millisecond
+	if len(text) > 200 {
+		delay = 2 * time.Second
+	}
+	return sendToTmuxWithDelay(session, text, delay)
 }
 
 func sendToTmuxWithDelay(session string, text string, delay time.Duration) error {
@@ -1094,7 +1104,7 @@ func sendToTmuxWithDelay(session string, text string, delay time.Duration) error
 		return err
 	}
 
-	// Wait for content to load (e.g., images)
+	// Wait for content to load (e.g., images, long pasted text)
 	time.Sleep(delay)
 
 	// Send Enter twice (Claude Code needs double Enter)
@@ -1327,20 +1337,78 @@ func startClientSession(config *Config, args []string) error {
 
 // Hook handling
 
+// extractProjectDirFromTranscript extracts the encoded project directory from transcript path
+// e.g., "/home/user/.claude/projects/-home-user-Projects-myapp/transcript.json" -> "-home-user-Projects-myapp"
+func extractProjectDirFromTranscript(transcriptPath string) string {
+	if transcriptPath == "" {
+		return ""
+	}
+	// Find "/projects/" in the path
+	idx := strings.Index(transcriptPath, "/projects/")
+	if idx == -1 {
+		return ""
+	}
+	// Get the part after "/projects/"
+	rest := transcriptPath[idx+len("/projects/"):]
+	// Take only the directory name (before next /)
+	if slashIdx := strings.Index(rest, "/"); slashIdx != -1 {
+		return rest[:slashIdx]
+	}
+	return rest
+}
+
+// resolveProjectPathFromTranscript finds the actual project path by matching encoded transcript dir with cwd segments
+// Returns the project path if found, empty string otherwise
+func resolveProjectPathFromTranscript(encodedProjectDir string, cwd string) string {
+	if encodedProjectDir == "" || cwd == "" {
+		return ""
+	}
+
+	// Normalize cwd (expand ~)
+	if strings.HasPrefix(cwd, "~") {
+		home, _ := os.UserHomeDir()
+		cwd = home + cwd[1:]
+	}
+
+	// Split into segments
+	segments := strings.Split(cwd, "/")
+
+	// Build path incrementally and check for match
+	currentPath := ""
+	for _, segment := range segments {
+		if segment == "" {
+			continue
+		}
+		currentPath += "/" + segment
+
+		// Encode current path the same way Claude does: replace / with -
+		encoded := strings.ReplaceAll(currentPath, "/", "-")
+
+		if encoded == encodedProjectDir {
+			return currentPath
+		}
+	}
+
+	return ""
+}
+
 // forwardToServer forwards a message to the server in client mode
 // Returns true if forwarded (client mode), false otherwise
-func forwardToServer(config *Config, cwd string, message string) bool {
+func forwardToServer(config *Config, cwd string, transcriptPath string, message string) bool {
 	if config.Mode != "client" || config.Server == "" || config.HostName == "" {
 		return false
 	}
 
+	// Extract encoded project dir from transcript path
+	projectDir := extractProjectDirFromTranscript(transcriptPath)
+
 	// Forward to server via SSH
 	// Use base64 to safely encode the message
 	encoded := base64.StdEncoding.EncodeToString([]byte(message))
-	cmd := fmt.Sprintf("ccc --from=%s --cwd=%s \"$(echo %s | base64 -d)\"",
-		shellQuote(config.HostName), shellQuote(cwd), encoded)
+	cmd := fmt.Sprintf("ccc --from=%s --cwd=%s --project=%s \"$(echo %s | base64 -d)\"",
+		shellQuote(config.HostName), shellQuote(cwd), shellQuote(projectDir), encoded)
 
-	fmt.Fprintf(os.Stderr, "hook: forwarding to server %s\n", config.Server)
+	fmt.Fprintf(os.Stderr, "hook: forwarding to server %s (project=%s)\n", config.Server, projectDir)
 	_, err := runSSH(config.Server, cmd, 10*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hook: forward error: %v\n", err)
@@ -1374,7 +1442,7 @@ func handleHook() error {
 	}
 
 	// In client mode, forward to server
-	if forwardToServer(config, hookData.Cwd, lastMessage) {
+	if forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, lastMessage) {
 		return nil
 	}
 
@@ -1569,7 +1637,7 @@ func handlePromptHook() error {
 	}
 
 	// In client mode, forward to server
-	if forwardToServer(config, hookData.Cwd, fmt.Sprintf("💬 %s", prompt)) {
+	if forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, fmt.Sprintf("💬 %s", prompt)) {
 		return nil
 	}
 
@@ -1637,7 +1705,7 @@ func handleOutputHook() error {
 	}
 
 	// In client mode, forward to server
-	if forwardToServer(config, hookData.Cwd, msg) {
+	if forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, msg) {
 		return nil
 	}
 
@@ -2374,7 +2442,7 @@ func send(message string) error {
 }
 
 // handleRemoteMessage handles messages forwarded from remote clients via --from flag
-func handleRemoteMessage(fromHost string, cwd string, message string) error {
+func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, message string) error {
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("not configured: %v", err)
@@ -2383,6 +2451,16 @@ func handleRemoteMessage(fromHost string, cwd string, message string) error {
 	// cwd is passed from remote client via --cwd flag
 	if cwd == "" {
 		return fmt.Errorf("missing --cwd parameter")
+	}
+
+	// Resolve actual project path from encoded project dir
+	// This handles cases where Claude cd'd into a subdirectory
+	projectPath := cwd
+	if encodedProjectDir != "" {
+		if resolved := resolveProjectPathFromTranscript(encodedProjectDir, cwd); resolved != "" {
+			projectPath = resolved
+			fmt.Printf("[remote] resolved project path: %s (from cwd=%s)\n", projectPath, cwd)
+		}
 	}
 
 	// Find session matching fromHost and path
@@ -2394,20 +2472,20 @@ func handleRemoteMessage(fromHost string, cwd string, message string) error {
 		if info.Host != fromHost {
 			continue
 		}
-		// Check if path matches
-		if info.Path == cwd {
+		// Check if path matches (use resolved projectPath)
+		if info.Path == projectPath {
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
 			return sendMessage(config, config.GroupID, info.TopicID, message)
 		}
 	}
 
 	// No matching session found - auto-create topic (fallback for client-initiated sessions)
-	fmt.Printf("[remote] from=%s no session for path=%s, creating topic\n", fromHost, cwd)
+	fmt.Printf("[remote] from=%s no session for path=%s, creating topic\n", fromHost, projectPath)
 
 	// Generate session name: host:projectDir
-	fullName := fromHost + ":" + filepath.Base(cwd)
+	fullName := fromHost + ":" + filepath.Base(projectPath)
 
-	topicID, err := getOrCreateTopic(config, fullName, cwd, fromHost)
+	topicID, err := getOrCreateTopic(config, fullName, projectPath, fromHost)
 	if err != nil {
 		// Fallback to private chat if topic creation fails
 		fmt.Fprintf(os.Stderr, "Failed to create topic: %v\n", err)
@@ -3757,9 +3835,10 @@ func main() {
 		}
 
 	default:
-		// Check for --from and --cwd flags (used by client mode to forward messages)
+		// Check for --from, --cwd, and --project flags (used by client mode to forward messages)
 		var fromHost string
 		var remoteCwd string
+		var remoteProject string
 		args := os.Args[1:]
 		filteredArgs := []string{}
 		for i := 0; i < len(args); i++ {
@@ -3773,6 +3852,11 @@ func main() {
 			} else if args[i] == "--cwd" && i+1 < len(args) {
 				remoteCwd = args[i+1]
 				i++ // skip next arg
+			} else if strings.HasPrefix(args[i], "--project=") {
+				remoteProject = strings.TrimPrefix(args[i], "--project=")
+			} else if args[i] == "--project" && i+1 < len(args) {
+				remoteProject = args[i+1]
+				i++ // skip next arg
 			} else {
 				filteredArgs = append(filteredArgs, args[i])
 			}
@@ -3781,7 +3865,7 @@ func main() {
 		if fromHost != "" {
 			// Message from remote client
 			message := strings.Join(filteredArgs, " ")
-			if err := handleRemoteMessage(fromHost, remoteCwd, message); err != nil {
+			if err := handleRemoteMessage(fromHost, remoteCwd, remoteProject, message); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
