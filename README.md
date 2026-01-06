@@ -705,6 +705,16 @@ This checks tmux, claude, config, hooks, and service status.
 - Check if Claude Code is installed: `which claude`
 - On Linux, verify tmux socket exists: `ls /tmp/tmux-$(id -u)/`
 
+**tmux socket error?**
+```
+error connecting to /tmp/tmux-1000/default (No such file or directory)
+```
+Run `tmux` once manually to create the socket directory, then exit:
+```bash
+tmux
+# press Ctrl+D or type 'exit'
+```
+
 **Messages not reaching Claude?**
 - Verify you're in the correct topic
 - Check if session exists: `/list`
