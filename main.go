@@ -1205,14 +1205,25 @@ func getSessionByTopic(config *Config, topicID int64) string {
 
 // startClientSession starts a claude session on the client
 // 1. Determines project path from args or cwd
-// 2. Registers session on server via SSH
-// 3. Starts claude locally
+// 2. Registers session on server via SSH (creates Telegram topic)
+// 3. Creates/attaches tmux session with claude
 func startClientSession(config *Config, args []string) error {
+	// Check for -c flag
+	continueSession := false
+	filteredArgs := []string{}
+	for _, arg := range args {
+		if arg == "-c" {
+			continueSession = true
+		} else {
+			filteredArgs = append(filteredArgs, arg)
+		}
+	}
+
 	// Determine project path
 	var projectPath string
-	if len(args) > 0 && args[0] != "" {
+	if len(filteredArgs) > 0 && filteredArgs[0] != "" {
 		// Project name or path provided
-		arg := args[0]
+		arg := filteredArgs[0]
 		if strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "~") || strings.HasPrefix(arg, ".") {
 			// Absolute or relative path
 			projectPath = arg
@@ -1251,7 +1262,11 @@ func startClientSession(config *Config, args []string) error {
 		}
 	}
 
-	// Register session on server
+	// Session name for tmux
+	name := filepath.Base(projectPath)
+	tmuxName := "claude-" + name
+
+	// Register session on server (creates Telegram topic)
 	fmt.Printf("Registering session on server...\n")
 	cmd := fmt.Sprintf("ccc register-session %s %s",
 		shellQuote(config.HostName), shellQuote(projectPath))
@@ -1264,19 +1279,44 @@ func startClientSession(config *Config, args []string) error {
 	topicID := strings.TrimSpace(output)
 	fmt.Printf("Session registered (topic: %s)\n", topicID)
 
-	// Change to project directory
-	if err := os.Chdir(projectPath); err != nil {
-		return fmt.Errorf("cannot change to directory: %v", err)
+	// Check if tmux session already exists
+	if tmuxSessionExists(tmuxName) {
+		fmt.Printf("Attaching to existing session: %s\n", tmuxName)
+		if os.Getenv("TMUX") != "" {
+			// Inside tmux: switch to the session
+			switchCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "switch-client", "-t", tmuxName)
+			switchCmd.Stdin = os.Stdin
+			switchCmd.Stdout = os.Stdout
+			switchCmd.Stderr = os.Stderr
+			return switchCmd.Run()
+		}
+		// Outside tmux: attach to existing session
+		attachCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "attach-session", "-t", tmuxName)
+		attachCmd.Stdin = os.Stdin
+		attachCmd.Stdout = os.Stdout
+		attachCmd.Stderr = os.Stderr
+		return attachCmd.Run()
 	}
 
-	// Start claude
-	fmt.Printf("Starting claude in %s...\n", projectPath)
-	claudeCmd := exec.Command("claude")
-	claudeCmd.Stdin = os.Stdin
-	claudeCmd.Stdout = os.Stdout
-	claudeCmd.Stderr = os.Stderr
+	// Create new tmux session
+	fmt.Printf("Creating session: %s\n", tmuxName)
+	if err := createTmuxSession(tmuxName, projectPath, continueSession); err != nil {
+		return err
+	}
 
-	return claudeCmd.Run()
+	// Attach to the session
+	if os.Getenv("TMUX") != "" {
+		attachCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "switch-client", "-t", tmuxName)
+		attachCmd.Stdin = os.Stdin
+		attachCmd.Stdout = os.Stdout
+		attachCmd.Stderr = os.Stderr
+		return attachCmd.Run()
+	}
+	attachCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "attach-session", "-t", tmuxName)
+	attachCmd.Stdin = os.Stdin
+	attachCmd.Stdout = os.Stdout
+	attachCmd.Stderr = os.Stderr
+	return attachCmd.Run()
 }
 
 // Hook handling
@@ -3405,16 +3445,32 @@ func main() {
 
 	if len(os.Args) < 2 {
 		// No args: start/attach tmux session with topic
-		if err := startSession(false); err != nil {
-			os.Exit(1)
+		config, _ := loadOrCreateConfig()
+		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
+			if err := startClientSession(config, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := startSession(false); err != nil {
+				os.Exit(1)
+			}
 		}
 		return
 	}
 
 	// Check for -c flag (continue) as first arg
 	if os.Args[1] == "-c" {
-		if err := startSession(true); err != nil {
-			os.Exit(1)
+		config, _ := loadOrCreateConfig()
+		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
+			if err := startClientSession(config, []string{"-c"}); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := startSession(true); err != nil {
+				os.Exit(1)
+			}
 		}
 		return
 	}
