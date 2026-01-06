@@ -859,13 +859,19 @@ func getOrCreateTopic(config *Config, fullName string, path string, host string)
 		// Try to rename topic to verify it exists and sync name
 		err := editForumTopic(config, info.TopicID, fullName)
 		if err != nil {
-			// Topic was deleted by user, create new one
-			fmt.Fprintf(os.Stderr, "Topic %d gone, creating new: %v\n", info.TopicID, err)
-			topicID, err := createForumTopic(config, fullName)
-			if err != nil {
-				return 0, err
+			errStr := err.Error()
+			// Check if error indicates topic doesn't exist vs just "not modified"
+			if strings.Contains(errStr, "not found") || strings.Contains(errStr, "TOPIC_CLOSED") ||
+				strings.Contains(errStr, "TOPIC_DELETED") || strings.Contains(errStr, "invalid") {
+				// Topic was deleted by user, create new one
+				fmt.Fprintf(os.Stderr, "Topic %d gone, creating new: %v\n", info.TopicID, err)
+				topicID, err := createForumTopic(config, fullName)
+				if err != nil {
+					return 0, err
+				}
+				info.TopicID = topicID
 			}
-			info.TopicID = topicID
+			// Otherwise (e.g., "not modified"), topic exists - just continue
 		}
 		// Update path and undelete
 		info.Path = path
