@@ -569,6 +569,38 @@ func runSSH(address string, command string, timeout time.Duration) (string, erro
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// scpToHost copies a file to a remote host via scp
+func scpToHost(address string, localPath string, remotePath string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "scp",
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
+		localPath,
+		address+":"+remotePath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("timeout after %v", timeout)
+	}
+	if err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return fmt.Errorf("%s: %s", err, errMsg)
+		}
+		return err
+	}
+
+	return nil
+}
+
 // shellQuote quotes a string for safe shell usage
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
@@ -2870,32 +2902,53 @@ func listen() error {
 						hostName = sessionInfo.Host
 					}
 
-					// Photos for remote sessions not yet supported
-					if hostName != "" {
-						sendMessage(config, chatID, threadID, "⚠️ Photos not yet supported for remote sessions. Send as text or use voice.")
-						continue
-					}
-
 					// Extract project name for tmux session
 					_, projectName := parseSessionTarget(sessionName)
 					tmuxName := "claude-" + extractProjectName(projectName)
 
-					if tmuxSessionExists(tmuxName) {
-						// Get largest photo (last in array)
-						photo := msg.Photo[len(msg.Photo)-1]
-						imgPath := filepath.Join(os.TempDir(), fmt.Sprintf("telegram_%d.jpg", time.Now().UnixNano()))
-						if err := downloadTelegramFile(config, photo.FileID, imgPath); err != nil {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
-						} else {
-							caption := msg.Caption
-							if caption == "" {
-								caption = "Analyze this image:"
-							}
-							prompt := fmt.Sprintf("%s %s", caption, imgPath)
-							sendMessage(config, chatID, threadID, fmt.Sprintf("📷 Image saved, sending to Claude..."))
-							// Send text first, wait for image to load, then send Enter
-							sendToTmuxWithDelay(tmuxName, prompt, 2*time.Second)
+					// Get largest photo (last in array)
+					photo := msg.Photo[len(msg.Photo)-1]
+					imgPath := filepath.Join(os.TempDir(), fmt.Sprintf("telegram_%d.jpg", time.Now().UnixNano()))
+					if err := downloadTelegramFile(config, photo.FileID, imgPath); err != nil {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
+						continue
+					}
+
+					caption := msg.Caption
+					if caption == "" {
+						caption = "Analyze this image:"
+					}
+
+					// Handle remote sessions
+					if hostName != "" {
+						hostInfo := config.Hosts[hostName]
+						if hostInfo == nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host %s not found in config", hostName))
+							continue
 						}
+
+						// SCP file to remote host
+						sendMessage(config, chatID, threadID, "📷 Transferring image to remote host...")
+						remotePath := imgPath // Use same path on remote
+						if err := scpToHost(hostInfo.Address, imgPath, remotePath, 30*time.Second); err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ SCP failed: %v", err))
+							continue
+						}
+
+						// Send to remote tmux
+						prompt := fmt.Sprintf("%s %s", caption, remotePath)
+						sshTmuxSendKeys(hostInfo.Address, tmuxName, prompt)
+						// Clean up local file
+						os.Remove(imgPath)
+						continue
+					}
+
+					// Local session
+					if tmuxSessionExists(tmuxName) {
+						prompt := fmt.Sprintf("%s %s", caption, imgPath)
+						sendMessage(config, chatID, threadID, "📷 Image saved, sending to Claude...")
+						// Send text first, wait for image to load, then send Enter
+						sendToTmuxWithDelay(tmuxName, prompt, 2*time.Second)
 					}
 				}
 				continue
