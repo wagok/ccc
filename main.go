@@ -1275,18 +1275,33 @@ func handleHook() error {
 	}
 
 	// Find session by matching cwd with saved path
+	// Prefer local sessions (Host=="") over remote sessions with same path
 	var sessionName string
 	var topicID int64
+	var foundRemote string // Track remote match in case no local match
+	var remoteTopicID int64
 	for name, info := range config.Sessions {
-		if info == nil {
+		if info == nil || info.Deleted {
 			continue
 		}
 		// Match against saved path or suffix
 		if hookData.Cwd == info.Path || strings.HasSuffix(hookData.Cwd, "/"+name) {
-			sessionName = name
-			topicID = info.TopicID
-			break
+			if info.Host == "" {
+				// Local session - use immediately
+				sessionName = name
+				topicID = info.TopicID
+				break
+			} else if foundRemote == "" {
+				// Remote session - save as fallback
+				foundRemote = name
+				remoteTopicID = info.TopicID
+			}
 		}
+	}
+	// Use remote match if no local match found
+	if sessionName == "" && foundRemote != "" {
+		sessionName = foundRemote
+		topicID = remoteTopicID
 	}
 	if sessionName == "" || config.GroupID == 0 {
 		fmt.Fprintf(os.Stderr, "hook: no session found for cwd=%s\n", hookData.Cwd)
