@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -226,6 +227,53 @@ func sendTypingAction(config *Config, chatID int64, threadID int64) {
 		params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
 	}
 	telegramAPI(config, "sendChatAction", params)
+}
+
+// Continuous typing indicator management
+var (
+	typingCancelers = make(map[string]context.CancelFunc)
+	typingMu        sync.Mutex
+)
+
+// startContinuousTyping starts sending typing indicator every 4 seconds
+// until stopContinuousTyping is called for this session
+func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName string) {
+	typingMu.Lock()
+	// Cancel existing typing for this session
+	if cancel, ok := typingCancelers[sessionName]; ok {
+		cancel()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // Max 10 min
+	typingCancelers[sessionName] = cancel
+	typingMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+
+		// Send initial typing
+		sendTypingAction(cfg, chatID, threadID)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sendTypingAction(cfg, chatID, threadID)
+			}
+		}
+	}()
+}
+
+// stopContinuousTyping stops the typing indicator for a session
+func stopContinuousTyping(sessionName string) {
+	typingMu.Lock()
+	defer typingMu.Unlock()
+	if cancel, ok := typingCancelers[sessionName]; ok {
+		cancel()
+		delete(typingCancelers, sessionName)
+	}
 }
 
 func splitMessage(text string, maxLen int) []string {
@@ -975,6 +1023,95 @@ func listTmuxSessions() ([]string, error) {
 	return sessions, nil
 }
 
+// TmuxSessionInfo holds information about a tmux session
+type TmuxSessionInfo struct {
+	Created  time.Time
+	Activity time.Time
+	Path     string
+}
+
+// getTmuxSessionInfo returns detailed info about a tmux session
+func getTmuxSessionInfo(name string) (*TmuxSessionInfo, error) {
+	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "list-sessions", "-F",
+		"#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_path}",
+		"-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return nil, fmt.Errorf("session not found")
+	}
+
+	parts := strings.Split(line, "\t")
+	if len(parts) < 4 {
+		return nil, fmt.Errorf("invalid tmux output")
+	}
+
+	created, _ := strconv.ParseInt(parts[1], 10, 64)
+	activity, _ := strconv.ParseInt(parts[2], 10, 64)
+
+	return &TmuxSessionInfo{
+		Created:  time.Unix(created, 0),
+		Activity: time.Unix(activity, 0),
+		Path:     parts[3],
+	}, nil
+}
+
+// sshGetTmuxSessionInfo returns detailed info about a remote tmux session
+func sshGetTmuxSessionInfo(address string, name string) (*TmuxSessionInfo, error) {
+	cmd := fmt.Sprintf("tmux list-sessions -F '#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_path}' -f '#{==:#{session_name},%s}'", name)
+	out, err := runSSH(address, cmd, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return nil, fmt.Errorf("session not found")
+	}
+
+	parts := strings.Split(line, "\t")
+	if len(parts) < 4 {
+		return nil, fmt.Errorf("invalid tmux output")
+	}
+
+	created, _ := strconv.ParseInt(parts[1], 10, 64)
+	activity, _ := strconv.ParseInt(parts[2], 10, 64)
+
+	return &TmuxSessionInfo{
+		Created:  time.Unix(created, 0),
+		Activity: time.Unix(activity, 0),
+		Path:     parts[3],
+	}, nil
+}
+
+// formatDuration formats a duration in human-readable format
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		hours := int(d.Hours())
+		mins := int(d.Minutes()) % 60
+		if mins > 0 {
+			return fmt.Sprintf("%dh %dm", hours, mins)
+		}
+		return fmt.Sprintf("%dh", hours)
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	if hours > 0 {
+		return fmt.Sprintf("%dd %dh", days, hours)
+	}
+	return fmt.Sprintf("%dd", days)
+}
+
 // Session management
 
 func sessionName(name string) string {
@@ -1310,6 +1447,10 @@ func handleHook() error {
 
 	fmt.Fprintf(os.Stderr, "hook: session=%s topic=%d\n", sessionName, topicID)
 	fmt.Fprintf(os.Stderr, "hook: sending message to telegram\n")
+
+	// Stop typing indicator for this session
+	stopContinuousTyping(sessionName)
+
 	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
 }
 
@@ -1717,6 +1858,7 @@ func setBotCommands(botToken string) {
 			{"command": "continue", "description": "Continue session: /continue [host:]<name>"},
 			{"command": "kill", "description": "Kill session: /kill <name>"},
 			{"command": "list", "description": "List sessions with status"},
+			{"command": "status", "description": "Show current session details"},
 			{"command": "host", "description": "Manage hosts: /host add|del|list|check"},
 			{"command": "rc", "description": "Remote command: /rc <host> <cmd>"},
 			{"command": "setdir", "description": "Set projects dir: /setdir [host:]<path>"},
@@ -2688,7 +2830,8 @@ func listen() error {
 							} else if transcription != "" {
 								fmt.Printf("[voice] @%s: %s\n", msg.From.Username, transcription)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("📝 %s", transcription))
-								// Send to appropriate tmux
+								// Start typing indicator and send to appropriate tmux
+								startContinuousTyping(config, chatID, threadID, sessionName)
 								if hostName != "" {
 									sshTmuxSendKeys(address, tmuxName, transcription)
 								} else {
@@ -2748,6 +2891,7 @@ func listen() error {
 
 						// Send to remote tmux
 						prompt := fmt.Sprintf("%s %s", caption, remotePath)
+						startContinuousTyping(config, chatID, threadID, sessionName)
 						sshTmuxSendKeys(hostInfo.Address, tmuxName, prompt)
 						// Clean up local file
 						os.Remove(imgPath)
@@ -2758,6 +2902,7 @@ func listen() error {
 					if tmuxSessionExists(tmuxName) {
 						prompt := fmt.Sprintf("%s %s", caption, imgPath)
 						sendMessage(config, chatID, threadID, "📷 Image saved, sending to Claude...")
+						startContinuousTyping(config, chatID, threadID, sessionName)
 						// Send text first, wait for image to load, then send Enter
 						sendToTmuxWithDelay(tmuxName, prompt, 2*time.Second)
 					}
@@ -2795,6 +2940,7 @@ func listen() error {
 • /continue — Restart with -c flag
 • /kill <name> — Kill session (keeps topic)
 • /list — List sessions (🟢 running, ⚪ stopped)
+• /status — Show current session details
 • /movehere <name> — Move session to this topic
 
 *Remote Hosts:*
@@ -2875,6 +3021,62 @@ func listen() error {
 				} else {
 					sendMessage(config, chatID, threadID, "Sessions:\n"+strings.Join(lines, "\n"))
 				}
+				continue
+			}
+
+			// /status - show detailed session info for current topic
+			if text == "/status" && isGroup {
+				sessionName := getSessionByTopic(config, threadID)
+				if sessionName == "" {
+					sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
+					continue
+				}
+
+				sessionInfo := config.Sessions[sessionName]
+				if sessionInfo == nil {
+					sendMessage(config, chatID, threadID, "❌ Session info not found")
+					continue
+				}
+
+				_, projectName := parseSessionTarget(sessionName)
+				tmuxName := "claude-" + extractProjectName(projectName)
+
+				var msg strings.Builder
+				msg.WriteString(fmt.Sprintf("📊 *Session: %s*\n\n", sessionName))
+
+				// Get tmux session info
+				var tmuxInfo *TmuxSessionInfo
+				var err error
+
+				if sessionInfo.Host != "" {
+					address := getHostAddress(config, sessionInfo.Host)
+					if address != "" {
+						tmuxInfo, err = sshGetTmuxSessionInfo(address, tmuxName)
+						msg.WriteString(fmt.Sprintf("🖥️ Host: %s\n", sessionInfo.Host))
+					}
+				} else {
+					tmuxInfo, err = getTmuxSessionInfo(tmuxName)
+					msg.WriteString("🖥️ Host: local\n")
+				}
+
+				msg.WriteString(fmt.Sprintf("📁 Path: %s\n", sessionInfo.Path))
+
+				if err != nil || tmuxInfo == nil {
+					msg.WriteString("\n⚪ Status: stopped\n")
+				} else {
+					msg.WriteString("\n🟢 Status: running\n")
+					msg.WriteString(fmt.Sprintf("📂 CWD: %s\n", tmuxInfo.Path))
+
+					now := time.Now()
+					uptime := now.Sub(tmuxInfo.Created)
+					idle := now.Sub(tmuxInfo.Activity)
+
+					msg.WriteString(fmt.Sprintf("⏱️ Uptime: %s\n", formatDuration(uptime)))
+					msg.WriteString(fmt.Sprintf("💤 Idle: %s\n", formatDuration(idle)))
+					msg.WriteString(fmt.Sprintf("🕐 Started: %s\n", tmuxInfo.Created.Format("2006-01-02 15:04")))
+				}
+
+				sendMessage(config, chatID, threadID, msg.String())
 				continue
 			}
 
@@ -3259,7 +3461,9 @@ func listen() error {
 						}
 
 						if sshTmuxHasSession(address, tmuxName) {
+							startContinuousTyping(config, chatID, threadID, sessionName)
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
+								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
 							}
 						} else {
@@ -3268,7 +3472,9 @@ func listen() error {
 					} else {
 						// Local session
 						if tmuxSessionExists(tmuxName) {
+							startContinuousTyping(config, chatID, threadID, sessionName)
 							if err := sendToTmux(tmuxName, text); err != nil {
+								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
 							}
 						} else {
