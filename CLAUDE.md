@@ -1,49 +1,62 @@
 # Project Instructions
 
+## Language Policy
+
+**All code, comments, commit messages, and documentation in this repository MUST be in English.**
+
+This includes:
+- Source code comments
+- Variable/function names
+- Commit messages
+- Documentation files (README, CLAUDE.md, etc.)
+- Issue descriptions in beads
+
+Note: Conversation with the user may be in any language they prefer.
+
 ## Task Tracking Policy
 
-### ЕДИНСТВЕННЫЙ инструмент: beads (bd)
+### Use beads (bd) exclusively
 
-Для ЛЮБОГО отслеживания задач, прогресса, TODO используй ТОЛЬКО `bd`:
+For ANY task tracking, progress monitoring, or TODO management, use ONLY `bd`:
 
 ```bash
-bd ready              # Поиск доступной работы
-bd create "Task"      # Создание задачи
-bd update <id> --status in_progress  # Начать работу
-bd close <id>         # Завершить задачу
-bd sync               # Синхронизация с git
+bd ready              # Find available work
+bd create "Task"      # Create a task
+bd update <id> --status in_progress  # Start work
+bd close <id>         # Complete a task
+bd sync               # Sync with git
 ```
 
-### ЗАПРЕЩЕНО использовать для task tracking
+### Prohibited for task tracking
 
-| Инструмент | Статус | Причина |
-|------------|--------|---------|
-| **TodoWrite** | ЗАПРЕЩЁН | Используй `bd` вместо встроенного todo |
-| **Linear MCP** | ЗАПРЕЩЁН | Внешняя система, не интегрирована |
-| **Asana MCP** | ЗАПРЕЩЁН | Внешняя система, не интегрирована |
-| **GitHub Issues** | Только upstream | Не для внутренних задач |
-| **GitLab Issues** | ЗАПРЕЩЁН | Не используется |
-| **Файлы TODO.md** | ЗАПРЕЩЁН | Задачи только в beads |
+| Tool | Status | Reason |
+|------|--------|--------|
+| **TodoWrite** | PROHIBITED | Use `bd` instead |
+| **Linear MCP** | PROHIBITED | External system, not integrated |
+| **Asana MCP** | PROHIBITED | External system, not integrated |
+| **GitHub Issues** | Upstream only | Not for internal tasks |
+| **GitLab Issues** | PROHIBITED | Not used |
+| **TODO.md files** | PROHIBITED | Tasks only in beads |
 
-### Замена TodoWrite на beads
+### Replacing TodoWrite with beads
 
-Когда нужно спланировать несколько задач, вместо TodoWrite:
+When planning multiple tasks, instead of TodoWrite:
 
 ```bash
-# Создай задачи в beads
+# Create tasks in beads
 bd create "Implement feature X" -p 1
 bd create "Add tests for X" -p 2
 bd create "Update documentation" -p 3
 
-# Отслеживай прогресс через bd
+# Track progress via bd
 bd update <id> --status in_progress
 bd close <id>
 ```
 
-### Вспомогательные инструменты (read-only)
+### Auxiliary tools (read-only)
 
-- **qdrant-mcp** — только поиск по документации
-- **claude-context** — только анализ структуры кода
-- **Grep/Glob** — поиск в коде
+- **qdrant-mcp** — documentation search only
+- **claude-context** — code structure analysis only
+- **Grep/Glob** — code search
 
-Эти инструменты НЕ используются для хранения задач или статусов.
+These tools are NOT used for storing tasks or status.
