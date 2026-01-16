@@ -173,7 +173,7 @@ type HistoryMessage struct {
 	Username      string `json:"username,omitempty"`      // telegram username
 }
 
-// Global message ID counter (in-memory, resets on restart)
+// Global message ID counter (in-memory, initialized from history on start)
 var (
 	messageIDCounter int64
 	messageIDMutex   sync.Mutex
@@ -184,6 +184,46 @@ func nextMessageID() int64 {
 	defer messageIDMutex.Unlock()
 	messageIDCounter++
 	return messageIDCounter
+}
+
+// initMessageIDCounter initializes the counter from existing history files
+func initMessageIDCounter() {
+	homeDir, _ := os.UserHomeDir()
+	historyBase := filepath.Join(homeDir, ".ccc", "history")
+
+	var maxID int64
+
+	// Walk through all history directories
+	filepath.Walk(historyBase, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var msg struct {
+				ID int64 `json:"id"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &msg) == nil && msg.ID > maxID {
+				maxID = msg.ID
+			}
+		}
+		return nil
+	})
+
+	messageIDMutex.Lock()
+	messageIDCounter = maxID
+	messageIDMutex.Unlock()
+
+	if maxID > 0 {
+		fmt.Printf("Message ID counter initialized to %d\n", maxID)
+	}
 }
 
 // getHistoryDir returns the history directory for a topic
@@ -3534,6 +3574,9 @@ func listen() error {
 	fmt.Printf("Bot listening... (chat: %d, group: %d)\n", config.ChatID, config.GroupID)
 	fmt.Printf("Active sessions: %d\n", len(config.Sessions))
 	fmt.Println("Press Ctrl+C to stop")
+
+	// Initialize message ID counter from history
+	initMessageIDCounter()
 
 	// Start Unix socket API server
 	if err := startSocketServer(config); err != nil {
