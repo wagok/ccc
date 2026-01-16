@@ -17,6 +17,10 @@ install: build
 			echo "   Run: source ~/.bashrc"; \
 		fi \
 	fi
+	@if systemctl --user is-active ccc >/dev/null 2>&1; then \
+		systemctl --user restart ccc; \
+		echo "✅ Restarted ccc service"; \
+	fi
 
 clean:
 	rm -f ccc
