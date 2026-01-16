@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -114,6 +115,588 @@ type HookData struct {
 			} `json:"options"`
 		} `json:"questions"`
 	} `json:"tool_input"`
+}
+
+// ============================================================================
+// Local API Types and Functions (Unix Socket)
+// ============================================================================
+
+// APIRequest represents an incoming request on the Unix socket
+type APIRequest struct {
+	Cmd      string   `json:"cmd"`                 // sessions, ask, send, history, subscribe
+	Session  string   `json:"session,omitempty"`   // session name
+	Text     string   `json:"text,omitempty"`      // message text
+	From     string   `json:"from,omitempty"`      // agent identifier
+	After    int64    `json:"after,omitempty"`     // for history: after message_id
+	Limit    int      `json:"limit,omitempty"`     // for history: max messages
+	Sessions []string `json:"sessions,omitempty"`  // for subscribe: session list
+}
+
+// APIResponse represents a response on the Unix socket
+type APIResponse struct {
+	OK        bool              `json:"ok"`
+	Error     string            `json:"error,omitempty"`
+	Sessions  []APISessionInfo  `json:"sessions,omitempty"`
+	Response  string            `json:"response,omitempty"`
+	MessageID int64             `json:"message_id,omitempty"`
+	Messages  []HistoryMessage  `json:"messages,omitempty"`
+	Duration  int64             `json:"duration_ms,omitempty"`
+}
+
+// APIEvent represents a streaming event for subscribe
+type APIEvent struct {
+	Event   string `json:"event"`             // subscribed, message, status
+	Session string `json:"session,omitempty"`
+	From    string `json:"from,omitempty"`    // human, claude, api
+	Text    string `json:"text,omitempty"`
+	Status  string `json:"status,omitempty"`  // active, idle
+}
+
+// APISessionInfo represents session info in API response
+type APISessionInfo struct {
+	Name   string `json:"name"`
+	Host   string `json:"host"`   // "local" or host name
+	Status string `json:"status"` // "active", "idle"
+}
+
+// HistoryMessage represents a message stored in history
+type HistoryMessage struct {
+	ID            int64  `json:"id"`
+	Timestamp     int64  `json:"ts"`
+	From          string `json:"from"`                    // human, claude, api
+	Text          string `json:"text,omitempty"`
+	Type          string `json:"type,omitempty"`          // text, voice, photo, document
+	Path          string `json:"path,omitempty"`          // artifact path
+	Transcription string `json:"transcription,omitempty"` // for voice
+	Caption       string `json:"caption,omitempty"`       // for photo/document
+	Agent         string `json:"agent,omitempty"`         // for api messages
+	Username      string `json:"username,omitempty"`      // telegram username
+}
+
+// Global message ID counter (in-memory, resets on restart)
+var (
+	messageIDCounter int64
+	messageIDMutex   sync.Mutex
+)
+
+func nextMessageID() int64 {
+	messageIDMutex.Lock()
+	defer messageIDMutex.Unlock()
+	messageIDCounter++
+	return messageIDCounter
+}
+
+// getHistoryDir returns the history directory for a topic
+func getHistoryDir(topicID int64) string {
+	homeDir, _ := os.UserHomeDir()
+	return filepath.Join(homeDir, ".ccc", "history", fmt.Sprintf("%d", topicID), "messages")
+}
+
+// getHistoryFile returns the history file path for current hour
+func getHistoryFile(topicID int64) string {
+	hour := time.Now().Format("2006-01-02-15")
+	return filepath.Join(getHistoryDir(topicID), hour+".jsonl")
+}
+
+// appendHistory appends a message to the history file
+func appendHistory(topicID int64, msg HistoryMessage) error {
+	if topicID == 0 {
+		return nil // Skip private chats without topic
+	}
+
+	dir := getHistoryDir(topicID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	filePath := getHistoryFile(topicID)
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return json.NewEncoder(f).Encode(msg)
+}
+
+// readHistory reads messages from history files
+func readHistory(topicID int64, afterID int64, limit int) ([]HistoryMessage, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	dir := getHistoryDir(topicID)
+	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort files in reverse order (newest first) - filenames are sortable
+	for i, j := 0, len(files)-1; i < j; i, j = i+1, j-1 {
+		files[i], files[j] = files[j], files[i]
+	}
+
+	var messages []HistoryMessage
+	for _, file := range files {
+		if len(messages) >= limit {
+			break
+		}
+
+		f, err := os.Open(file)
+		if err != nil {
+			continue
+		}
+
+		var fileMessages []HistoryMessage
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var msg HistoryMessage
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
+				if msg.ID > afterID {
+					fileMessages = append(fileMessages, msg)
+				}
+			}
+		}
+		f.Close()
+
+		// Prepend to messages (older files first after reversal)
+		messages = append(fileMessages, messages...)
+	}
+
+	// Trim to limit (keep newest)
+	if len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+
+	return messages, nil
+}
+
+// socketPath returns the Unix socket path
+func socketPath() string {
+	homeDir, _ := os.UserHomeDir()
+	return filepath.Join(homeDir, ".ccc.sock")
+}
+
+// Global socket listener for cleanup
+var socketListener net.Listener
+
+// startSocketServer starts the Unix socket API server
+func startSocketServer(cfg *Config) error {
+	path := socketPath()
+
+	// Remove existing socket file
+	os.Remove(path)
+
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("failed to create socket: %w", err)
+	}
+	socketListener = listener
+
+	// Set socket permissions (owner only)
+	os.Chmod(path, 0600)
+
+	fmt.Printf("API socket: %s\n", path)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				// Check if listener was closed
+				if strings.Contains(err.Error(), "use of closed") {
+					return
+				}
+				continue
+			}
+			go handleSocketConnection(conn, cfg)
+		}
+	}()
+
+	return nil
+}
+
+// stopSocketServer stops the Unix socket server
+func stopSocketServer() {
+	if socketListener != nil {
+		socketListener.Close()
+		os.Remove(socketPath())
+	}
+}
+
+// handleSocketConnection handles a single socket connection
+func handleSocketConnection(conn net.Conn, cfg *Config) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	encoder := json.NewEncoder(conn)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return // Connection closed
+		}
+
+		var req APIRequest
+		if err := json.Unmarshal(line, &req); err != nil {
+			encoder.Encode(APIResponse{OK: false, Error: "invalid JSON"})
+			continue
+		}
+
+		switch req.Cmd {
+		case "sessions":
+			handleSessionsCmd(encoder, cfg)
+		case "ask":
+			handleAskCmd(encoder, cfg, req)
+		case "send":
+			handleSendCmd(encoder, cfg, req)
+		case "history":
+			handleHistoryCmd(encoder, cfg, req)
+		case "subscribe":
+			handleSubscribeCmd(conn, encoder, cfg, req)
+			return // Subscribe keeps connection open until done
+		default:
+			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
+		}
+	}
+}
+
+// handleSessionsCmd handles the "sessions" command
+func handleSessionsCmd(encoder *json.Encoder, cfg *Config) {
+	var sessions []APISessionInfo
+
+	for name, info := range cfg.Sessions {
+		if info.Deleted {
+			continue
+		}
+
+		status := "idle"
+		tmuxName := tmuxSessionName(name)
+
+		if info.Host != "" {
+			// Remote session
+			address := getHostAddress(cfg, info.Host)
+			if address != "" && sshTmuxHasSession(address, tmuxName) {
+				if checkClaudeState(tmuxName, address) == "busy" {
+					status = "active"
+				}
+			}
+		} else {
+			// Local session
+			if tmuxSessionExists(tmuxName) {
+				if checkClaudeState(tmuxName, "") == "busy" {
+					status = "active"
+				}
+			}
+		}
+
+		host := "local"
+		if info.Host != "" {
+			host = info.Host
+		}
+
+		sessions = append(sessions, APISessionInfo{
+			Name:   name,
+			Host:   host,
+			Status: status,
+		})
+	}
+
+	encoder.Encode(APIResponse{OK: true, Sessions: sessions})
+}
+
+// handleAskCmd handles the "ask" command (blocking)
+func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" || req.Text == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session and text required"})
+		return
+	}
+
+	info, exists := cfg.Sessions[req.Session]
+	if !exists || info.Deleted {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	tmuxName := tmuxSessionName(req.Session)
+	startTime := time.Now()
+
+	// Format message with agent identifier
+	agentLabel := req.From
+	if agentLabel == "" {
+		agentLabel = "api"
+	}
+
+	// Send to Telegram topic
+	if info.TopicID > 0 {
+		telegramMsg := fmt.Sprintf("🤖 [%s] %s", agentLabel, req.Text)
+		sendMessage(cfg, cfg.GroupID, info.TopicID, telegramMsg)
+	}
+
+	// Store in history
+	msgID := nextMessageID()
+	appendHistory(info.TopicID, HistoryMessage{
+		ID:        msgID,
+		Timestamp: time.Now().Unix(),
+		From:      "api",
+		Text:      req.Text,
+		Agent:     agentLabel,
+	})
+
+	// Send to tmux
+	var sendErr error
+	if info.Host != "" {
+		address := getHostAddress(cfg, info.Host)
+		if address == "" {
+			encoder.Encode(APIResponse{OK: false, Error: "host not configured"})
+			return
+		}
+		sendErr = sshTmuxSendKeys(address, tmuxName, req.Text)
+	} else {
+		sendErr = sendToTmux(tmuxName, req.Text)
+	}
+
+	if sendErr != nil {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to send: %v", sendErr)})
+		return
+	}
+
+	// Wait for Claude to finish (poll state)
+	sshAddr := ""
+	if info.Host != "" {
+		sshAddr = getHostAddress(cfg, info.Host)
+	}
+
+	// Wait for Claude to become busy (started processing)
+	time.Sleep(500 * time.Millisecond)
+
+	// Wait for Claude to become idle (finished processing)
+	timeout := time.After(5 * time.Minute)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	idleCount := 0
+	for {
+		select {
+		case <-timeout:
+			encoder.Encode(APIResponse{OK: false, Error: "timeout waiting for response"})
+			return
+		case <-ticker.C:
+			state := checkClaudeState(tmuxName, sshAddr)
+			if state == "idle" {
+				idleCount++
+				if idleCount >= 2 {
+					// Claude is idle, get last response
+					response := getLastClaudeResponse(tmuxName, sshAddr)
+					duration := time.Since(startTime).Milliseconds()
+					encoder.Encode(APIResponse{
+						OK:       true,
+						Response: response,
+						Duration: duration,
+					})
+					return
+				}
+			} else {
+				idleCount = 0
+			}
+		}
+	}
+}
+
+// handleSendCmd handles the "send" command (non-blocking)
+func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" || req.Text == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session and text required"})
+		return
+	}
+
+	info, exists := cfg.Sessions[req.Session]
+	if !exists || info.Deleted {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	tmuxName := tmuxSessionName(req.Session)
+
+	// Format message with agent identifier
+	agentLabel := req.From
+	if agentLabel == "" {
+		agentLabel = "api"
+	}
+
+	// Send to Telegram topic
+	if info.TopicID > 0 {
+		telegramMsg := fmt.Sprintf("🤖 [%s] %s", agentLabel, req.Text)
+		sendMessage(cfg, cfg.GroupID, info.TopicID, telegramMsg)
+	}
+
+	// Store in history
+	msgID := nextMessageID()
+	appendHistory(info.TopicID, HistoryMessage{
+		ID:        msgID,
+		Timestamp: time.Now().Unix(),
+		From:      "api",
+		Text:      req.Text,
+		Agent:     agentLabel,
+	})
+
+	// Send to tmux
+	var sendErr error
+	if info.Host != "" {
+		address := getHostAddress(cfg, info.Host)
+		if address == "" {
+			encoder.Encode(APIResponse{OK: false, Error: "host not configured"})
+			return
+		}
+		sendErr = sshTmuxSendKeys(address, tmuxName, req.Text)
+	} else {
+		sendErr = sendToTmux(tmuxName, req.Text)
+	}
+
+	if sendErr != nil {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to send: %v", sendErr)})
+		return
+	}
+
+	encoder.Encode(APIResponse{OK: true, MessageID: msgID})
+}
+
+// handleHistoryCmd handles the "history" command
+func handleHistoryCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session required"})
+		return
+	}
+
+	info, exists := cfg.Sessions[req.Session]
+	if !exists || info.Deleted {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	messages, err := readHistory(info.TopicID, req.After, req.Limit)
+	if err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to read history: %v", err)})
+		return
+	}
+
+	encoder.Encode(APIResponse{OK: true, Messages: messages})
+}
+
+// handleSubscribeCmd handles the "subscribe" command
+func handleSubscribeCmd(conn net.Conn, encoder *json.Encoder, cfg *Config, req APIRequest) {
+	// For now, implement basic subscription that sends events for specified sessions
+	sessions := req.Sessions
+	if len(sessions) == 0 {
+		// Subscribe to all sessions
+		for name, info := range cfg.Sessions {
+			if !info.Deleted {
+				sessions = append(sessions, name)
+			}
+		}
+	}
+
+	// Send subscribed confirmation
+	encoder.Encode(APIEvent{Event: "subscribed", Session: strings.Join(sessions, ",")})
+
+	// Keep connection open and poll for state changes
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	lastStatus := make(map[string]string)
+
+	for {
+		select {
+		case <-ticker.C:
+			for _, sessionName := range sessions {
+				info, exists := cfg.Sessions[sessionName]
+				if !exists || info.Deleted {
+					continue
+				}
+
+				tmuxName := tmuxSessionName(sessionName)
+				sshAddr := ""
+				if info.Host != "" {
+					sshAddr = getHostAddress(cfg, info.Host)
+				}
+
+				var status string
+				if info.Host != "" && sshAddr != "" {
+					if sshTmuxHasSession(sshAddr, tmuxName) {
+						if checkClaudeState(tmuxName, sshAddr) == "busy" {
+							status = "active"
+						} else {
+							status = "idle"
+						}
+					} else {
+						status = "stopped"
+					}
+				} else if tmuxSessionExists(tmuxName) {
+					if checkClaudeState(tmuxName, "") == "busy" {
+						status = "active"
+					} else {
+						status = "idle"
+					}
+				} else {
+					status = "stopped"
+				}
+
+				if lastStatus[sessionName] != status {
+					lastStatus[sessionName] = status
+					if err := encoder.Encode(APIEvent{Event: "status", Session: sessionName, Status: status}); err != nil {
+						return // Connection closed
+					}
+				}
+			}
+		}
+	}
+}
+
+// getLastClaudeResponse captures the last response from Claude in tmux
+func getLastClaudeResponse(tmuxName string, sshAddress string) string {
+	var output string
+
+	if sshAddress != "" {
+		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -50", shellQuote(tmuxName))
+		result, err := runSSH(sshAddress, cmd, 10*time.Second)
+		if err != nil {
+			return ""
+		}
+		output = result
+	} else {
+		cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", "-50")
+		result, err := cmd.Output()
+		if err != nil {
+			return ""
+		}
+		output = string(result)
+	}
+
+	// Parse output to find Claude's response
+	// Look for content after the prompt marker (❯) and before the next prompt
+	lines := strings.Split(output, "\n")
+	var responseLines []string
+	inResponse := false
+
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+
+		// Found prompt - start collecting response going backwards
+		if strings.Contains(line, "❯") && !inResponse {
+			inResponse = true
+			continue
+		}
+
+		// Found previous prompt - stop
+		if strings.Contains(line, "❯") && inResponse {
+			break
+		}
+
+		if inResponse && strings.TrimSpace(line) != "" {
+			responseLines = append([]string{line}, responseLines...)
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(responseLines, "\n"))
 }
 
 // Config function wrappers - delegate to config package
@@ -1698,6 +2281,14 @@ func handleHook() error {
 	// Stop typing indicator for this session
 	stopContinuousTyping(sessionName)
 
+	// Store Claude's response in history
+	appendHistory(topicID, HistoryMessage{
+		ID:        nextMessageID(),
+		Timestamp: time.Now().Unix(),
+		From:      "claude",
+		Text:      lastMessage,
+	})
+
 	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
 }
 
@@ -2944,6 +3535,11 @@ func listen() error {
 	fmt.Printf("Active sessions: %d\n", len(config.Sessions))
 	fmt.Println("Press Ctrl+C to stop")
 
+	// Start Unix socket API server
+	if err := startSocketServer(config); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to start API socket: %v\n", err)
+	}
+
 	setBotCommands(config.BotToken)
 
 	sigChan := make(chan os.Signal, 1)
@@ -2955,6 +3551,7 @@ func listen() error {
 	go func() {
 		<-sigChan
 		fmt.Println("\nShutting down...")
+		stopSocketServer()
 		os.Exit(0)
 	}()
 
@@ -3092,6 +3689,15 @@ func listen() error {
 							} else if transcription != "" {
 								fmt.Printf("[voice] @%s: %s\n", msg.From.Username, transcription)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("📝 %s", transcription))
+								// Store in history
+								appendHistory(threadID, HistoryMessage{
+									ID:            nextMessageID(),
+									Timestamp:     time.Now().Unix(),
+									From:          "human",
+									Type:          "voice",
+									Transcription: transcription,
+									Username:      msg.From.Username,
+								})
 								// Start typing indicator and send to appropriate tmux
 								startContinuousTyping(config, chatID, threadID, sessionName)
 								if hostName != "" {
@@ -3164,6 +3770,16 @@ func listen() error {
 
 						// Send to remote tmux
 						prompt := fmt.Sprintf("%s %s", caption, remotePath)
+						// Store in history
+						appendHistory(threadID, HistoryMessage{
+							ID:        nextMessageID(),
+							Timestamp: time.Now().Unix(),
+							From:      "human",
+							Type:      "photo",
+							Path:      remotePath,
+							Caption:   caption,
+							Username:  msg.From.Username,
+						})
 						startContinuousTyping(config, chatID, threadID, sessionName)
 						sshTmuxSendKeys(hostInfo.Address, tmuxName, prompt)
 						// Clean up local file
@@ -3184,6 +3800,16 @@ func listen() error {
 							sendMessage(config, chatID, threadID, "✅ Session restarted")
 						}
 						prompt := fmt.Sprintf("%s %s", caption, imgPath)
+						// Store in history
+						appendHistory(threadID, HistoryMessage{
+							ID:        nextMessageID(),
+							Timestamp: time.Now().Unix(),
+							From:      "human",
+							Type:      "photo",
+							Path:      imgPath,
+							Caption:   caption,
+							Username:  msg.From.Username,
+						})
 						sendMessage(config, chatID, threadID, "📷 Image saved, sending to Claude...")
 						startContinuousTyping(config, chatID, threadID, sessionName)
 						// Send text first, wait for image to load, then send Enter
@@ -3756,6 +4382,14 @@ func listen() error {
 								sendMessage(config, chatID, threadID, "✅ Session restarted")
 							}
 							startContinuousTyping(config, chatID, threadID, sessionName)
+							// Store in history
+							appendHistory(threadID, HistoryMessage{
+								ID:        nextMessageID(),
+								Timestamp: time.Now().Unix(),
+								From:      "human",
+								Text:      text,
+								Username:  msg.From.Username,
+							})
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
@@ -3777,6 +4411,14 @@ func listen() error {
 								sendMessage(config, chatID, threadID, "✅ Session restarted")
 							}
 							startContinuousTyping(config, chatID, threadID, sessionName)
+							// Store in history
+							appendHistory(threadID, HistoryMessage{
+								ID:        nextMessageID(),
+								Timestamp: time.Now().Unix(),
+								From:      "human",
+								Text:      text,
+								Username:  msg.From.Username,
+							})
 							if err := sendToTmux(tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
