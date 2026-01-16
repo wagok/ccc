@@ -364,6 +364,33 @@ func isClaudeRunning(tmuxName string, sshAddress string) bool {
 	return false
 }
 
+// restartClaudeInSession restarts Claude Code in an existing tmux session where it crashed
+// Returns true if restart was successful
+func restartClaudeInSession(tmuxName string, sshAddress string) bool {
+	restartCmd := cccPath + " run -c"
+
+	if sshAddress != "" {
+		// Remote session - send command via SSH
+		cmd := fmt.Sprintf("tmux send-keys -t %s %s C-m", shellQuote(tmuxName), shellQuote(restartCmd))
+		_, err := runSSH(sshAddress, cmd, 10*time.Second)
+		if err != nil {
+			return false
+		}
+	} else {
+		// Local session - send command directly
+		cmd := tmuxCmd("send-keys", "-t", tmuxName, restartCmd, "C-m")
+		if err := cmd.Run(); err != nil {
+			return false
+		}
+	}
+
+	// Wait for Claude to start
+	time.Sleep(3 * time.Second)
+
+	// Verify Claude is now running
+	return isClaudeRunning(tmuxName, sshAddress)
+}
+
 // startContinuousTyping starts sending typing indicator every 4 seconds
 // until stopContinuousTyping is called or Claude becomes idle
 func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName string) {
@@ -3043,8 +3070,13 @@ func listen() error {
 							sshAddr = address
 						}
 						if !isClaudeRunning(tmuxName, sshAddr) {
-							sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
-							continue
+							// Auto-restart Claude
+							sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+							if !restartClaudeInSession(tmuxName, sshAddr) {
+								sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+								continue
+							}
+							sendMessage(config, chatID, threadID, "✅ Session restarted")
 						}
 
 						sendMessage(config, chatID, threadID, "🎤 Transcribing...")
@@ -3113,8 +3145,13 @@ func listen() error {
 
 						// Check if Claude is actually running
 						if !isClaudeRunning(tmuxName, hostInfo.Address) {
-							sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
-							continue
+							// Auto-restart Claude
+							sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+							if !restartClaudeInSession(tmuxName, hostInfo.Address) {
+								sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+								continue
+							}
+							sendMessage(config, chatID, threadID, "✅ Session restarted")
 						}
 
 						// SCP file to remote host
@@ -3138,8 +3175,13 @@ func listen() error {
 					if tmuxSessionExists(tmuxName) {
 						// Check if Claude is actually running
 						if !isClaudeRunning(tmuxName, "") {
-							sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
-							continue
+							// Auto-restart Claude
+							sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+							if !restartClaudeInSession(tmuxName, "") {
+								sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+								continue
+							}
+							sendMessage(config, chatID, threadID, "✅ Session restarted")
 						}
 						prompt := fmt.Sprintf("%s %s", caption, imgPath)
 						sendMessage(config, chatID, threadID, "📷 Image saved, sending to Claude...")
@@ -3705,8 +3747,13 @@ func listen() error {
 						if sshTmuxHasSession(address, tmuxName) {
 							// Check if Claude is actually running (not crashed to bash)
 							if !isClaudeRunning(tmuxName, address) {
-								sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
-								continue
+								// Auto-restart Claude
+								sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+								if !restartClaudeInSession(tmuxName, address) {
+									sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+									continue
+								}
+								sendMessage(config, chatID, threadID, "✅ Session restarted")
 							}
 							startContinuousTyping(config, chatID, threadID, sessionName)
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
@@ -3721,8 +3768,13 @@ func listen() error {
 						if tmuxSessionExists(tmuxName) {
 							// Check if Claude is actually running (not crashed to bash)
 							if !isClaudeRunning(tmuxName, "") {
-								sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
-								continue
+								// Auto-restart Claude
+								sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+								if !restartClaudeInSession(tmuxName, "") {
+									sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+									continue
+								}
+								sendMessage(config, chatID, threadID, "✅ Session restarted")
 							}
 							startContinuousTyping(config, chatID, threadID, sessionName)
 							if err := sendToTmux(tmuxName, text); err != nil {
