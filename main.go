@@ -337,11 +337,11 @@ func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName stri
 		// Remote session (host:name format)
 		hostName := sessionName[:idx]
 		projectName := sessionName[idx+1:]
-		tmuxName = "claude-" + projectName
+		tmuxName = tmuxSessionName(projectName)
 		sshAddress = getHostAddress(cfg, hostName)
 	} else {
 		// Local session
-		tmuxName = "claude-" + sessionName
+		tmuxName = tmuxSessionName(sessionName)
 		sshAddress = ""
 	}
 
@@ -785,6 +785,13 @@ func extractProjectName(path string) string {
 	return filepath.Base(path)
 }
 
+// tmuxSessionName returns a safe tmux session name for a project
+// Replaces dots with underscores because tmux 3.5+ interprets dots as window/pane separators
+func tmuxSessionName(name string) string {
+	safeName := strings.ReplaceAll(name, ".", "_")
+	return "claude-" + safeName
+}
+
 func createForumTopic(config *Config, name string) (int64, error) {
 	if config.GroupID == 0 {
 		return 0, fmt.Errorf("no group configured. Add bot to a group with topics enabled and run: ccc setgroup")
@@ -1080,7 +1087,7 @@ func startSession(continueSession bool) error {
 		return err
 	}
 	name := filepath.Base(cwd)
-	tmuxName := "claude-" + name
+	tmuxName := tmuxSessionName(name)
 
 	// Load config to check/create topic
 	config, err := loadConfig()
@@ -1286,10 +1293,6 @@ func formatDuration(d time.Duration) string {
 
 // Session management
 
-func sessionName(name string) string {
-	return "claude-" + name
-}
-
 func createSession(config *Config, name string) error {
 	// Check if session already exists
 	if _, exists := config.Sessions[name]; exists {
@@ -1309,7 +1312,7 @@ func createSession(config *Config, name string) error {
 		os.MkdirAll(workDir, 0755)
 	}
 
-	if err := createTmuxSession(sessionName(name), workDir, false); err != nil {
+	if err := createTmuxSession(tmuxSessionName(name), workDir, false); err != nil {
 		return fmt.Errorf("failed to create tmux session: %w", err)
 	}
 
@@ -1333,7 +1336,7 @@ func killSession(config *Config, name string) error {
 
 	// Extract project name for tmux session (without host prefix)
 	_, projectName := parseSessionTarget(name)
-	tmuxName := "claude-" + extractProjectName(projectName)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 	// Kill tmux session (remote or local)
 	if sessionInfo != nil && sessionInfo.Host != "" {
@@ -1417,7 +1420,7 @@ func startClientSession(config *Config, args []string) error {
 
 	// Session name for tmux
 	name := filepath.Base(projectPath)
-	tmuxName := "claude-" + name
+	tmuxName := tmuxSessionName(name)
 
 	// Register session on server (creates Telegram topic)
 	fmt.Printf("Registering session on server...\n")
@@ -1593,8 +1596,8 @@ func handleHook() error {
 		if info == nil || info.Deleted {
 			continue
 		}
-		// Match against saved path or suffix
-		if hookData.Cwd == info.Path || strings.HasSuffix(hookData.Cwd, "/"+name) {
+		// Match against saved path, subdirectories of saved path, or suffix
+		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			if info.Host == "" {
 				// Local session - use immediately
 				sessionName = name
@@ -1670,7 +1673,7 @@ func handlePermissionHook() error {
 		if name == "" || info == nil {
 			continue
 		}
-		if hookData.Cwd == info.Path || strings.HasSuffix(hookData.Cwd, "/"+name) {
+		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			sessionName = name
 			topicID = info.TopicID
 			break
@@ -1803,7 +1806,7 @@ func handlePromptHook() error {
 		if info == nil {
 			continue
 		}
-		if hookData.Cwd == info.Path || strings.HasSuffix(hookData.Cwd, "/"+name) {
+		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			topicID = info.TopicID
 			break
 		}
@@ -1872,7 +1875,7 @@ func handleOutputHook() error {
 		if info == nil {
 			continue
 		}
-		if hookData.Cwd == info.Path || strings.HasSuffix(hookData.Cwd, "/"+name) {
+		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			sessionName = name
 			topicID = info.TopicID
 			break
@@ -1918,7 +1921,7 @@ func handleQuestionHook() error {
 		if info == nil {
 			continue
 		}
-		if hookData.Cwd == info.Path || strings.HasSuffix(hookData.Cwd, "/"+name) {
+		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			sessionName = name
 			topicID = info.TopicID
 			break
@@ -2588,7 +2591,7 @@ func send(message string) error {
 			if info == nil {
 				continue
 			}
-			if cwd == info.Path || strings.HasSuffix(cwd, "/"+name) {
+			if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
 				return sendMessage(config, config.GroupID, info.TopicID, message)
 			}
 		}
@@ -2935,7 +2938,7 @@ func listen() error {
 						editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID, newText)
 					}
 
-					tmuxName := "claude-" + sessionName
+					tmuxName := tmuxSessionName(sessionName)
 					if tmuxSessionExists(tmuxName) {
 						// Send arrow down keys to select option, then Enter
 						for i := 0; i < optionIndex; i++ {
@@ -2974,7 +2977,7 @@ func listen() error {
 
 					// Extract project name for tmux session
 					_, projectName := parseSessionTarget(sessionName)
-					tmuxName := "claude-" + extractProjectName(projectName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					// Check if session is running
 					sessionRunning := false
@@ -3030,7 +3033,7 @@ func listen() error {
 
 					// Extract project name for tmux session
 					_, projectName := parseSessionTarget(sessionName)
-					tmuxName := "claude-" + extractProjectName(projectName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					// Get largest photo (last in array)
 					photo := msg.Photo[len(msg.Photo)-1]
@@ -3165,7 +3168,7 @@ func listen() error {
 
 					// Check if tmux session is running
 					_, projectName := parseSessionTarget(name)
-					tmuxName := "claude-" + extractProjectName(projectName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					var status string
 					if info.Host != "" {
@@ -3211,7 +3214,7 @@ func listen() error {
 				}
 
 				_, projectName := parseSessionTarget(sessionName)
-				tmuxName := "claude-" + extractProjectName(projectName)
+				tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 				var msg strings.Builder
 				msg.WriteString(fmt.Sprintf("📊 *Session: %s*\n\n", sessionName))
@@ -3454,7 +3457,7 @@ func listen() error {
 					}
 
 					// Create work directory and tmux session
-					tmuxName := "claude-" + extractProjectName(projectName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					// Kill existing tmux session if running (for restart)
 					if hostName != "" {
@@ -3528,7 +3531,7 @@ func listen() error {
 
 					// Extract project name for tmux session (without host prefix)
 					_, projectName := parseSessionTarget(sessionName)
-					tmuxName := "claude-" + extractProjectName(projectName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					// Get work directory from stored session info
 					workDir := ""
@@ -3623,7 +3626,7 @@ func listen() error {
 
 					// Extract project name for tmux session (without host prefix)
 					_, projectName := parseSessionTarget(sessionName)
-					tmuxName := "claude-" + extractProjectName(projectName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					if hostName != "" {
 						// Remote session
