@@ -685,10 +685,9 @@ func sshTmuxSendKeys(address string, sessionName string, text string) error {
 		return err
 	}
 
-	// For long messages, Claude needs more time to process pasted content
-	if len(text) > 200 {
-		time.Sleep(2 * time.Second)
-	}
+	// Always wait 2 seconds before Enter to ensure text is fully processed
+	// Without this delay, Enter may be interpreted as newline instead of submit
+	time.Sleep(2 * time.Second)
 
 	// Send Enter twice (Claude needs double Enter)
 	enterCmd := fmt.Sprintf(
@@ -1151,12 +1150,9 @@ func startSession(continueSession bool) error {
 }
 
 func sendToTmux(session string, text string) error {
-	// For long messages, use longer delay for Claude to process pasted content
-	delay := 50 * time.Millisecond
-	if len(text) > 200 {
-		delay = 2 * time.Second
-	}
-	return sendToTmuxWithDelay(session, text, delay)
+	// Always use 2 second delay before Enter to ensure text is fully processed
+	// Without this delay, Enter may be interpreted as newline instead of submit
+	return sendToTmuxWithDelay(session, text, 2*time.Second)
 }
 
 func sendToTmuxWithDelay(session string, text string, delay time.Duration) error {
