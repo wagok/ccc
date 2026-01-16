@@ -879,7 +879,11 @@ func ensureTmuxServer() error {
 	// Check if socket directory exists
 	socketDir := filepath.Dir(tmuxSocket)
 	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
-		// Socket directory doesn't exist, tmux server not running
+		// Socket directory doesn't exist - create it with proper permissions (700)
+		if err := os.MkdirAll(socketDir, 0700); err != nil {
+			return fmt.Errorf("failed to create tmux socket directory: %w", err)
+		}
+
 		// Start tmux server by creating and immediately killing a temporary session
 		cmd := tmuxCmd("new-session", "-d", "-s", "ccc-init")
 		if err := cmd.Run(); err != nil {
