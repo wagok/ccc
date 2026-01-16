@@ -315,6 +315,55 @@ func checkClaudeState(tmuxName string, sshAddress string) string {
 	return "idle"
 }
 
+// isClaudeRunning checks if Claude Code is running in a tmux session
+// Returns true if Claude UI elements are detected, false if it looks like plain bash
+func isClaudeRunning(tmuxName string, sshAddress string) bool {
+	var content string
+	var err error
+
+	if sshAddress != "" {
+		// Remote session - use SSH
+		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -30", shellQuote(tmuxName))
+		content, err = runSSH(sshAddress, cmd, 5*time.Second)
+	} else {
+		// Local session
+		cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", "-30")
+		var output []byte
+		output, err = cmd.Output()
+		content = string(output)
+	}
+
+	if err != nil {
+		return false
+	}
+
+	// Claude Code UI has distinctive elements:
+	// - Input prompt: ❯
+	// - Status bar: "bypass permissions" or "shift+tab to cycle"
+	// - Activity indicators: ●, ✽, ✻
+	// - Tool output markers: ⎿
+	// If none of these are present, Claude is probably not running
+
+	claudeIndicators := []string{
+		"❯",                    // Input prompt
+		"bypass permissions",   // Status bar
+		"shift+tab to cycle",   // Status bar variant
+		"ctrl+c to interrupt",  // Activity indicator
+		"●",                    // Tool marker
+		"✽",                    // Spinner
+		"✻",                    // Spinner variant
+		"⎿",                    // Tool output
+	}
+
+	for _, indicator := range claudeIndicators {
+		if strings.Contains(content, indicator) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // startContinuousTyping starts sending typing indicator every 4 seconds
 // until stopContinuousTyping is called or Claude becomes idle
 func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName string) {
@@ -2988,6 +3037,16 @@ func listen() error {
 					}
 
 					if sessionRunning {
+						// Check if Claude is actually running (not crashed to bash)
+						sshAddr := ""
+						if hostName != "" {
+							sshAddr = address
+						}
+						if !isClaudeRunning(tmuxName, sshAddr) {
+							sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
+							continue
+						}
+
 						sendMessage(config, chatID, threadID, "🎤 Transcribing...")
 						// Download and transcribe
 						audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("voice_%d.ogg", time.Now().UnixNano()))
@@ -3052,6 +3111,12 @@ func listen() error {
 							continue
 						}
 
+						// Check if Claude is actually running
+						if !isClaudeRunning(tmuxName, hostInfo.Address) {
+							sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
+							continue
+						}
+
 						// SCP file to remote host
 						sendMessage(config, chatID, threadID, "📷 Transferring image to remote host...")
 						remotePath := imgPath // Use same path on remote
@@ -3071,6 +3136,11 @@ func listen() error {
 
 					// Local session
 					if tmuxSessionExists(tmuxName) {
+						// Check if Claude is actually running
+						if !isClaudeRunning(tmuxName, "") {
+							sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
+							continue
+						}
 						prompt := fmt.Sprintf("%s %s", caption, imgPath)
 						sendMessage(config, chatID, threadID, "📷 Image saved, sending to Claude...")
 						startContinuousTyping(config, chatID, threadID, sessionName)
@@ -3633,6 +3703,11 @@ func listen() error {
 						}
 
 						if sshTmuxHasSession(address, tmuxName) {
+							// Check if Claude is actually running (not crashed to bash)
+							if !isClaudeRunning(tmuxName, address) {
+								sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
+								continue
+							}
 							startContinuousTyping(config, chatID, threadID, sessionName)
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
@@ -3644,6 +3719,11 @@ func listen() error {
 					} else {
 						// Local session
 						if tmuxSessionExists(tmuxName) {
+							// Check if Claude is actually running (not crashed to bash)
+							if !isClaudeRunning(tmuxName, "") {
+								sendMessage(config, chatID, threadID, "⚠️ Claude Code is not running in this session. Use /continue to restart.")
+								continue
+							}
 							startContinuousTyping(config, chatID, threadID, sessionName)
 							if err := sendToTmux(tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
