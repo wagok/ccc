@@ -526,7 +526,9 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 
-	tmuxName := tmuxSessionName(req.Session)
+	// Extract correct tmux session name
+	_, projectName := parseSessionTarget(req.Session)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
 	startTime := time.Now()
 
 	// Format message with agent identifier
@@ -626,7 +628,9 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 
-	tmuxName := tmuxSessionName(req.Session)
+	// Extract correct tmux session name
+	_, projectName := parseSessionTarget(req.Session)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 	// Format message with agent identifier
 	agentLabel := req.From
