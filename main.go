@@ -852,6 +852,26 @@ func init() {
 	}
 }
 
+// tmuxVerbose returns true if CCC_TMUX_VERBOSE env is set
+func tmuxVerbose() bool {
+	return os.Getenv("CCC_TMUX_VERBOSE") != ""
+}
+
+// tmuxBaseArgs returns base tmux arguments including socket and optional verbose flag
+func tmuxBaseArgs() []string {
+	args := []string{"-S", tmuxSocket}
+	if tmuxVerbose() {
+		args = append([]string{"-v"}, args...)
+	}
+	return args
+}
+
+// tmuxCmd creates an exec.Cmd for tmux with proper base args
+func tmuxCmd(cmdArgs ...string) *exec.Cmd {
+	args := append(tmuxBaseArgs(), cmdArgs...)
+	return exec.Command(tmuxPath, args...)
+}
+
 // ensureTmuxServer ensures tmux server is running by checking if socket exists
 // If not, starts a new tmux server. This handles the case after system reboot
 // when tmux hasn't been started yet and socket doesn't exist.
@@ -861,12 +881,16 @@ func ensureTmuxServer() error {
 	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
 		// Socket directory doesn't exist, tmux server not running
 		// Start tmux server by creating and immediately killing a temporary session
-		cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "new-session", "-d", "-s", "ccc-init")
+		cmd := tmuxCmd("new-session", "-d", "-s", "ccc-init")
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to start tmux server: %w", err)
 		}
 		// Kill the temporary session
-		exec.Command(tmuxPath, "-S", tmuxSocket, "kill-session", "-t", "ccc-init").Run()
+		tmuxCmd("kill-session", "-t", "ccc-init").Run()
+
+		if tmuxVerbose() {
+			fmt.Fprintf(os.Stderr, "tmux verbose logging enabled, logs in current directory\n")
+		}
 	}
 	return nil
 }
@@ -876,7 +900,7 @@ func tmuxSessionExists(name string) bool {
 	if err := ensureTmuxServer(); err != nil {
 		return false
 	}
-	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "has-session", "-t", name)
+	cmd := tmuxCmd("has-session", "-t", name)
 	return cmd.Run() == nil
 }
 
@@ -893,18 +917,17 @@ func createTmuxSession(name string, workDir string, continueSession bool) error 
 	}
 
 	// Create tmux session with a login shell (don't run command directly - it kills session on exit)
-	args := []string{"-S", tmuxSocket, "new-session", "-d", "-s", name, "-c", workDir}
-	cmd := exec.Command(tmuxPath, args...)
+	cmd := tmuxCmd("new-session", "-d", "-s", name, "-c", workDir)
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 
 	// Enable mouse mode for this session (allows scrolling)
-	exec.Command(tmuxPath, "-S", tmuxSocket, "set-option", "-t", name, "mouse", "on").Run()
+	tmuxCmd("set-option", "-t", name, "mouse", "on").Run()
 
 	// Send the command to the session via send-keys (preserves TTY properly)
 	time.Sleep(200 * time.Millisecond)
-	exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", name, cccCmd, "C-m").Run()
+	tmuxCmd( "send-keys", "-t", name, cccCmd, "C-m").Run()
 
 	return nil
 }
@@ -965,14 +988,14 @@ func startSession(continueSession bool) error {
 		// Check if we're already inside tmux
 		if os.Getenv("TMUX") != "" {
 			// Inside tmux: switch to the session
-			cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "switch-client", "-t", tmuxName)
+			cmd := tmuxCmd( "switch-client", "-t", tmuxName)
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			return cmd.Run()
 		}
 		// Outside tmux: attach to existing session
-		cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "attach-session", "-t", tmuxName)
+		cmd := tmuxCmd( "attach-session", "-t", tmuxName)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -986,13 +1009,13 @@ func startSession(continueSession bool) error {
 
 	// Check if we're already inside tmux
 	if os.Getenv("TMUX") != "" {
-		cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "switch-client", "-t", tmuxName)
+		cmd := tmuxCmd( "switch-client", "-t", tmuxName)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return cmd.Run()
 	}
-	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "attach-session", "-t", tmuxName)
+	cmd := tmuxCmd( "attach-session", "-t", tmuxName)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1010,7 +1033,7 @@ func sendToTmux(session string, text string) error {
 
 func sendToTmuxWithDelay(session string, text string, delay time.Duration) error {
 	// Send text literally
-	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", session, "-l", text)
+	cmd := tmuxCmd( "send-keys", "-t", session, "-l", text)
 	if err := cmd.Run(); err != nil {
 		return err
 	}
@@ -1019,22 +1042,22 @@ func sendToTmuxWithDelay(session string, text string, delay time.Duration) error
 	time.Sleep(delay)
 
 	// Send Enter twice (Claude Code needs double Enter)
-	cmd = exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", session, "C-m")
+	cmd = tmuxCmd( "send-keys", "-t", session, "C-m")
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 	time.Sleep(50 * time.Millisecond)
-	cmd = exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", session, "C-m")
+	cmd = tmuxCmd( "send-keys", "-t", session, "C-m")
 	return cmd.Run()
 }
 
 func killTmuxSession(name string) error {
-	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "kill-session", "-t", name)
+	cmd := tmuxCmd( "kill-session", "-t", name)
 	return cmd.Run()
 }
 
 func listTmuxSessions() ([]string, error) {
-	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "list-sessions", "-F", "#{session_name}")
+	cmd := tmuxCmd( "list-sessions", "-F", "#{session_name}")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -1060,7 +1083,7 @@ type TmuxSessionInfo struct {
 
 // getTmuxSessionInfo returns detailed info about a tmux session
 func getTmuxSessionInfo(name string) (*TmuxSessionInfo, error) {
-	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "list-sessions", "-F",
+	cmd := tmuxCmd( "list-sessions", "-F",
 		"#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_path}",
 		"-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	out, err := cmd.Output()
@@ -1293,14 +1316,14 @@ func startClientSession(config *Config, args []string) error {
 		fmt.Printf("Attaching to existing session: %s\n", tmuxName)
 		if os.Getenv("TMUX") != "" {
 			// Inside tmux: switch to the session
-			switchCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "switch-client", "-t", tmuxName)
+			switchCmd := tmuxCmd( "switch-client", "-t", tmuxName)
 			switchCmd.Stdin = os.Stdin
 			switchCmd.Stdout = os.Stdout
 			switchCmd.Stderr = os.Stderr
 			return switchCmd.Run()
 		}
 		// Outside tmux: attach to existing session
-		attachCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "attach-session", "-t", tmuxName)
+		attachCmd := tmuxCmd( "attach-session", "-t", tmuxName)
 		attachCmd.Stdin = os.Stdin
 		attachCmd.Stdout = os.Stdout
 		attachCmd.Stderr = os.Stderr
@@ -1315,13 +1338,13 @@ func startClientSession(config *Config, args []string) error {
 
 	// Attach to the session
 	if os.Getenv("TMUX") != "" {
-		attachCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "switch-client", "-t", tmuxName)
+		attachCmd := tmuxCmd( "switch-client", "-t", tmuxName)
 		attachCmd.Stdin = os.Stdin
 		attachCmd.Stdout = os.Stdout
 		attachCmd.Stderr = os.Stderr
 		return attachCmd.Run()
 	}
-	attachCmd := exec.Command(tmuxPath, "-S", tmuxSocket, "attach-session", "-t", tmuxName)
+	attachCmd := tmuxCmd( "attach-session", "-t", tmuxName)
 	attachCmd.Stdin = os.Stdin
 	attachCmd.Stdout = os.Stdout
 	attachCmd.Stderr = os.Stderr
@@ -2795,10 +2818,10 @@ func listen() error {
 					if tmuxSessionExists(tmuxName) {
 						// Send arrow down keys to select option, then Enter
 						for i := 0; i < optionIndex; i++ {
-							exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", tmuxName, "Down").Run()
+							tmuxCmd( "send-keys", "-t", tmuxName, "Down").Run()
 							time.Sleep(50 * time.Millisecond)
 						}
-						exec.Command(tmuxPath, "-S", tmuxSocket, "send-keys", "-t", tmuxName, "Enter").Run()
+						tmuxCmd( "send-keys", "-t", tmuxName, "Enter").Run()
 						fmt.Printf("[callback] Selected option %d for %s\n", optionIndex, sessionName)
 					}
 				}
