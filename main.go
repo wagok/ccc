@@ -852,12 +852,40 @@ func init() {
 	}
 }
 
+// ensureTmuxServer ensures tmux server is running by checking if socket exists
+// If not, starts a new tmux server. This handles the case after system reboot
+// when tmux hasn't been started yet and socket doesn't exist.
+func ensureTmuxServer() error {
+	// Check if socket directory exists
+	socketDir := filepath.Dir(tmuxSocket)
+	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
+		// Socket directory doesn't exist, tmux server not running
+		// Start tmux server by creating and immediately killing a temporary session
+		cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "new-session", "-d", "-s", "ccc-init")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to start tmux server: %w", err)
+		}
+		// Kill the temporary session
+		exec.Command(tmuxPath, "-S", tmuxSocket, "kill-session", "-t", "ccc-init").Run()
+	}
+	return nil
+}
+
 func tmuxSessionExists(name string) bool {
+	// Ensure tmux server is running first
+	if err := ensureTmuxServer(); err != nil {
+		return false
+	}
 	cmd := exec.Command(tmuxPath, "-S", tmuxSocket, "has-session", "-t", name)
 	return cmd.Run() == nil
 }
 
 func createTmuxSession(name string, workDir string, continueSession bool) error {
+	// Ensure tmux server is running (handles post-reboot case)
+	if err := ensureTmuxServer(); err != nil {
+		return err
+	}
+
 	// Build the command to run inside tmux
 	cccCmd := cccPath + " run"
 	if continueSession {
