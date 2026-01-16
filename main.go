@@ -235,9 +235,90 @@ var (
 	typingMu        sync.Mutex
 )
 
+// checkClaudeState checks if Claude is busy or idle in a tmux session
+// Returns: "busy", "idle", or "unknown"
+// sshAddress is empty for local sessions, or SSH address for remote sessions
+func checkClaudeState(tmuxName string, sshAddress string) string {
+	var content string
+	var err error
+
+	if sshAddress != "" {
+		// Remote session - use SSH
+		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -15", shellQuote(tmuxName))
+		content, err = runSSH(sshAddress, cmd, 5*time.Second)
+	} else {
+		// Local session
+		cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", "-15")
+		var output []byte
+		output, err = cmd.Output()
+		content = string(output)
+	}
+
+	if err != nil {
+		return "unknown"
+	}
+
+	// Parse lines and find the prompt position
+	lines := strings.Split(content, "\n")
+
+	// Find the last occurrence of the input prompt ❯
+	promptLineIdx := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "❯" || line == "> " {
+			promptLineIdx = i
+			break
+		}
+	}
+
+	// If no prompt found, state is unknown
+	if promptLineIdx == -1 {
+		return "unknown"
+	}
+
+	// Check lines AFTER the prompt for activity indicators
+	// If "ctrl+c to interrupt" or spinners appear AFTER the prompt, Claude is busy
+	for i := promptLineIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		// Skip separator lines and status bar
+		if strings.HasPrefix(strings.TrimSpace(line), "─") || strings.Contains(line, "bypass permissions") {
+			continue
+		}
+		// Activity indicators after prompt mean busy
+		if strings.Contains(line, "ctrl+c to interrupt") {
+			return "busy"
+		}
+		if strings.Contains(line, "✽") || strings.Contains(line, "✻") {
+			return "busy"
+		}
+		if strings.Contains(line, "Running…") || strings.Contains(line, "Thinking…") {
+			return "busy"
+		}
+	}
+
+	// Check lines BEFORE the prompt - if recent activity indicator, might still be transitioning
+	// Look only at the 3 lines before prompt
+	startCheck := promptLineIdx - 3
+	if startCheck < 0 {
+		startCheck = 0
+	}
+	for i := startCheck; i < promptLineIdx; i++ {
+		line := lines[i]
+		// If there's an active spinner line right before prompt, still processing
+		if strings.Contains(line, "ctrl+c to interrupt") {
+			// This is historical - Claude finished. Check if prompt is truly last
+			break
+		}
+	}
+
+	// Prompt found and no activity after it - Claude is idle
+	return "idle"
+}
+
 // startContinuousTyping starts sending typing indicator every 4 seconds
-// until stopContinuousTyping is called for this session
+// until stopContinuousTyping is called or Claude becomes idle
 func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName string) {
+	fmt.Fprintf(os.Stderr, "[typing] START session=%s\n", sessionName)
 	typingMu.Lock()
 	// Cancel existing typing for this session
 	if cancel, ok := typingCancelers[sessionName]; ok {
@@ -248,18 +329,54 @@ func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName stri
 	typingCancelers[sessionName] = cancel
 	typingMu.Unlock()
 
+	// Determine tmux session name and SSH address (if remote)
+	var tmuxName string
+	var sshAddress string
+
+	if idx := strings.Index(sessionName, ":"); idx != -1 {
+		// Remote session (host:name format)
+		hostName := sessionName[:idx]
+		projectName := sessionName[idx+1:]
+		tmuxName = "claude-" + projectName
+		sshAddress = getHostAddress(cfg, hostName)
+	} else {
+		// Local session
+		tmuxName = "claude-" + sessionName
+		sshAddress = ""
+	}
+
 	go func() {
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
+		typingTicker := time.NewTicker(4 * time.Second)
+		stateTicker := time.NewTicker(2 * time.Second)
+		defer typingTicker.Stop()
+		defer stateTicker.Stop()
 
 		// Send initial typing
 		sendTypingAction(cfg, chatID, threadID)
+
+		// Track consecutive idle checks to avoid false positives
+		idleCount := 0
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-stateTicker.C:
+				// Check Claude state
+				state := checkClaudeState(tmuxName, sshAddress)
+				if state == "idle" {
+					idleCount++
+					// Require 2 consecutive idle checks to confirm
+					if idleCount >= 2 {
+						fmt.Fprintf(os.Stderr, "[typing] %s: Claude idle, stopping typing indicator\n", sessionName)
+						stopContinuousTyping(sessionName)
+						return
+					}
+				} else if state == "busy" {
+					idleCount = 0
+				}
+				// On "unknown" state, don't reset counter (might be transient)
+			case <-typingTicker.C:
 				sendTypingAction(cfg, chatID, threadID)
 			}
 		}
@@ -3495,6 +3612,7 @@ func listen() error {
 				// Reload config to get latest sessions
 				config, _ = loadConfig()
 				sessionName := getSessionByTopic(config, threadID)
+				fmt.Fprintf(os.Stderr, "[msg] threadID=%d sessionName=%q\n", threadID, sessionName)
 				if sessionName != "" {
 					// Get session info to check if remote
 					sessionInfo := config.Sessions[sessionName]
