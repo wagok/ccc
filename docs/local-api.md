@@ -19,6 +19,43 @@ The Local API allows external programs running on the same host to:
 The socket is created when `ccc listen` starts and removed on shutdown.
 Permissions are set to owner-only (0600) for security.
 
+## Running as a Service
+
+The API server runs as part of `ccc listen`. For production use, run it as a systemd user service:
+
+```bash
+# Install service (done automatically during ccc setup)
+ccc install-service
+
+# Or manually create ~/.config/systemd/user/ccc.service
+```
+
+### Service Management
+
+```bash
+# Status
+systemctl --user status ccc
+
+# Logs
+journalctl --user -u ccc -f
+
+# Restart (after updating binary)
+systemctl --user restart ccc
+
+# Stop
+systemctl --user stop ccc
+```
+
+### Enable Lingering
+
+To keep the service running after logout:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+**Note:** `make install` automatically restarts the service if it's running.
+
 ## Protocol
 
 - **Transport**: Unix socket
@@ -83,6 +120,7 @@ Send a message and wait for Claude's response (blocking).
 - `from` (optional) - Agent identifier, shown in Telegram as `[from]`
 
 **Notes:**
+- **Auto-start**: If session is not running, it will be automatically started with `-c` flag (continue)
 - Timeout: 5 minutes
 - Message appears in Telegram: `🤖 [orchestrator] What's the current API version?`
 - Returns when Claude finishes responding
@@ -111,7 +149,9 @@ Send a message without waiting for response (non-blocking).
 }
 ```
 
-Use `history` command with `after` parameter to retrieve the response later.
+**Notes:**
+- **Auto-start**: If session is not running, it will be automatically started with `-c` flag (continue)
+- Use `history` command with `after` parameter to retrieve the response later
 
 ---
 
