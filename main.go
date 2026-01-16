@@ -444,6 +444,69 @@ func handleSessionsCmd(encoder *json.Encoder, cfg *Config) {
 	encoder.Encode(APIResponse{OK: true, Sessions: sessions})
 }
 
+// ensureSessionRunning ensures the tmux session exists and Claude is running
+// Returns error message or empty string on success
+func ensureSessionRunning(cfg *Config, sessionName string, info *SessionInfo) string {
+	// Extract project name for tmux session and workdir
+	_, projectName := parseSessionTarget(sessionName)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
+	projectPath := info.Path
+	if projectPath == "" {
+		projectPath = resolveProjectPath(cfg, projectName)
+	}
+
+	if info.Host != "" {
+		// Remote session
+		address := getHostAddress(cfg, info.Host)
+		if address == "" {
+			return "host not configured"
+		}
+
+		if !sshTmuxHasSession(address, tmuxName) {
+			// Session doesn't exist, create it with continue flag
+			if err := sshTmuxNewSession(address, tmuxName, projectPath, true); err != nil {
+				// Ignore "duplicate session" error - session may have been created by another process
+				if !strings.Contains(err.Error(), "duplicate session") {
+					return fmt.Sprintf("failed to start session: %v", err)
+				}
+			} else {
+				// Wait for Claude to initialize only if we actually created the session
+				time.Sleep(5 * time.Second)
+			}
+		}
+		// Check if Claude is running (regardless of whether we just created the session)
+		if !isClaudeRunning(tmuxName, address) {
+			// Session exists but Claude crashed, restart
+			if !restartClaudeInSession(tmuxName, address) {
+				return "failed to restart Claude"
+			}
+		}
+	} else {
+		// Local session
+		if !tmuxSessionExists(tmuxName) {
+			// Session doesn't exist, create it with continue flag
+			if err := createTmuxSession(tmuxName, projectPath, true); err != nil {
+				// Ignore "duplicate session" error
+				if !strings.Contains(err.Error(), "duplicate session") {
+					return fmt.Sprintf("failed to start session: %v", err)
+				}
+			} else {
+				// Wait for Claude to initialize only if we actually created the session
+				time.Sleep(5 * time.Second)
+			}
+		}
+		// Check if Claude is running (regardless of whether we just created the session)
+		if !isClaudeRunning(tmuxName, "") {
+			// Session exists but Claude crashed, restart
+			if !restartClaudeInSession(tmuxName, "") {
+				return "failed to restart Claude"
+			}
+		}
+	}
+
+	return ""
+}
+
 // handleAskCmd handles the "ask" command (blocking)
 func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	if req.Session == "" || req.Text == "" {
@@ -454,6 +517,12 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	info, exists := cfg.Sessions[req.Session]
 	if !exists || info.Deleted {
 		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	// Ensure session is running (auto-start if needed)
+	if errMsg := ensureSessionRunning(cfg, req.Session, info); errMsg != "" {
+		encoder.Encode(APIResponse{OK: false, Error: errMsg})
 		return
 	}
 
@@ -486,10 +555,6 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	var sendErr error
 	if info.Host != "" {
 		address := getHostAddress(cfg, info.Host)
-		if address == "" {
-			encoder.Encode(APIResponse{OK: false, Error: "host not configured"})
-			return
-		}
 		sendErr = sshTmuxSendKeys(address, tmuxName, req.Text)
 	} else {
 		sendErr = sendToTmux(tmuxName, req.Text)
@@ -555,6 +620,12 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 
+	// Ensure session is running (auto-start if needed)
+	if errMsg := ensureSessionRunning(cfg, req.Session, info); errMsg != "" {
+		encoder.Encode(APIResponse{OK: false, Error: errMsg})
+		return
+	}
+
 	tmuxName := tmuxSessionName(req.Session)
 
 	// Format message with agent identifier
@@ -583,10 +654,6 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	var sendErr error
 	if info.Host != "" {
 		address := getHostAddress(cfg, info.Host)
-		if address == "" {
-			encoder.Encode(APIResponse{OK: false, Error: "host not configured"})
-			return
-		}
 		sendErr = sshTmuxSendKeys(address, tmuxName, req.Text)
 	} else {
 		sendErr = sendToTmux(tmuxName, req.Text)
