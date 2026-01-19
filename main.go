@@ -2813,6 +2813,7 @@ func setBotCommands(botToken string) {
 			{"command": "setdir", "description": "Set projects dir: /setdir [host:]<path>"},
 			{"command": "away", "description": "Toggle notifications"},
 			{"command": "c", "description": "Local command: /c <cmd>"},
+			{"command": "screenshot", "description": "Take screenshot of display"},
 			{"command": "ping", "description": "Check bot status"}
 		]
 	}`
