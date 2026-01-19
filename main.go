@@ -783,6 +783,51 @@ func captureTmuxPane(tmuxName string, sshAddress string, lines int) (string, err
 	return strings.TrimRight(string(result), "\n"), nil
 }
 
+// truncateRepeatingChars compresses runs of repeated characters (>10) to char(count) format
+func truncateRepeatingChars(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+
+	var result strings.Builder
+	runes := []rune(s)
+	i := 0
+
+	for i < len(runes) {
+		char := runes[i]
+		count := 1
+
+		// Count consecutive occurrences
+		for i+count < len(runes) && runes[i+count] == char {
+			count++
+		}
+
+		if count > 10 {
+			// Truncate: show char(count)
+			result.WriteRune(char)
+			result.WriteString(fmt.Sprintf("(%d)", count))
+		} else {
+			// Keep as is
+			for j := 0; j < count; j++ {
+				result.WriteRune(char)
+			}
+		}
+
+		i += count
+	}
+
+	return result.String()
+}
+
+// truncateRepeatingCharsInLines applies truncateRepeatingChars to each line
+func truncateRepeatingCharsInLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = truncateRepeatingChars(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
 // getLastClaudeResponse captures the last response from Claude in tmux
 func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 	var output string
@@ -4231,6 +4276,8 @@ func listen() error {
 				}
 
 				// Send as monospace code block
+				// Truncate repeating characters for cleaner display
+				content = truncateRepeatingCharsInLines(content)
 				sendMessage(config, chatID, threadID, fmt.Sprintf("📸 Last 50 lines:\n```\n%s\n```", content))
 				continue
 			}
