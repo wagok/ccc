@@ -2739,6 +2739,78 @@ func handleQuestionHook() error {
 
 // Install hook in Claude settings
 
+// addHookToEvent adds a hook command to an event without overwriting existing hooks.
+// Returns true if the hook was added, false if it already exists.
+func addHookToEvent(hooks map[string]interface{}, eventName string, command string) bool {
+	// Get existing entries for this event
+	entries, ok := hooks[eventName].([]interface{})
+	if !ok {
+		// No entries for this event - create new
+		hooks[eventName] = []interface{}{
+			map[string]interface{}{
+				"matcher": "",
+				"hooks": []interface{}{
+					map[string]interface{}{
+						"type":    "command",
+						"command": command,
+					},
+				},
+			},
+		}
+		return true
+	}
+
+	// Find entry with empty matcher (global hook)
+	for _, entry := range entries {
+		entryMap, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		matcher, _ := entryMap["matcher"].(string)
+		if matcher != "" {
+			continue
+		}
+
+		// Found global entry, check if hook already exists
+		hooksList, ok := entryMap["hooks"].([]interface{})
+		if !ok {
+			hooksList = []interface{}{}
+		}
+
+		for _, h := range hooksList {
+			hookMap, ok := h.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if hookMap["command"] == command {
+				// Hook already exists
+				return false
+			}
+		}
+
+		// Add hook to existing entry
+		hooksList = append(hooksList, map[string]interface{}{
+			"type":    "command",
+			"command": command,
+		})
+		entryMap["hooks"] = hooksList
+		return true
+	}
+
+	// No global entry found - create new one
+	entries = append(entries, map[string]interface{}{
+		"matcher": "",
+		"hooks": []interface{}{
+			map[string]interface{}{
+				"type":    "command",
+				"command": command,
+			},
+		},
+	})
+	hooks[eventName] = entries
+	return true
+}
+
 func installHook() error {
 	home, _ := os.UserHomeDir()
 	claudeDir := filepath.Join(home, ".claude")
@@ -2766,22 +2838,14 @@ func installHook() error {
 		}
 	}
 
-	// Create the Stop hook with correct nested format
-	stopHookEntry := map[string]interface{}{
-		"matcher": "",
-		"hooks": []interface{}{
-			map[string]interface{}{
-				"type":    "command",
-				"command": cccPath + " hook",
-			},
-		},
-	}
-
 	hooks, ok := settings["hooks"].(map[string]interface{})
 	if !ok {
 		hooks = make(map[string]interface{})
 	}
-	hooks["Stop"] = []interface{}{stopHookEntry}
+
+	// Add Stop hook (doesn't overwrite existing hooks)
+	stopAdded := addHookToEvent(hooks, "Stop", cccPath+" hook")
+
 	settings["hooks"] = hooks
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
@@ -2793,7 +2857,11 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	fmt.Println("✅ Claude hook installed!")
+	if stopAdded {
+		fmt.Println("✅ Claude hook installed!")
+	} else {
+		fmt.Println("✅ Claude hook already installed")
+	}
 	return nil
 }
 
