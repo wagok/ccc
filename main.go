@@ -762,6 +762,27 @@ func handleSubscribeCmd(conn net.Conn, encoder *json.Encoder, cfg *Config, req A
 	}
 }
 
+// captureTmuxPane captures the last N lines from a tmux pane
+func captureTmuxPane(tmuxName string, sshAddress string, lines int) (string, error) {
+	linesArg := fmt.Sprintf("-%d", lines)
+
+	if sshAddress != "" {
+		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S %s", shellQuote(tmuxName), linesArg)
+		result, err := runSSH(sshAddress, cmd, 10*time.Second)
+		if err != nil {
+			return "", fmt.Errorf("failed to capture pane: %w", err)
+		}
+		return strings.TrimRight(result, "\n"), nil
+	}
+
+	cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", linesArg)
+	result, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to capture pane: %w", err)
+	}
+	return strings.TrimRight(string(result), "\n"), nil
+}
+
 // getLastClaudeResponse captures the last response from Claude in tmux
 func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 	var output string
@@ -4169,6 +4190,48 @@ func listen() error {
 				}
 
 				sendMessage(config, chatID, threadID, msg.String())
+				continue
+			}
+
+			// /screenshot - capture last 50 lines from tmux session
+			if text == "/screenshot" && isGroup {
+				sessionName := getSessionByTopic(config, threadID)
+				if sessionName == "" {
+					sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
+					continue
+				}
+
+				sessionInfo := config.Sessions[sessionName]
+				if sessionInfo == nil {
+					sendMessage(config, chatID, threadID, "❌ Session info not found")
+					continue
+				}
+
+				_, projectName := parseSessionTarget(sessionName)
+				tmuxName := tmuxSessionName(extractProjectName(projectName))
+
+				var sshAddress string
+				if sessionInfo.Host != "" {
+					sshAddress = getHostAddress(config, sessionInfo.Host)
+					if sshAddress == "" {
+						sendMessage(config, chatID, threadID, "❌ Host not found: "+sessionInfo.Host)
+						continue
+					}
+				}
+
+				content, err := captureTmuxPane(tmuxName, sshAddress, 50)
+				if err != nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to capture: %v", err))
+					continue
+				}
+
+				if content == "" {
+					sendMessage(config, chatID, threadID, "📸 (empty screen)")
+					continue
+				}
+
+				// Send as monospace code block
+				sendMessage(config, chatID, threadID, fmt.Sprintf("📸 Last 50 lines:\n```\n%s\n```", content))
 				continue
 			}
 
