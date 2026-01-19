@@ -803,8 +803,10 @@ func truncateRepeatingChars(s string) string {
 		}
 
 		if count > 10 {
-			// Truncate: show char(count)
-			result.WriteRune(char)
+			// Truncate: keep 10 chars, show total count in brackets
+			for j := 0; j < 10; j++ {
+				result.WriteRune(char)
+			}
 			result.WriteString(fmt.Sprintf("(%d)", count))
 		} else {
 			// Keep as is
