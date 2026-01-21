@@ -2366,6 +2366,30 @@ func resolveProjectPathFromTranscript(encodedProjectDir string, cwd string) stri
 	return ""
 }
 
+// logHook writes hook events to ~/.ccc/hooks.log for debugging
+func logHook(hookType string, format string, args ...interface{}) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	logDir := filepath.Join(home, ".ccc")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return
+	}
+
+	logPath := filepath.Join(logDir, "hooks.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	message := fmt.Sprintf(format, args...)
+	fmt.Fprintf(f, "[%s] [%s] %s\n", timestamp, hookType, message)
+}
+
 // forwardToServer forwards a message to the server in client mode
 // Returns true if forwarded (client mode), false otherwise
 func forwardToServer(config *Config, cwd string, transcriptPath string, message string) bool {
@@ -2376,6 +2400,13 @@ func forwardToServer(config *Config, cwd string, transcriptPath string, message 
 	// Extract encoded project dir from transcript path
 	projectDir := extractProjectDirFromTranscript(transcriptPath)
 
+	// Truncate message for log
+	logMsg := message
+	if len(logMsg) > 100 {
+		logMsg = logMsg[:100] + "..."
+	}
+	logHook("Forward", "server=%s cwd=%s project=%s msg=%s", config.Server, cwd, projectDir, logMsg)
+
 	// Forward to server via SSH
 	// Use base64 to safely encode the message
 	encoded := base64.StdEncoding.EncodeToString([]byte(message))
@@ -2385,14 +2416,20 @@ func forwardToServer(config *Config, cwd string, transcriptPath string, message 
 	fmt.Fprintf(os.Stderr, "hook: forwarding to server %s (project=%s)\n", config.Server, projectDir)
 	_, err := runSSH(config.Server, cmd, 10*time.Second)
 	if err != nil {
+		logHook("Forward", "ERROR: %v", err)
 		fmt.Fprintf(os.Stderr, "hook: forward error: %v\n", err)
+	} else {
+		logHook("Forward", "SUCCESS")
 	}
 	return true
 }
 
 func handleHook() error {
+	logHook("Stop", "hook started")
+
 	config, err := loadConfig()
 	if err != nil {
+		logHook("Stop", "ERROR: no config")
 		fmt.Fprintf(os.Stderr, "hook: no config\n")
 		return nil
 	}
@@ -2401,10 +2438,12 @@ func handleHook() error {
 	var hookData HookData
 	decoder := json.NewDecoder(os.Stdin)
 	if err := decoder.Decode(&hookData); err != nil {
+		logHook("Stop", "ERROR: decode error: %v", err)
 		fmt.Fprintf(os.Stderr, "hook: decode error: %v\n", err)
 		return nil
 	}
 
+	logHook("Stop", "cwd=%s transcript=%s", hookData.Cwd, hookData.TranscriptPath)
 	fmt.Fprintf(os.Stderr, "hook: cwd=%s transcript=%s\n", hookData.Cwd, hookData.TranscriptPath)
 
 	// Read last message from transcript
@@ -2415,8 +2454,16 @@ func handleHook() error {
 		}
 	}
 
+	// Truncate message for log (first 100 chars)
+	logMsg := lastMessage
+	if len(logMsg) > 100 {
+		logMsg = logMsg[:100] + "..."
+	}
+	logHook("Stop", "message=%s", logMsg)
+
 	// In client mode, forward to server
 	if forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, lastMessage) {
+		logHook("Stop", "forwarded to server %s", config.Server)
 		return nil
 	}
 
@@ -2450,10 +2497,12 @@ func handleHook() error {
 		topicID = remoteTopicID
 	}
 	if sessionName == "" || config.GroupID == 0 {
+		logHook("Stop", "ERROR: no session found for cwd=%s", hookData.Cwd)
 		fmt.Fprintf(os.Stderr, "hook: no session found for cwd=%s\n", hookData.Cwd)
 		return nil
 	}
 
+	logHook("Stop", "session=%s topic=%d, sending to telegram", sessionName, topicID)
 	fmt.Fprintf(os.Stderr, "hook: session=%s topic=%d\n", sessionName, topicID)
 	fmt.Fprintf(os.Stderr, "hook: sending message to telegram\n")
 
@@ -3514,13 +3563,22 @@ func send(message string) error {
 
 // handleRemoteMessage handles messages forwarded from remote clients via --from flag
 func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, message string) error {
+	// Truncate message for log
+	logMsg := message
+	if len(logMsg) > 100 {
+		logMsg = logMsg[:100] + "..."
+	}
+	logHook("Remote", "from=%s cwd=%s project=%s msg=%s", fromHost, cwd, encodedProjectDir, logMsg)
+
 	config, err := loadConfig()
 	if err != nil {
+		logHook("Remote", "ERROR: not configured: %v", err)
 		return fmt.Errorf("not configured: %v", err)
 	}
 
 	// cwd is passed from remote client via --cwd flag
 	if cwd == "" {
+		logHook("Remote", "ERROR: missing --cwd parameter")
 		return fmt.Errorf("missing --cwd parameter")
 	}
 
@@ -3545,12 +3603,14 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		}
 		// Check if path matches (use resolved projectPath)
 		if info.Path == projectPath {
+			logHook("Remote", "matched session=%s topic=%d, sending", name, info.TopicID)
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
 			return sendMessage(config, config.GroupID, info.TopicID, message)
 		}
 	}
 
 	// No matching session found - auto-create topic (fallback for client-initiated sessions)
+	logHook("Remote", "no session for path=%s, creating topic", projectPath)
 	fmt.Printf("[remote] from=%s no session for path=%s, creating topic\n", fromHost, projectPath)
 
 	// Generate session name: host:projectDir
