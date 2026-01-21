@@ -2633,9 +2633,9 @@ func getLastAssistantMessage(transcriptPath string) string {
 
 	var lastMessage string
 	scanner := bufio.NewScanner(file)
-	// Increase buffer size for large lines
+	// Increase buffer size for large lines (up to 16MB for transcripts with images/PDFs)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, 16*1024*1024)
 
 	for scanner.Scan() {
 		var entry map[string]interface{}
