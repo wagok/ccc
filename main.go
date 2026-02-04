@@ -2446,6 +2446,10 @@ func handleHook() error {
 	logHook("Stop", "cwd=%s transcript=%s", hookData.Cwd, hookData.TranscriptPath)
 	fmt.Fprintf(os.Stderr, "hook: cwd=%s transcript=%s\n", hookData.Cwd, hookData.TranscriptPath)
 
+	// Delay to allow transcript file to be fully written
+	// (race condition: hook fires before final message is flushed to disk)
+	time.Sleep(2 * time.Second)
+
 	// Read last message from transcript
 	lastMessage := "Session ended"
 	if hookData.TranscriptPath != "" {
@@ -2651,7 +2655,11 @@ func getLastAssistantMessage(transcriptPath string) string {
 		// Reset on actual user message (not tool_result) - start fresh collection
 		if entryType == "user" {
 			if msg, ok := entry["message"].(map[string]interface{}); ok {
-				if content, ok := msg["content"].([]interface{}); ok && len(content) > 0 {
+				// Case 1: content is a string (simple user message)
+				if _, ok := msg["content"].(string); ok {
+					allTexts = nil
+				} else if content, ok := msg["content"].([]interface{}); ok && len(content) > 0 {
+					// Case 2: content is an array
 					if block, ok := content[0].(map[string]interface{}); ok {
 						// Only reset if first content block is "text" (real user message),
 						// not "tool_result" which is just a response to tool_use
