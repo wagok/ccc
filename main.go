@@ -2627,29 +2627,42 @@ func handlePermissionHook() error {
 func getLastAssistantMessage(transcriptPath string) string {
 	file, err := os.Open(transcriptPath)
 	if err != nil {
+		logHook("Parse", "failed to open transcript: %v", err)
 		return ""
 	}
 	defer file.Close()
 
-	var lastMessage string
+	var allTexts []string
+	var linesProcessed, assistantCount, textCount int
 	scanner := bufio.NewScanner(file)
 	// Increase buffer size for large lines (up to 16MB for transcripts with images/PDFs)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 16*1024*1024)
 
 	for scanner.Scan() {
+		linesProcessed++
 		var entry map[string]interface{}
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
 		}
-		if entry["type"] == "assistant" {
+
+		entryType, _ := entry["type"].(string)
+
+		// Reset on user message - start fresh collection
+		if entryType == "user" {
+			allTexts = nil
+		}
+
+		if entryType == "assistant" {
+			assistantCount++
 			if msg, ok := entry["message"].(map[string]interface{}); ok {
 				if content, ok := msg["content"].([]interface{}); ok {
 					for _, c := range content {
 						if block, ok := c.(map[string]interface{}); ok {
 							if block["type"] == "text" {
 								if text, ok := block["text"].(string); ok {
-									lastMessage = text
+									textCount++
+									allTexts = append(allTexts, text)
 								}
 							}
 						}
@@ -2658,7 +2671,14 @@ func getLastAssistantMessage(transcriptPath string) string {
 			}
 		}
 	}
-	return lastMessage
+
+	if err := scanner.Err(); err != nil {
+		logHook("Parse", "scanner error after %d lines: %v", linesProcessed, err)
+	}
+	logHook("Parse", "processed %d lines, %d assistant entries, %d text blocks since last user msg", linesProcessed, assistantCount, len(allTexts))
+
+	// Join all text blocks from the last turn
+	return strings.Join(allTexts, "\n\n")
 }
 
 func handlePromptHook() error {
