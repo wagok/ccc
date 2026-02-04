@@ -2648,9 +2648,19 @@ func getLastAssistantMessage(transcriptPath string) string {
 
 		entryType, _ := entry["type"].(string)
 
-		// Reset on user message - start fresh collection
+		// Reset on actual user message (not tool_result) - start fresh collection
 		if entryType == "user" {
-			allTexts = nil
+			if msg, ok := entry["message"].(map[string]interface{}); ok {
+				if content, ok := msg["content"].([]interface{}); ok && len(content) > 0 {
+					if block, ok := content[0].(map[string]interface{}); ok {
+						// Only reset if first content block is "text" (real user message),
+						// not "tool_result" which is just a response to tool_use
+						if block["type"] == "text" {
+							allTexts = nil
+						}
+					}
+				}
+			}
 		}
 
 		if entryType == "assistant" {
