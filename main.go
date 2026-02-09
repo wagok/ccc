@@ -3703,6 +3703,11 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		}
 		// Check if path matches (use resolved projectPath)
 		if info.Path == projectPath {
+			// Skip prompt messages that were just sent from Telegram (cooldown 10s)
+			if strings.HasPrefix(message, "💬") && wasTelegramSent(info.TopicID) {
+				logHook("Remote", "skipping prompt (telegram cooldown) session=%s topic=%d", name, info.TopicID)
+				return nil
+			}
 			logHook("Remote", "matched session=%s topic=%d, sending", name, info.TopicID)
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
 			return sendMessage(config, config.GroupID, info.TopicID, message)
