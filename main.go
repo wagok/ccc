@@ -1813,6 +1813,35 @@ func init() {
 	}
 }
 
+// markTelegramSent creates a marker file indicating a message was just sent
+// from Telegram to this topic's tmux session. Used by hook-prompt to avoid
+// echoing Telegram-originated messages back to Telegram.
+func markTelegramSent(topicID int64) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".ccc", "telegram-sent")
+	os.MkdirAll(dir, 0755)
+	marker := filepath.Join(dir, fmt.Sprintf("%d", topicID))
+	os.WriteFile(marker, nil, 0644)
+}
+
+// wasTelegramSent checks if a message was sent from Telegram to this topic
+// within the cooldown period (10 seconds).
+func wasTelegramSent(topicID int64) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	marker := filepath.Join(home, ".ccc", "telegram-sent", fmt.Sprintf("%d", topicID))
+	info, err := os.Stat(marker)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) < 10*time.Second
+}
+
 // tmuxVerbose returns true if CCC_TMUX_VERBOSE env is set
 func tmuxVerbose() bool {
 	return os.Getenv("CCC_TMUX_VERBOSE") != ""
@@ -1827,10 +1856,28 @@ func tmuxBaseArgs() []string {
 	return args
 }
 
+// tmuxLogDir returns the directory for tmux verbose logs (~/.ccc/tmux-logs/)
+// and ensures it exists.
+func tmuxLogDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".ccc", "tmux-logs")
+	os.MkdirAll(dir, 0755)
+	return dir
+}
+
 // tmuxCmd creates an exec.Cmd for tmux with proper base args
 func tmuxCmd(cmdArgs ...string) *exec.Cmd {
 	args := append(tmuxBaseArgs(), cmdArgs...)
-	return exec.Command(tmuxPath, args...)
+	cmd := exec.Command(tmuxPath, args...)
+	if tmuxVerbose() {
+		if dir := tmuxLogDir(); dir != "" {
+			cmd.Dir = dir
+		}
+	}
+	return cmd
 }
 
 // ensureTmuxServer ensures tmux server is running by checking if socket exists
@@ -2746,10 +2793,25 @@ func handlePromptHook() error {
 		return nil
 	}
 
+	// Check if this prompt was just sent from Telegram (cooldown 10s)
+	if wasTelegramSent(topicID) {
+		fmt.Fprintf(os.Stderr, "hook-prompt: skipping (telegram cooldown) topic=%d\n", topicID)
+		return nil
+	}
+
+	// This is a locally-typed prompt — save to history
+	appendHistory(topicID, HistoryMessage{
+		ID:        nextMessageID(),
+		Timestamp: time.Now().Unix(),
+		From:      "human",
+		Text:      hookData.Prompt,
+		Username:  "terminal",
+	})
+
 	// Send typing action
 	sendTypingAction(config, config.GroupID, topicID)
 
-	fmt.Fprintf(os.Stderr, "hook-prompt: sending to topic %d\n", topicID)
+	fmt.Fprintf(os.Stderr, "hook-prompt: sending local prompt to topic %d\n", topicID)
 	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", prompt))
 }
 
@@ -4783,6 +4845,7 @@ func listen() error {
 								Text:      text,
 								Username:  msg.From.Username,
 							})
+							markTelegramSent(threadID)
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
@@ -4812,6 +4875,7 @@ func listen() error {
 								Text:      text,
 								Username:  msg.From.Username,
 							})
+							markTelegramSent(threadID)
 							if err := sendToTmux(tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
