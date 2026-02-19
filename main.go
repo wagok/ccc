@@ -956,19 +956,40 @@ func truncateRepeatingCharsInLines(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-// getLastClaudeResponse captures the last response from Claude in tmux
+// getLastClaudeResponse captures the last response from Claude in tmux.
+// It tries up to 3 times with increasing capture window if the result is empty,
+// since Claude Code's terminal UI may overwrite the response with spinners/prompts.
 func getLastClaudeResponse(tmuxName string, sshAddress string) string {
+	// Try with increasing capture sizes; retry if result is empty
+	captureSizes := []int{200, 500, 500}
+	for attempt, captureSize := range captureSizes {
+		if attempt > 0 {
+			fmt.Printf("[getLastClaudeResponse] retry #%d (capture -S -%d)\n", attempt, captureSize)
+			time.Sleep(2 * time.Second)
+		}
+
+		result := captureClaudeResponse(tmuxName, sshAddress, captureSize)
+		if result != "" {
+			return result
+		}
+	}
+	fmt.Printf("[getLastClaudeResponse] all retries exhausted, returning empty\n")
+	return ""
+}
+
+// captureClaudeResponse does a single capture-pane and parses Claude's response
+func captureClaudeResponse(tmuxName string, sshAddress string, captureLines int) string {
 	var output string
 
 	if sshAddress != "" {
-		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -50", shellQuote(tmuxName))
+		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -%d", shellQuote(tmuxName), captureLines)
 		result, err := runSSH(sshAddress, cmd, 10*time.Second)
 		if err != nil {
 			return ""
 		}
 		output = result
 	} else {
-		cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", "-50")
+		cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", fmt.Sprintf("-%d", captureLines))
 		result, err := cmd.Output()
 		if err != nil {
 			return ""
@@ -977,8 +998,8 @@ func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 	}
 
 	// Debug: log raw capture-pane output before any filtering
-	fmt.Printf("[getLastClaudeResponse] raw capture-pane (%d bytes, %d lines):\n---RAW START---\n%s\n---RAW END---\n",
-		len(output), len(strings.Split(output, "\n")), output)
+	fmt.Printf("[getLastClaudeResponse] raw capture-pane (%d bytes, %d lines, -S -%d):\n---RAW START---\n%s\n---RAW END---\n",
+		len(output), len(strings.Split(output, "\n")), captureLines, output)
 
 	// Parse output to find Claude's response
 	// Look for content after the prompt marker (❯) and before the next prompt
