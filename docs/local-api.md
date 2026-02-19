@@ -87,11 +87,11 @@ Health check. Returns server version, uptime, and active session count.
 **Response fields:**
 - `version` - Server version string
 - `uptime_seconds` - Seconds since server started
-- `sessions_active` - Number of sessions where Claude is currently processing
+- `sessions_active` - Number of configured (non-deleted) sessions
 
 **Notes:**
-- This command checks tmux state for each session, so `sessions_active` reflects real-time status.
-- Use this as a readiness probe before sending work — if `sessions_active` is high, the server is under load.
+- This command is instant (no tmux or SSH calls). Use it as a health/readiness probe.
+- To check real-time session activity (active/idle), use `sessions` instead.
 
 ---
 

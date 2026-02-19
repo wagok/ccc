@@ -417,24 +417,11 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 
 // handlePingCmd handles the "ping" command
 func handlePingCmd(encoder *json.Encoder, cfg *Config) {
-	// Count active sessions
-	active := 0
-	for name, info := range cfg.Sessions {
-		if info.Deleted {
-			continue
-		}
-		tmuxName := tmuxSessionName(name)
-		if info.Host != "" {
-			address := getHostAddress(cfg, info.Host)
-			if address != "" && sshTmuxHasSession(address, tmuxName) {
-				if checkClaudeState(tmuxName, address) == "busy" {
-					active++
-				}
-			}
-		} else if tmuxSessionExists(tmuxName) {
-			if checkClaudeState(tmuxName, "") == "busy" {
-				active++
-			}
+	// Count configured (non-deleted) sessions — no tmux/SSH calls for fast response
+	total := 0
+	for _, info := range cfg.Sessions {
+		if !info.Deleted {
+			total++
 		}
 	}
 
@@ -442,7 +429,7 @@ func handlePingCmd(encoder *json.Encoder, cfg *Config) {
 		OK:             true,
 		Version:        version,
 		UptimeSeconds:  int64(time.Since(serverStartTime).Seconds()),
-		SessionsActive: active,
+		SessionsActive: total,
 	})
 }
 
