@@ -5,9 +5,10 @@ CCC provides a Unix socket API for local integration with external agents and or
 ## Overview
 
 The Local API allows external programs running on the same host to:
-- List available Claude Code sessions
+- Check server health and version (`ping`)
+- List available Claude Code sessions with metadata
 - Send messages to sessions (blocking or non-blocking)
-- Retrieve message history
+- Retrieve message history with filtering
 - Subscribe to real-time status updates
 
 ## Socket Location
@@ -64,9 +65,39 @@ sudo loginctl enable-linger $USER
 
 ## Commands
 
+### ping
+
+Health check. Returns server version, uptime, and active session count.
+
+**Request:**
+```json
+{"cmd": "ping"}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "version": "1.0.0",
+  "uptime_seconds": 3600,
+  "sessions_active": 3
+}
+```
+
+**Response fields:**
+- `version` - Server version string
+- `uptime_seconds` - Seconds since server started
+- `sessions_active` - Number of sessions where Claude is currently processing
+
+**Notes:**
+- This command checks tmux state for each session, so `sessions_active` reflects real-time status.
+- Use this as a readiness probe before sending work — if `sessions_active` is high, the server is under load.
+
+---
+
 ### sessions
 
-List all available sessions with their current status.
+List all available sessions with their current status and metadata.
 
 **Request:**
 ```json
@@ -78,16 +109,38 @@ List all available sessions with their current status.
 {
   "ok": true,
   "sessions": [
-    {"name": "myproject", "host": "local", "status": "active"},
-    {"name": "backend", "host": "server1", "status": "idle"}
+    {
+      "name": "myproject",
+      "host": "local",
+      "status": "active",
+      "cwd": "/home/user/Projects/myproject",
+      "last_activity": 1705412400
+    },
+    {
+      "name": "backend",
+      "host": "server1",
+      "status": "idle",
+      "cwd": "/home/user/Projects/backend",
+      "last_activity": 1705410000
+    }
   ]
 }
 ```
 
+**Session fields:**
+- `name` - Session identifier
+- `host` - `"local"` or remote host name
+- `status` - `"active"`, `"idle"`, or `"stopped"`
+- `cwd` - Project working directory (the path Claude operates in)
+- `last_activity` - Unix timestamp of last history file modification (0 if no history)
+
 **Status values:**
 - `active` - Claude is currently processing
 - `idle` - Claude is waiting for input
-- `stopped` - tmux session not running
+
+**Notes:**
+- `last_activity` is based on history file mtime, not tmux state. A session with no messages via CCC will have `last_activity: 0` even if Claude is active in tmux.
+- `cwd` is the configured project path, not Claude's runtime working directory (Claude may `cd` elsewhere during a task).
 
 ---
 
@@ -110,6 +163,7 @@ Send a message and wait for Claude's response (blocking).
 {
   "ok": true,
   "response": "The current API version is 2.3.1...",
+  "message_id": 287,
   "duration_ms": 8500
 }
 ```
@@ -119,11 +173,18 @@ Send a message and wait for Claude's response (blocking).
 - `text` (required) - Message to send
 - `from` (optional) - Agent identifier, shown in Telegram as `[from]`
 
+**Response fields:**
+- `response` - Claude's response text
+- `message_id` - ID of the stored response message in history
+- `duration_ms` - Wall-clock time from send to response
+
 **Notes:**
 - **Auto-start**: If session is not running, it will be automatically started with `-c` flag (continue)
 - Timeout: 5 minutes
 - Message appears in Telegram: `🤖 [orchestrator] What's the current API version?`
 - Returns when Claude finishes responding
+- Both the sent message and Claude's response are stored in history. The `message_id` in the response refers to Claude's reply, not the sent message.
+- **One at a time**: Do not send concurrent `ask` requests to the same session. Check `sessions` status or use `ping` to verify the session is idle before sending.
 
 ---
 
@@ -145,13 +206,14 @@ Send a message without waiting for response (non-blocking).
 ```json
 {
   "ok": true,
-  "message_id": 12345
+  "message_id": 285
 }
 ```
 
 **Notes:**
 - **Auto-start**: If session is not running, it will be automatically started with `-c` flag (continue)
-- Use `history` command with `after` parameter to retrieve the response later
+- The `message_id` refers to the sent message (not Claude's response)
+- To retrieve Claude's response later, poll with `history` using `after` set to the returned `message_id`
 
 ---
 
@@ -165,7 +227,8 @@ Retrieve message history for a session.
   "cmd": "history",
   "session": "myproject",
   "after": 12345,
-  "limit": 50
+  "limit": 50,
+  "from_filter": "claude"
 }
 ```
 
@@ -175,7 +238,7 @@ Retrieve message history for a session.
   "ok": true,
   "messages": [
     {"id": 12346, "ts": 1705412345, "from": "claude", "text": "Tests passed..."},
-    {"id": 12347, "ts": 1705412400, "from": "human", "text": "Great!", "username": "wlad"}
+    {"id": 12347, "ts": 1705412400, "from": "claude", "text": "Refactoring complete."}
   ]
 }
 ```
@@ -184,6 +247,7 @@ Retrieve message history for a session.
 - `session` (required) - Session name
 - `after` (optional) - Return messages after this ID
 - `limit` (optional) - Maximum messages to return (default: 100)
+- `from_filter` (optional) - Only return messages from this sender: `"human"`, `"claude"`, or `"api"`
 
 **Message fields:**
 - `id` - Unique message ID
@@ -195,6 +259,10 @@ Retrieve message history for a session.
 - `caption` - For photo messages
 - `agent` - For API messages, the `from` parameter
 - `username` - Telegram username for human messages
+
+**Notes:**
+- `from_filter` is an exact match. Use `"api"` (not the agent name) to get all API-originated messages regardless of which agent sent them.
+- To get only Claude's responses to your API messages, combine `after` with `from_filter`: send via `send`, save the `message_id`, then poll `history(after=message_id, from_filter="claude", limit=1)`.
 
 ---
 
@@ -251,7 +319,10 @@ Common errors:
 ### Using nc (netcat)
 
 ```bash
-# List sessions
+# Health check
+echo '{"cmd":"ping"}' | nc -U ~/.ccc.sock -q 1
+
+# List sessions with metadata
 echo '{"cmd":"sessions"}' | nc -U ~/.ccc.sock -q 1
 
 # Send message and wait for response
@@ -259,6 +330,9 @@ echo '{"cmd":"ask","session":"myproject","text":"Hello"}' | nc -U ~/.ccc.sock -q
 
 # Get recent history
 echo '{"cmd":"history","session":"myproject","limit":10}' | nc -U ~/.ccc.sock -q 1
+
+# Get only Claude's messages
+echo '{"cmd":"history","session":"myproject","from_filter":"claude","limit":5}' | nc -U ~/.ccc.sock -q 1
 ```
 
 ### Using socat
@@ -276,6 +350,7 @@ echo '{"cmd":"sessions"}' | socat -t 5 - UNIX-CONNECT:$HOME/.ccc.sock
 ```python
 import socket
 import json
+import os
 
 def ccc_request(cmd):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -285,9 +360,14 @@ def ccc_request(cmd):
     sock.close()
     return json.loads(response)
 
+# Health check
+ping = ccc_request({"cmd": "ping"})
+print(f"CCC v{ping['version']}, up {ping['uptime_seconds']}s")
+
 # List sessions
 sessions = ccc_request({"cmd": "sessions"})
-print(sessions)
+for s in sessions["sessions"]:
+    print(f"  {s['name']} ({s['status']}) cwd={s.get('cwd', 'N/A')}")
 
 # Ask Claude
 response = ccc_request({
@@ -296,7 +376,7 @@ response = ccc_request({
     "text": "What tests are failing?",
     "from": "my-script"
 })
-print(response["response"])
+print(f"Response (msg {response['message_id']}): {response['response']}")
 ```
 
 ### Go Example
@@ -306,6 +386,7 @@ package main
 
 import (
     "encoding/json"
+    "fmt"
     "net"
     "os"
     "path/filepath"
@@ -351,7 +432,7 @@ All messages sent via the API appear in the corresponding Telegram topic:
 
 This allows human oversight of automated interactions.
 
-## Use Cases
+## Patterns and Use Cases
 
 ### 1. Orchestrator Agent
 
@@ -366,7 +447,64 @@ CCC API → Orchestrator: response
 Orchestrator → User: "Backend tests all pass (47/47)"
 ```
 
-### 2. Background Monitoring
+### 2. Fire-and-Poll (Non-blocking)
+
+For long-running tasks, use `send` + `history` instead of `ask` to avoid blocking:
+
+```python
+# 1. Send the task
+result = ccc_request({
+    "cmd": "send",
+    "session": "backend",
+    "text": "Run the full test suite and fix failures",
+    "from": "orchestrator"
+})
+sent_id = result["message_id"]
+
+# 2. Poll for Claude's response
+import time
+while True:
+    time.sleep(10)
+    history = ccc_request({
+        "cmd": "history",
+        "session": "backend",
+        "after": sent_id,
+        "from_filter": "claude",
+        "limit": 1
+    })
+    if history["messages"]:
+        print("Claude responded:", history["messages"][0]["text"])
+        break
+```
+
+This pattern is preferable when:
+- The task may take longer than the 5-minute `ask` timeout
+- You need to monitor multiple sessions concurrently
+- You want to check on progress without blocking the caller
+
+### 3. Pre-flight Check
+
+Before sending work, verify the server is healthy and the target session is idle:
+
+```python
+# Check server
+ping = ccc_request({"cmd": "ping"})
+if not ping["ok"]:
+    raise RuntimeError("CCC is down")
+
+# Check target session is idle
+sessions = ccc_request({"cmd": "sessions"})
+target = next((s for s in sessions["sessions"] if s["name"] == "backend"), None)
+if target is None:
+    raise RuntimeError("Session not found")
+if target["status"] == "active":
+    raise RuntimeError("Session is busy, retry later")
+
+# Safe to send
+ccc_request({"cmd": "ask", "session": "backend", "text": "...", "from": "agent"})
+```
+
+### 4. Background Monitoring
 
 Monitor all sessions for status changes:
 
@@ -379,7 +517,7 @@ while True:
         print(f"{event['session']}: {event['status']}")
 ```
 
-### 3. CI/CD Integration
+### 5. CI/CD Integration
 
 Trigger Claude tasks from CI pipelines:
 
@@ -387,4 +525,19 @@ Trigger Claude tasks from CI pipelines:
 # In CI script
 echo '{"cmd":"send","session":"myproject","text":"Run linter and fix issues","from":"github-actions"}' \
   | nc -U ~/.ccc.sock -q 1
+```
+
+### 6. Session Discovery by Path
+
+Find the session for a specific project using `cwd`:
+
+```python
+sessions = ccc_request({"cmd": "sessions"})
+target = next(
+    (s["name"] for s in sessions["sessions"]
+     if s.get("cwd", "").endswith("/myproject")),
+    None
+)
+if target:
+    ccc_request({"cmd": "ask", "session": target, "text": "...", "from": "agent"})
 ```
