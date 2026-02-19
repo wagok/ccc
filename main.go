@@ -602,6 +602,11 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		Agent:     agentLabel,
 	})
 
+	// Mark as sent to suppress prompt hook echo (same mechanism as Telegram dedup)
+	if info.TopicID > 0 {
+		markTelegramSent(info.TopicID)
+	}
+
 	// Send to tmux
 	var sendErr error
 	if info.Host != "" {
@@ -713,6 +718,11 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		Text:      req.Text,
 		Agent:     agentLabel,
 	})
+
+	// Mark as sent to suppress prompt hook echo (same mechanism as Telegram dedup)
+	if info.TopicID > 0 {
+		markTelegramSent(info.TopicID)
+	}
 
 	// Send to tmux
 	var sendErr error
