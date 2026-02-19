@@ -123,24 +123,28 @@ type HookData struct {
 
 // APIRequest represents an incoming request on the Unix socket
 type APIRequest struct {
-	Cmd      string   `json:"cmd"`                 // sessions, ask, send, history, subscribe
-	Session  string   `json:"session,omitempty"`   // session name
-	Text     string   `json:"text,omitempty"`      // message text
-	From     string   `json:"from,omitempty"`      // agent identifier
-	After    int64    `json:"after,omitempty"`     // for history: after message_id
-	Limit    int      `json:"limit,omitempty"`     // for history: max messages
-	Sessions []string `json:"sessions,omitempty"`  // for subscribe: session list
+	Cmd        string   `json:"cmd"`                   // ping, sessions, ask, send, history, subscribe
+	Session    string   `json:"session,omitempty"`     // session name
+	Text       string   `json:"text,omitempty"`        // message text
+	From       string   `json:"from,omitempty"`        // agent identifier
+	After      int64    `json:"after,omitempty"`       // for history: after message_id
+	Limit      int      `json:"limit,omitempty"`       // for history: max messages
+	FromFilter string   `json:"from_filter,omitempty"` // for history: filter by sender (human, claude, api)
+	Sessions   []string `json:"sessions,omitempty"`    // for subscribe: session list
 }
 
 // APIResponse represents a response on the Unix socket
 type APIResponse struct {
-	OK        bool              `json:"ok"`
-	Error     string            `json:"error,omitempty"`
-	Sessions  []APISessionInfo  `json:"sessions,omitempty"`
-	Response  string            `json:"response,omitempty"`
-	MessageID int64             `json:"message_id,omitempty"`
-	Messages  []HistoryMessage  `json:"messages,omitempty"`
-	Duration  int64             `json:"duration_ms,omitempty"`
+	OK             bool              `json:"ok"`
+	Error          string            `json:"error,omitempty"`
+	Sessions       []APISessionInfo  `json:"sessions,omitempty"`
+	Response       string            `json:"response,omitempty"`
+	MessageID      int64             `json:"message_id,omitempty"`
+	Messages       []HistoryMessage  `json:"messages,omitempty"`
+	Duration       int64             `json:"duration_ms,omitempty"`
+	Version        string            `json:"version,omitempty"`
+	UptimeSeconds  int64             `json:"uptime_seconds,omitempty"`
+	SessionsActive int              `json:"sessions_active,omitempty"`
 }
 
 // APIEvent represents a streaming event for subscribe
@@ -154,9 +158,11 @@ type APIEvent struct {
 
 // APISessionInfo represents session info in API response
 type APISessionInfo struct {
-	Name   string `json:"name"`
-	Host   string `json:"host"`   // "local" or host name
-	Status string `json:"status"` // "active", "idle"
+	Name         string `json:"name"`
+	Host         string `json:"host"`                    // "local" or host name
+	Status       string `json:"status"`                  // "active", "idle"
+	Cwd          string `json:"cwd,omitempty"`           // project working directory
+	LastActivity int64  `json:"last_activity,omitempty"` // unix timestamp of last history entry
 }
 
 // HistoryMessage represents a message stored in history
@@ -172,6 +178,9 @@ type HistoryMessage struct {
 	Agent         string `json:"agent,omitempty"`         // for api messages
 	Username      string `json:"username,omitempty"`      // telegram username
 }
+
+// Server start time for uptime calculation
+var serverStartTime time.Time
 
 // Global message ID counter (in-memory, initialized from history on start)
 var (
@@ -260,7 +269,7 @@ func appendHistory(topicID int64, msg HistoryMessage) error {
 }
 
 // readHistory reads messages from history files
-func readHistory(topicID int64, afterID int64, limit int) ([]HistoryMessage, error) {
+func readHistory(topicID int64, afterID int64, limit int, fromFilter string) ([]HistoryMessage, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -293,6 +302,9 @@ func readHistory(topicID int64, afterID int64, limit int) ([]HistoryMessage, err
 			var msg HistoryMessage
 			if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
 				if msg.ID > afterID {
+					if fromFilter != "" && msg.From != fromFilter {
+						continue
+					}
 					fileMessages = append(fileMessages, msg)
 				}
 			}
@@ -322,6 +334,7 @@ var socketListener net.Listener
 
 // startSocketServer starts the Unix socket API server
 func startSocketServer(cfg *Config) error {
+	serverStartTime = time.Now()
 	path := socketPath()
 
 	// Remove existing socket file
@@ -383,6 +396,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 		}
 
 		switch req.Cmd {
+		case "ping":
+			handlePingCmd(encoder, cfg)
 		case "sessions":
 			handleSessionsCmd(encoder, cfg)
 		case "ask":
@@ -398,6 +413,37 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
 	}
+}
+
+// handlePingCmd handles the "ping" command
+func handlePingCmd(encoder *json.Encoder, cfg *Config) {
+	// Count active sessions
+	active := 0
+	for name, info := range cfg.Sessions {
+		if info.Deleted {
+			continue
+		}
+		tmuxName := tmuxSessionName(name)
+		if info.Host != "" {
+			address := getHostAddress(cfg, info.Host)
+			if address != "" && sshTmuxHasSession(address, tmuxName) {
+				if checkClaudeState(tmuxName, address) == "busy" {
+					active++
+				}
+			}
+		} else if tmuxSessionExists(tmuxName) {
+			if checkClaudeState(tmuxName, "") == "busy" {
+				active++
+			}
+		}
+	}
+
+	encoder.Encode(APIResponse{
+		OK:             true,
+		Version:        version,
+		UptimeSeconds:  int64(time.Since(serverStartTime).Seconds()),
+		SessionsActive: active,
+	})
 }
 
 // handleSessionsCmd handles the "sessions" command
@@ -434,10 +480,23 @@ func handleSessionsCmd(encoder *json.Encoder, cfg *Config) {
 			host = info.Host
 		}
 
+		// Get last activity time from latest history file
+		var lastActivity int64
+		histDir := getHistoryDir(info.TopicID)
+		if histFiles, err := filepath.Glob(filepath.Join(histDir, "*.jsonl")); err == nil && len(histFiles) > 0 {
+			// Files are date-sorted by name; last one is newest
+			latestFile := histFiles[len(histFiles)-1]
+			if fi, err := os.Stat(latestFile); err == nil {
+				lastActivity = fi.ModTime().Unix()
+			}
+		}
+
 		sessions = append(sessions, APISessionInfo{
-			Name:   name,
-			Host:   host,
-			Status: status,
+			Name:         name,
+			Host:         host,
+			Status:       status,
+			Cwd:          info.Path,
+			LastActivity: lastActivity,
 		})
 	}
 
@@ -595,10 +654,21 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 					// Claude is idle, get last response
 					response := getLastClaudeResponse(tmuxName, sshAddr)
 					duration := time.Since(startTime).Milliseconds()
+
+					// Store Claude's response in history
+					responseMsgID := nextMessageID()
+					appendHistory(info.TopicID, HistoryMessage{
+						ID:        responseMsgID,
+						Timestamp: time.Now().Unix(),
+						From:      "claude",
+						Text:      response,
+					})
+
 					encoder.Encode(APIResponse{
-						OK:       true,
-						Response: response,
-						Duration: duration,
+						OK:        true,
+						Response:  response,
+						MessageID: responseMsgID,
+						Duration:  duration,
 					})
 					return
 				}
@@ -684,7 +754,7 @@ func handleHistoryCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 
-	messages, err := readHistory(info.TopicID, req.After, req.Limit)
+	messages, err := readHistory(info.TopicID, req.After, req.Limit, req.FromFilter)
 	if err != nil {
 		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to read history: %v", err)})
 		return
