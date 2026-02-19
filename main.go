@@ -928,11 +928,67 @@ func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 		}
 
 		if inResponse && strings.TrimSpace(line) != "" {
+			if isClaudeUIArtifact(line) {
+				continue
+			}
 			responseLines = append([]string{line}, responseLines...)
 		}
 	}
 
 	return strings.TrimSpace(strings.Join(responseLines, "\n"))
+}
+
+// isClaudeUIArtifact returns true if a line is a Claude Code terminal UI element
+// (spinners, separators, tool markers, status bars) rather than actual response text.
+func isClaudeUIArtifact(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return true
+	}
+
+	// Separator lines (──────)
+	if strings.TrimLeft(trimmed, "─") == "" {
+		return true
+	}
+
+	// Tool use markers: ● Bash(...), ● Update(...), ● Read ...
+	if strings.HasPrefix(trimmed, "●") {
+		return true
+	}
+
+	// Nested tool output: ⎿ Added 16 lines...
+	if strings.HasPrefix(trimmed, "⎿") {
+		return true
+	}
+
+	// Spinners and thinking indicators: ✶ ✢ ✽ ✻
+	if strings.HasPrefix(trimmed, "✶") || strings.HasPrefix(trimmed, "✢") ||
+		strings.HasPrefix(trimmed, "✽") || strings.HasPrefix(trimmed, "✻") {
+		return true
+	}
+
+	// Status bar
+	if strings.HasPrefix(trimmed, "⏵") {
+		return true
+	}
+
+	// Thinking statistics
+	if strings.HasPrefix(trimmed, "Cogitated for") {
+		return true
+	}
+
+	// Activity/permission indicators
+	if strings.Contains(line, "ctrl+c to interrupt") ||
+		strings.Contains(line, "bypass permissions") {
+		return true
+	}
+
+	// Collapsed output indicator: … +56 lines (ctrl+o to expand)
+	if strings.Contains(trimmed, "lines (ctrl+o to expand)") {
+		return true
+	}
+
+	return false
 }
 
 // Config function wrappers - delegate to config package
