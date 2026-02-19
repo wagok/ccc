@@ -188,6 +188,9 @@ var (
 	messageIDMutex   sync.Mutex
 )
 
+// activeCaptures tracks ongoing background response captures per session
+var activeCaptures sync.Map // key: session name (string), value: bool
+
 func nextMessageID() int64 {
 	messageIDMutex.Lock()
 	defer messageIDMutex.Unlock()
@@ -726,6 +729,72 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 
 	encoder.Encode(APIResponse{OK: true, MessageID: msgID})
+
+	// Start background capture for remote sessions
+	if info.Host != "" {
+		address := getHostAddress(cfg, info.Host)
+		captureResponseAsync(req.Session, tmuxName, address, info.TopicID)
+	}
+}
+
+// captureResponseAsync polls a remote session in the background to capture
+// Claude's response after a message is sent. It stores the response in history.
+// Only one capture runs per session at a time (guarded by activeCaptures).
+func captureResponseAsync(sessionName string, tmuxName string, sshAddress string, topicID int64) {
+	// Per-session guard: skip if capture already running
+	if _, loaded := activeCaptures.LoadOrStore(sessionName, true); loaded {
+		return
+	}
+
+	go func() {
+		defer activeCaptures.Delete(sessionName)
+
+		// Wait for Claude to start processing
+		time.Sleep(1 * time.Second)
+
+		timeout := time.After(5 * time.Minute)
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		idleCount := 0
+		for {
+			select {
+			case <-timeout:
+				fmt.Printf("[capture] timeout for session=%s\n", sessionName)
+				return
+			case <-ticker.C:
+				state := checkClaudeState(tmuxName, sshAddress)
+				if state == "idle" {
+					idleCount++
+					if idleCount >= 2 {
+						// Claude is idle, capture response
+						response := getLastClaudeResponse(tmuxName, sshAddress)
+						if response == "" {
+							return
+						}
+
+						// Dedup: check last claude message in history
+						msgs, err := readHistory(topicID, 0, 1, "claude")
+						if err == nil && len(msgs) > 0 && msgs[len(msgs)-1].Text == response {
+							fmt.Printf("[capture] dedup: response already in history for session=%s\n", sessionName)
+							return
+						}
+
+						appendHistory(topicID, HistoryMessage{
+							ID:        nextMessageID(),
+							Timestamp: time.Now().Unix(),
+							From:      "claude",
+							Text:      response,
+						})
+						fmt.Printf("[capture] stored response for session=%s (%d chars)\n", sessionName, len(response))
+						return
+					}
+				} else {
+					idleCount = 0
+				}
+			}
+		}
+	}()
 }
 
 // handleHistoryCmd handles the "history" command
@@ -3823,6 +3892,14 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 			}
 			logHook("Remote", "matched session=%s topic=%d, sending", name, info.TopicID)
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
+			// Store forwarded message in history
+			histFrom, histText := parseRemoteMessagePrefix(message)
+			appendHistory(info.TopicID, HistoryMessage{
+				ID:        nextMessageID(),
+				Timestamp: time.Now().Unix(),
+				From:      histFrom,
+				Text:      histText,
+			})
 			return sendMessage(config, config.GroupID, info.TopicID, message)
 		}
 	}
@@ -3842,7 +3919,38 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 	}
 
 	fmt.Printf("[remote] created/reused topic %d for session %s\n", topicID, fullName)
+	// Store forwarded message in history
+	histFrom, histText := parseRemoteMessagePrefix(message)
+	appendHistory(topicID, HistoryMessage{
+		ID:        nextMessageID(),
+		Timestamp: time.Now().Unix(),
+		From:      histFrom,
+		Text:      histText,
+	})
 	return sendMessage(config, config.GroupID, topicID, message)
+}
+
+// parseRemoteMessagePrefix determines the sender and clean text from a
+// forwarded remote message. Messages from client-mode hooks have prefixes:
+//   - "✅ sessionName\n\n..." → from claude (stop hook = response)
+//   - "💬 ..." → from human (prompt hook)
+//   - everything else → from claude (output hook / tool output)
+func parseRemoteMessagePrefix(message string) (from string, text string) {
+	if strings.HasPrefix(message, "✅") {
+		// Stop hook: "✅ sessionName\n\n<response>"
+		if idx := strings.Index(message, "\n\n"); idx != -1 {
+			return "claude", message[idx+2:]
+		}
+		return "claude", message
+	}
+	if strings.HasPrefix(message, "💬") {
+		// Prompt hook: "💬 <user message>"
+		text = strings.TrimPrefix(message, "💬 ")
+		text = strings.TrimPrefix(text, "💬")
+		return "human", strings.TrimSpace(text)
+	}
+	// Output hook or other → claude
+	return "claude", message
 }
 
 // handleHostCommand handles /host subcommands
@@ -4967,6 +5075,9 @@ func listen() error {
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
+							} else {
+								// Start background capture for remote session response
+								captureResponseAsync(sessionName, tmuxName, address, threadID)
 							}
 						} else {
 							sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
