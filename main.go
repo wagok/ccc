@@ -649,7 +649,7 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 				idleCount++
 				if idleCount >= 2 {
 					// Claude is idle, get last response
-					response := getLastClaudeResponse(tmuxName, sshAddr)
+					response := getLastClaudeResponse(tmuxName, sshAddr, req.Text)
 					duration := time.Since(startTime).Milliseconds()
 
 					// Store Claude's response in history
@@ -780,7 +780,7 @@ func captureResponseAsync(sessionName string, tmuxName string, sshAddress string
 					idleCount++
 					if idleCount >= 2 {
 						// Claude is idle, capture response
-						response := getLastClaudeResponse(tmuxName, sshAddress)
+						response := getLastClaudeResponse(tmuxName, sshAddress, "")
 						if response == "" {
 							return
 						}
@@ -1008,9 +1008,10 @@ func truncateRepeatingCharsInLines(s string) string {
 }
 
 // getLastClaudeResponse captures the last response from Claude in tmux.
+// sentText is the message that was sent — used to skip echo of our own message.
 // It tries up to 3 times with increasing capture window if the result is empty,
 // since Claude Code's terminal UI may overwrite the response with spinners/prompts.
-func getLastClaudeResponse(tmuxName string, sshAddress string) string {
+func getLastClaudeResponse(tmuxName string, sshAddress string, sentText string) string {
 	// Try with increasing capture sizes; retry if result is empty
 	captureSizes := []int{200, 500, 500}
 	for attempt, captureSize := range captureSizes {
@@ -1019,7 +1020,7 @@ func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 			time.Sleep(2 * time.Second)
 		}
 
-		result := captureClaudeResponse(tmuxName, sshAddress, captureSize)
+		result := captureClaudeResponse(tmuxName, sshAddress, captureSize, sentText)
 		if result != "" {
 			return result
 		}
@@ -1028,8 +1029,9 @@ func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 	return ""
 }
 
-// captureClaudeResponse does a single capture-pane and parses Claude's response
-func captureClaudeResponse(tmuxName string, sshAddress string, captureLines int) string {
+// captureClaudeResponse does a single capture-pane and parses Claude's response.
+// sentText is used to detect and skip echo of the sent message in the capture.
+func captureClaudeResponse(tmuxName string, sshAddress string, captureLines int, sentText string) string {
 	var output string
 
 	if sshAddress != "" {
@@ -1089,6 +1091,16 @@ func captureClaudeResponse(tmuxName string, sshAddress string, captureLines int)
 	}
 
 	result := strings.TrimSpace(strings.Join(responseLines, "\n"))
+
+	// Skip if result is echo of the sent message (or its tail due to tmux line wrapping)
+	if sentText != "" && result != "" {
+		sentNorm := strings.TrimSpace(sentText)
+		if result == sentNorm || strings.HasSuffix(sentNorm, result) || strings.HasSuffix(result, sentNorm) {
+			fmt.Printf("[getLastClaudeResponse] echo detected, skipping: %q\n", result)
+			return ""
+		}
+	}
+
 	fmt.Printf("[getLastClaudeResponse] final result (%d bytes): %q\n", len(result), result)
 	return result
 }
