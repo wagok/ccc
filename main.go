@@ -123,7 +123,7 @@ type HookData struct {
 
 // APIRequest represents an incoming request on the Unix socket
 type APIRequest struct {
-	Cmd        string   `json:"cmd"`                   // ping, sessions, ask, send, history, subscribe
+	Cmd        string   `json:"cmd"`                   // ping, sessions, ask, send, history, screenshot, subscribe
 	Session    string   `json:"session,omitempty"`     // session name
 	Text       string   `json:"text,omitempty"`        // message text
 	From       string   `json:"from,omitempty"`        // agent identifier
@@ -409,6 +409,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleSendCmd(encoder, cfg, req)
 		case "history":
 			handleHistoryCmd(encoder, cfg, req)
+		case "screenshot":
+			handleScreenshotCmd(encoder, cfg, req)
 		case "subscribe":
 			handleSubscribeCmd(conn, encoder, cfg, req)
 			return // Subscribe keeps connection open until done
@@ -827,6 +829,45 @@ func handleHistoryCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 
 	encoder.Encode(APIResponse{OK: true, Messages: messages})
+}
+
+// handleScreenshotCmd handles the "screenshot" command — returns raw tmux capture-pane
+func handleScreenshotCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session required"})
+		return
+	}
+
+	info, exists := cfg.Sessions[req.Session]
+	if !exists || info.Deleted {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	_, projectName := parseSessionTarget(req.Session)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
+
+	var sshAddress string
+	if info.Host != "" {
+		sshAddress = getHostAddress(cfg, info.Host)
+		if sshAddress == "" {
+			encoder.Encode(APIResponse{OK: false, Error: "host not configured: " + info.Host})
+			return
+		}
+	}
+
+	lines := req.Limit
+	if lines <= 0 {
+		lines = 50
+	}
+
+	content, err := captureTmuxPane(tmuxName, sshAddress, lines)
+	if err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("capture failed: %v", err)})
+		return
+	}
+
+	encoder.Encode(APIResponse{OK: true, Response: content})
 }
 
 // handleSubscribeCmd handles the "subscribe" command
