@@ -1077,10 +1077,11 @@ func isClaudeUIArtifact(line string) bool {
 		return true
 	}
 
-	// Spinners and thinking indicators: ✶ ✢ ✽ ✻ ·
+	// Spinners and thinking indicators: ✶ ✢ ✽ ✻ · * (both Unicode and ASCII variants)
+	// Claude Code uses both Unicode (✶ Thinking…) and ASCII (* Cogitating…) formats
 	if strings.HasPrefix(trimmed, "✶") || strings.HasPrefix(trimmed, "✢") ||
 		strings.HasPrefix(trimmed, "✽") || strings.HasPrefix(trimmed, "✻") ||
-		strings.HasPrefix(trimmed, "·") {
+		strings.HasPrefix(trimmed, "·") || strings.HasPrefix(trimmed, "* ") {
 		return true
 	}
 
@@ -1089,8 +1090,11 @@ func isClaudeUIArtifact(line string) bool {
 		return true
 	}
 
-	// Thinking statistics
-	if strings.HasPrefix(trimmed, "Cogitated for") {
+	// Thinking statistics: "Cogitated for 2m", "Brewed for 1m 19s", "Cooked for 30s", etc.
+	if strings.Contains(trimmed, " for ") && (strings.HasSuffix(trimmed, "s") || strings.HasSuffix(trimmed, "m")) &&
+		(strings.HasPrefix(trimmed, "Cogitated") || strings.HasPrefix(trimmed, "Brewed") ||
+			strings.HasPrefix(trimmed, "Cooked") || strings.HasPrefix(trimmed, "Churned") ||
+			strings.HasPrefix(trimmed, "Marinated") || strings.HasPrefix(trimmed, "Cultivated")) {
 		return true
 	}
 
