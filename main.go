@@ -1066,25 +1066,39 @@ func isClaudeUIArtifact(line string) bool {
 	}
 
 	// Tool use markers: ● Bash(...), ● Edit(...), ● Read(...), etc.
-	// Only match "● Word(" pattern — bare ● prefix is also used for Claude's text response.
+	// Also ● Searched for N patterns..., ● Wrote to file...
+	// Only match tool patterns — bare ● prefix is also used for Claude's text response.
 	if strings.HasPrefix(trimmed, "●") {
 		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "●"))
-		// Tool calls follow pattern: ToolName( or ToolName:
-		// e.g. "Bash(command)", "Read(file)", "Edit(file)", "Update(...)"
+		// Tool calls: ToolName( or ToolName:
 		for _, r := range rest {
 			if r == '(' || r == ':' {
-				return true // tool call pattern
+				return true
 			}
 			if r == ' ' || r < 'A' || (r > 'Z' && r < 'a') || r > 'z' {
-				break // not a tool name character
+				break
 			}
 		}
-		// Not a tool call — this is Claude's response text prefixed with ●
+		// Tool summary lines: "Searched for N ...", "Wrote to ...", "Read N lines ..."
+		if strings.HasPrefix(rest, "Searched ") || strings.HasPrefix(rest, "Wrote ") ||
+			strings.HasPrefix(rest, "Read ") {
+			return true
+		}
 	}
 
-	// Nested tool output: ⎿ Added 16 lines...
+	// Nested tool output: ⎿ Added 16 lines..., ⎿ (No content), ⎿ (timeout 15s)
 	if strings.HasPrefix(trimmed, "⎿") {
 		return true
+	}
+
+	// Indented tool continuation lines (output under ⎿)
+	if strings.HasPrefix(line, "     ") && !strings.HasPrefix(trimmed, "●") {
+		// Lines deeply indented (5+ spaces) are typically tool output continuation
+		// Only skip if not a ● prefixed line (which could be Claude's response)
+		if strings.Contains(trimmed, "(ctrl+o to expand)") || strings.HasPrefix(trimmed, "…") ||
+			strings.HasPrefix(trimmed, "… +") {
+			return true
+		}
 	}
 
 	// Spinners and thinking indicators: ✶ ✢ ✽ ✻ · * (both Unicode and ASCII variants)
@@ -1115,7 +1129,18 @@ func isClaudeUIArtifact(line string) bool {
 	}
 
 	// Collapsed output indicator: … +56 lines (ctrl+o to expand)
-	if strings.Contains(trimmed, "lines (ctrl+o to expand)") {
+	// Also: Searched for N patterns (ctrl+o to expand)
+	if strings.Contains(trimmed, "(ctrl+o to expand)") {
+		return true
+	}
+
+	// Timeout annotations: (timeout 5m), (timeout 15s)
+	if strings.HasPrefix(trimmed, "(timeout ") {
+		return true
+	}
+
+	// Tool output annotations: (No content)
+	if trimmed == "(No content)" {
 		return true
 	}
 
