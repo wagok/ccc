@@ -976,6 +976,10 @@ func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 		output = string(result)
 	}
 
+	// Debug: log raw capture-pane output before any filtering
+	fmt.Printf("[getLastClaudeResponse] raw capture-pane (%d bytes, %d lines):\n---RAW START---\n%s\n---RAW END---\n",
+		len(output), len(strings.Split(output, "\n")), output)
+
 	// Parse output to find Claude's response
 	// Look for content after the prompt marker (❯) and before the next prompt
 	lines := strings.Split(output, "\n")
@@ -998,13 +1002,23 @@ func getLastClaudeResponse(tmuxName string, sshAddress string) string {
 
 		if inResponse && strings.TrimSpace(line) != "" {
 			if isClaudeUIArtifact(line) {
+				fmt.Printf("[getLastClaudeResponse] FILTERED: %q\n", line)
 				continue
 			}
-			responseLines = append([]string{line}, responseLines...)
+			// Strip Claude Code UI bullet prefix (● ) from response text
+			cleaned := line
+			trimmedLine := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmedLine, "● ") {
+				cleaned = strings.TrimPrefix(trimmedLine, "● ")
+			}
+			fmt.Printf("[getLastClaudeResponse] KEPT: %q -> %q\n", line, cleaned)
+			responseLines = append([]string{cleaned}, responseLines...)
 		}
 	}
 
-	return strings.TrimSpace(strings.Join(responseLines, "\n"))
+	result := strings.TrimSpace(strings.Join(responseLines, "\n"))
+	fmt.Printf("[getLastClaudeResponse] final result (%d bytes): %q\n", len(result), result)
+	return result
 }
 
 // isClaudeUIArtifact returns true if a line is a Claude Code terminal UI element
@@ -1020,9 +1034,21 @@ func isClaudeUIArtifact(line string) bool {
 		return true
 	}
 
-	// Tool use markers: ● Bash(...), ● Update(...), ● Read ...
+	// Tool use markers: ● Bash(...), ● Edit(...), ● Read(...), etc.
+	// Only match "● Word(" pattern — bare ● prefix is also used for Claude's text response.
 	if strings.HasPrefix(trimmed, "●") {
-		return true
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "●"))
+		// Tool calls follow pattern: ToolName( or ToolName:
+		// e.g. "Bash(command)", "Read(file)", "Edit(file)", "Update(...)"
+		for _, r := range rest {
+			if r == '(' || r == ':' {
+				return true // tool call pattern
+			}
+			if r == ' ' || r < 'A' || (r > 'Z' && r < 'a') || r > 'z' {
+				break // not a tool name character
+			}
+		}
+		// Not a tool call — this is Claude's response text prefixed with ●
 	}
 
 	// Nested tool output: ⎿ Added 16 lines...
@@ -1030,9 +1056,10 @@ func isClaudeUIArtifact(line string) bool {
 		return true
 	}
 
-	// Spinners and thinking indicators: ✶ ✢ ✽ ✻
+	// Spinners and thinking indicators: ✶ ✢ ✽ ✻ ·
 	if strings.HasPrefix(trimmed, "✶") || strings.HasPrefix(trimmed, "✢") ||
-		strings.HasPrefix(trimmed, "✽") || strings.HasPrefix(trimmed, "✻") {
+		strings.HasPrefix(trimmed, "✽") || strings.HasPrefix(trimmed, "✻") ||
+		strings.HasPrefix(trimmed, "·") {
 		return true
 	}
 
@@ -3892,14 +3919,9 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 			}
 			logHook("Remote", "matched session=%s topic=%d, sending", name, info.TopicID)
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
-			// Store forwarded message in history
+			// Store forwarded message in history (with dedup)
 			histFrom, histText := parseRemoteMessagePrefix(message)
-			appendHistory(info.TopicID, HistoryMessage{
-				ID:        nextMessageID(),
-				Timestamp: time.Now().Unix(),
-				From:      histFrom,
-				Text:      histText,
-			})
+			appendHistoryDedup(info.TopicID, histFrom, histText)
 			return sendMessage(config, config.GroupID, info.TopicID, message)
 		}
 	}
@@ -3919,14 +3941,9 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 	}
 
 	fmt.Printf("[remote] created/reused topic %d for session %s\n", topicID, fullName)
-	// Store forwarded message in history
+	// Store forwarded message in history (with dedup)
 	histFrom, histText := parseRemoteMessagePrefix(message)
-	appendHistory(topicID, HistoryMessage{
-		ID:        nextMessageID(),
-		Timestamp: time.Now().Unix(),
-		From:      histFrom,
-		Text:      histText,
-	})
+	appendHistoryDedup(topicID, histFrom, histText)
 	return sendMessage(config, config.GroupID, topicID, message)
 }
 
@@ -3951,6 +3968,24 @@ func parseRemoteMessagePrefix(message string) (from string, text string) {
 	}
 	// Output hook or other → claude
 	return "claude", message
+}
+
+// appendHistoryDedup stores a message in history, but skips if the last
+// message with the same "from" already has identical text. This prevents
+// duplicates when both handleAskCmd (inline) and handleRemoteMessage
+// (stop hook forwarding) store the same response.
+func appendHistoryDedup(topicID int64, from string, text string) {
+	msgs, err := readHistory(topicID, 0, 1, from)
+	if err == nil && len(msgs) > 0 && msgs[len(msgs)-1].Text == text {
+		fmt.Printf("[history] dedup: skipping duplicate %s message for topic=%d\n", from, topicID)
+		return
+	}
+	appendHistory(topicID, HistoryMessage{
+		ID:        nextMessageID(),
+		Timestamp: time.Now().Unix(),
+		From:      from,
+		Text:      text,
+	})
 }
 
 // handleHostCommand handles /host subcommands
