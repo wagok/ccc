@@ -6,10 +6,13 @@ CCC provides a Unix socket API for local integration with external agents and or
 
 The Local API allows external programs running on the same host to:
 - Check server health and version (`ping`)
-- List available Claude Code sessions with metadata
-- Send messages to sessions (blocking or non-blocking)
-- Retrieve message history with filtering
-- Subscribe to real-time status updates
+- List available Claude Code sessions with metadata (`sessions`)
+- Send messages to sessions — blocking (`ask`) or non-blocking (`send`)
+- Restart crashed or stopped sessions (`continue`)
+- Retrieve message history with filtering (`history`)
+- Capture raw tmux terminal output (`screenshot`)
+- Handle interactive questions from Claude (`questions`, `answer`)
+- Subscribe to real-time status updates (`subscribe`)
 
 ## Socket Location
 
@@ -117,8 +120,8 @@ List all available sessions with their current status and metadata.
       "last_activity": 1705412400
     },
     {
-      "name": "backend",
-      "host": "server1",
+      "name": "msi:backend",
+      "host": "msi",
       "status": "idle",
       "cwd": "/home/user/Projects/backend",
       "last_activity": 1705410000
@@ -128,7 +131,7 @@ List all available sessions with their current status and metadata.
 ```
 
 **Session fields:**
-- `name` - Session identifier
+- `name` - Session identifier (e.g. `"myproject"` or `"msi:backend"`)
 - `host` - `"local"` or remote host name
 - `status` - `"active"`, `"idle"`, or `"stopped"`
 - `cwd` - Project working directory (the path Claude operates in)
@@ -217,6 +220,39 @@ Send a message without waiting for response (non-blocking).
 
 ---
 
+### continue
+
+Kill and restart a Claude Code session with conversation history preserved. Equivalent to the Telegram `/continue` command.
+
+**Request:**
+```json
+{
+  "cmd": "continue",
+  "session": "msi:myproject",
+  "from": "orchestrator"
+}
+```
+
+**Response:**
+```json
+{"ok": true}
+```
+
+**Parameters:**
+- `session` (required) - Session name (e.g. `"myproject"` or `"msi:myproject"`)
+- `from` (optional) - Agent identifier, shown in Telegram notification
+
+**Notes:**
+- Kills the existing tmux session (if running), then creates a new one with `claude --dangerously-skip-permissions -c`
+- The `-c` flag preserves Claude's conversation history
+- Waits ~5 seconds for Claude to initialize, then verifies it's running
+- Works for both local and remote (SSH) sessions
+- Sends a notification to Telegram: `🔄 [orchestrator] Session continued`
+- **Use case**: Recovering from crashed sessions. When `send` or `ask` returns errors like `"failed to restart Claude"`, call `continue` to force a clean restart.
+- **Blocking**: This command takes ~6-8 seconds due to kill + create + initialization wait
+
+---
+
 ### history
 
 Retrieve message history for a session.
@@ -263,6 +299,136 @@ Retrieve message history for a session.
 **Notes:**
 - `from_filter` is an exact match. Use `"api"` (not the agent name) to get all API-originated messages regardless of which agent sent them.
 - To get only Claude's responses to your API messages, combine `after` with `from_filter`: send via `send`, save the `message_id`, then poll `history(after=message_id, from_filter="claude", limit=1)`.
+
+---
+
+### screenshot
+
+Capture raw tmux terminal output for a session. Returns the visible text content of the tmux pane.
+
+**Request:**
+```json
+{
+  "cmd": "screenshot",
+  "session": "myproject",
+  "limit": 100
+}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "response": "❯ Running tests...\n\n  ✓ test_auth (0.3s)\n  ✓ test_api (0.5s)\n..."
+}
+```
+
+**Parameters:**
+- `session` (required) - Session name
+- `limit` (optional) - Number of terminal lines to capture (default: 50)
+
+**Notes:**
+- Returns raw `tmux capture-pane` output — the actual terminal content including UI elements, spinners, and ANSI artifacts
+- Works for both local and remote (SSH) sessions
+- Useful for debugging session state, checking what Claude is currently doing, or verifying Claude's UI is responsive
+- This is a point-in-time snapshot, not a continuous stream
+
+---
+
+### questions
+
+Get pending interactive questions (AskUserQuestion) for a session. When Claude Code asks the user a question with multiple-choice options, the questions are stored and available via this endpoint.
+
+**Request:**
+```json
+{
+  "cmd": "questions",
+  "session": "msi:myproject"
+}
+```
+
+**Response (with pending questions):**
+```json
+{
+  "ok": true,
+  "questions": {
+    "session": "msi:myproject",
+    "questions": [
+      {
+        "question": "Which database should we use?",
+        "header": "Database",
+        "options": [
+          {"label": "PostgreSQL", "description": "Relational, ACID compliant"},
+          {"label": "MongoDB", "description": "Document store, flexible schema"},
+          {"label": "SQLite", "description": "Embedded, zero configuration"}
+        ],
+        "multi_select": false,
+        "answered": false
+      }
+    ],
+    "timestamp": 1705412345
+  }
+}
+```
+
+**Response (no pending questions):**
+```json
+{"ok": true}
+```
+
+**Parameters:**
+- `session` (required) - Session name
+
+**Question fields:**
+- `question` - The question text
+- `header` - Short label/category (e.g. "Database", "Auth method")
+- `options` - Array of choices, each with `label` and optional `description`
+- `multi_select` - Whether multiple options can be selected
+- `answered` - Whether this question has been answered already
+- `answer_index` - Index of the selected option (if answered)
+- `timestamp` - Unix timestamp when the question was received
+
+**Notes:**
+- Questions expire after 5 minutes and are automatically cleaned up
+- Questions are also visible in Telegram as inline keyboard buttons
+- If a question is answered via Telegram, it will be marked as `answered` here too
+- Use `answer` command to respond to pending questions
+
+---
+
+### answer
+
+Answer a pending interactive question by selecting an option. Sends the appropriate key sequences to Claude Code's UI to select the chosen option.
+
+**Request:**
+```json
+{
+  "cmd": "answer",
+  "session": "msi:myproject",
+  "question_index": 0,
+  "option_index": 1
+}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "response": "answered question 0 with option 1 (MongoDB)"
+}
+```
+
+**Parameters:**
+- `session` (required) - Session name
+- `question_index` (required) - Which question to answer (0-based index)
+- `option_index` (required) - Which option to select (0-based index)
+
+**Notes:**
+- Sends `Down` arrow keys (option_index times) + `Enter` to tmux to select the option in Claude's UI
+- When all questions in a set are answered, automatically sends an extra `Enter` to submit
+- The answer is stored in history as a human message: `"Selected: <option label>"`
+- Returns error if no pending questions, question already answered, or indices out of range
+- Works for both local and remote (SSH) sessions
 
 ---
 
@@ -313,6 +479,12 @@ Common errors:
 - `host not configured` - Remote host not in config
 - `failed to send: ...` - tmux communication error
 - `timeout waiting for response` - Ask command timeout (5 min)
+- `no pending questions for this session` - No AskUserQuestion pending
+- `question already answered` - Question was already answered (via API or Telegram)
+- `question_index out of range` - Invalid question index
+- `option_index out of range` - Invalid option index
+- `session started but Claude failed to initialize` - Continue started tmux but Claude didn't start
+- `failed to start: ...` - Continue failed to create tmux session
 
 ## Examples
 
@@ -328,11 +500,26 @@ echo '{"cmd":"sessions"}' | nc -U ~/.ccc.sock -q 1
 # Send message and wait for response
 echo '{"cmd":"ask","session":"myproject","text":"Hello"}' | nc -U ~/.ccc.sock -q 300
 
+# Send message without waiting
+echo '{"cmd":"send","session":"myproject","text":"Run tests","from":"ci"}' | nc -U ~/.ccc.sock -q 1
+
+# Restart a crashed session
+echo '{"cmd":"continue","session":"msi:myproject","from":"agent"}' | nc -U ~/.ccc.sock -q 10
+
 # Get recent history
 echo '{"cmd":"history","session":"myproject","limit":10}' | nc -U ~/.ccc.sock -q 1
 
 # Get only Claude's messages
 echo '{"cmd":"history","session":"myproject","from_filter":"claude","limit":5}' | nc -U ~/.ccc.sock -q 1
+
+# Capture terminal output (100 lines)
+echo '{"cmd":"screenshot","session":"myproject","limit":100}' | nc -U ~/.ccc.sock -q 1
+
+# Check for pending questions
+echo '{"cmd":"questions","session":"msi:myproject"}' | nc -U ~/.ccc.sock -q 1
+
+# Answer a question (select option 2)
+echo '{"cmd":"answer","session":"msi:myproject","question_index":0,"option_index":2}' | nc -U ~/.ccc.sock -q 1
 ```
 
 ### Using socat
@@ -377,6 +564,31 @@ response = ccc_request({
     "from": "my-script"
 })
 print(f"Response (msg {response['message_id']}): {response['response']}")
+
+# Restart a crashed session
+result = ccc_request({
+    "cmd": "continue",
+    "session": "msi:myproject",
+    "from": "my-script"
+})
+if result["ok"]:
+    print("Session restarted successfully")
+
+# Handle interactive questions
+qs = ccc_request({"cmd": "questions", "session": "msi:myproject"})
+if qs.get("questions"):
+    for i, q in enumerate(qs["questions"]["questions"]):
+        if not q["answered"]:
+            print(f"Q{i}: {q['question']}")
+            for j, opt in enumerate(q["options"]):
+                print(f"  [{j}] {opt['label']} - {opt.get('description', '')}")
+            # Answer with first option
+            ccc_request({
+                "cmd": "answer",
+                "session": "msi:myproject",
+                "question_index": i,
+                "option_index": 0
+            })
 ```
 
 ### Go Example
@@ -430,7 +642,11 @@ All messages sent via the API appear in the corresponding Telegram topic:
 🤖 [orchestrator] What's the current API version?
 ```
 
-This allows human oversight of automated interactions.
+This allows human oversight of automated interactions. Session restarts via `continue` also send a notification:
+
+```
+🔄 [orchestrator] Session continued
+```
 
 ## Patterns and Use Cases
 
@@ -540,4 +756,76 @@ target = next(
 )
 if target:
     ccc_request({"cmd": "ask", "session": target, "text": "...", "from": "agent"})
+```
+
+### 7. Crash Recovery
+
+Automatically recover crashed sessions:
+
+```python
+def send_with_recovery(session, text, from_agent="agent"):
+    """Send a message, restarting the session if needed."""
+    result = ccc_request({
+        "cmd": "send",
+        "session": session,
+        "text": text,
+        "from": from_agent
+    })
+
+    if not result["ok"] and "failed to restart" in result.get("error", ""):
+        # Session is crashed beyond auto-recovery, force restart
+        restart = ccc_request({
+            "cmd": "continue",
+            "session": session,
+            "from": from_agent
+        })
+        if not restart["ok"]:
+            raise RuntimeError(f"Cannot recover session: {restart['error']}")
+
+        # Retry the send
+        result = ccc_request({
+            "cmd": "send",
+            "session": session,
+            "text": text,
+            "from": from_agent
+        })
+
+    return result
+```
+
+### 8. Handling Interactive Questions
+
+Programmatically answer Claude's questions (e.g. tool permissions, clarifications):
+
+```python
+import time
+
+def poll_and_answer_questions(session, decision_fn, timeout=300):
+    """Poll for questions and answer them using a decision function.
+
+    decision_fn(question, options) -> option_index
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        qs = ccc_request({"cmd": "questions", "session": session})
+        if not qs.get("questions"):
+            time.sleep(2)
+            continue
+
+        for i, q in enumerate(qs["questions"]["questions"]):
+            if q["answered"]:
+                continue
+            option_idx = decision_fn(q["question"], q["options"])
+            ccc_request({
+                "cmd": "answer",
+                "session": session,
+                "question_index": i,
+                "option_index": option_idx
+            })
+        return True
+
+    return False  # Timed out
+
+# Example: always pick the first option
+poll_and_answer_questions("msi:myproject", lambda q, opts: 0)
 ```
