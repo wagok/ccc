@@ -2684,7 +2684,28 @@ func handlePermissionHook() error {
 		return nil
 	}
 
-	// Find session by matching cwd suffix
+	// In client mode, forward AskUserQuestion to server
+	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
+		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
+			// Build question summary for forwarding
+			for _, q := range hookData.ToolInput.Questions {
+				if q.Question == "" {
+					continue
+				}
+				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+				for i, opt := range q.Options {
+					msg += fmt.Sprintf("\n%d. %s", i+1, opt.Label)
+					if opt.Description != "" {
+						msg += fmt.Sprintf(" — %s", opt.Description)
+					}
+				}
+				forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, msg)
+			}
+			return nil
+		}
+	}
+
+	// Find session by matching cwd
 	var sessionName string
 	var topicID int64
 	for name, info := range config.Sessions {
@@ -2702,16 +2723,17 @@ func handlePermissionHook() error {
 		return nil
 	}
 
-	// Handle AskUserQuestion (plan approval, etc.) - in goroutine to not block
-	fmt.Fprintf(os.Stderr, "hook-permission: tool=%s questions=%d\n", hookData.ToolName, len(hookData.ToolInput.Questions))
+	// Handle AskUserQuestion — send inline keyboard buttons to Telegram
+	logHook("Permission", "tool=%s session=%s questions=%d", hookData.ToolName, sessionName, len(hookData.ToolInput.Questions))
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
+		totalQuestions := len(hookData.ToolInput.Questions)
 		go func() {
 			defer func() { recover() }()
 			for qIdx, q := range hookData.ToolInput.Questions {
 				if q.Question == "" {
 					continue
 				}
-				// Build message
+				// Build message with option descriptions
 				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
 
 				// Build inline keyboard buttons
@@ -2720,26 +2742,42 @@ func handlePermissionHook() error {
 					if opt.Label == "" {
 						continue
 					}
-					// Callback data format: session:questionIndex:optionIndex
+					// Callback data format: session:questionIndex:totalQuestions:optionIndex
 					// Telegram limits callback_data to 64 bytes
-					callbackData := fmt.Sprintf("%s:%d:%d", sessionName, qIdx, i)
+					callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
 					if len(callbackData) > 64 {
 						callbackData = callbackData[:64]
 					}
+					label := opt.Label
+					if opt.Description != "" {
+						label += " — " + opt.Description
+					}
+					// Telegram button label max ~200 chars
+					if len(label) > 120 {
+						label = label[:117] + "..."
+					}
 					buttons = append(buttons, []InlineKeyboardButton{
-						{Text: opt.Label, CallbackData: callbackData},
+						{Text: label, CallbackData: callbackData},
 					})
 				}
 
 				if len(buttons) > 0 {
 					sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
 				}
+
+				// Store question in history
+				appendHistory(topicID, HistoryMessage{
+					ID:        nextMessageID(),
+					Timestamp: time.Now().Unix(),
+					From:      "claude",
+					Text:      msg,
+				})
 			}
 		}()
 		return nil
 	}
 
-	// Generic permission request - in goroutine to not block
+	// Generic permission request — notify in Telegram (non-blocking)
 	go func() {
 		defer func() { recover() }()
 		if hookData.ToolName != "" {
@@ -3059,69 +3097,10 @@ func handleOutputHook() error {
 	return nil
 }
 
+// handleQuestionHook is a legacy alias for handlePermissionHook.
+// Kept for backward compatibility with old hook registrations.
 func handleQuestionHook() error {
-	config, err := loadConfig()
-	if err != nil {
-		return nil
-	}
-
-	rawData, _ := io.ReadAll(os.Stdin)
-	if len(rawData) == 0 {
-		return nil
-	}
-
-	var hookData HookData
-	if err := json.Unmarshal(rawData, &hookData); err != nil {
-		return nil
-	}
-
-	// Find session by matching cwd suffix
-	var sessionName string
-	var topicID int64
-	for name, info := range config.Sessions {
-		if info == nil {
-			continue
-		}
-		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
-			sessionName = name
-			topicID = info.TopicID
-			break
-		}
-	}
-
-	if sessionName == "" || config.GroupID == 0 || topicID == 0 {
-		return nil
-	}
-
-	// Send questions to Telegram
-	for qIdx, q := range hookData.ToolInput.Questions {
-		if q.Question == "" {
-			continue
-		}
-		msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
-
-		var buttons [][]InlineKeyboardButton
-		for i, opt := range q.Options {
-			if opt.Label == "" {
-				continue
-			}
-			callbackData := fmt.Sprintf("%s:%d:%d", sessionName, qIdx, i)
-			if len(callbackData) > 64 {
-				callbackData = callbackData[:64]
-			}
-			buttons = append(buttons, []InlineKeyboardButton{
-				{Text: opt.Label, CallbackData: callbackData},
-			})
-		}
-
-		if len(buttons) > 0 {
-			sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
-		} else {
-			sendMessage(config, config.GroupID, topicID, msg)
-		}
-	}
-
-	return nil
+	return handlePermissionHook()
 }
 
 // Install hook in Claude settings
@@ -3233,6 +3212,10 @@ func installHook() error {
 	// Add Stop hook (doesn't overwrite existing hooks)
 	stopAdded := addHookToEvent(hooks, "Stop", cccPath+" hook")
 
+	// Add PreToolUse hook for AskUserQuestion forwarding
+	// Use timeout 300000ms (5min) to allow time for user to answer via Telegram
+	preToolAdded := addHookToEvent(hooks, "PreToolUse", cccPath+" hook-permission")
+
 	settings["hooks"] = hooks
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
@@ -3244,10 +3227,16 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded {
-		fmt.Println("✅ Claude hook installed!")
+	if stopAdded || preToolAdded {
+		fmt.Println("✅ Claude hooks installed!")
+		if stopAdded {
+			fmt.Println("  + Stop hook (response capture)")
+		}
+		if preToolAdded {
+			fmt.Println("  + PreToolUse hook (AskUserQuestion forwarding)")
+		}
 	} else {
-		fmt.Println("✅ Claude hook already installed")
+		fmt.Println("✅ Claude hooks already installed")
 	}
 	return nil
 }
@@ -4216,7 +4205,7 @@ func listen() error {
 		for _, update := range updates.Result {
 			offset = update.UpdateID + 1
 
-			// Handle callback queries (button presses)
+			// Handle callback queries (button presses from inline keyboards)
 			if update.CallbackQuery != nil {
 				cb := update.CallbackQuery
 				// Only accept from authorized user
@@ -4226,12 +4215,19 @@ func listen() error {
 
 				answerCallbackQuery(config, cb.ID)
 
-				// Parse callback data: session:questionIndex:optionIndex
+				// Parse callback data: session:questionIndex:totalQuestions:optionIndex
+				// Legacy format (3 parts): session:questionIndex:optionIndex
 				parts := strings.Split(cb.Data, ":")
-				if len(parts) == 3 {
+				if len(parts) >= 3 {
 					sessionName := parts[0]
-					// questionIndex := parts[1] // for multi-question support
-					optionIndex, _ := strconv.Atoi(parts[2])
+					questionIndex, _ := strconv.Atoi(parts[1])
+					var totalQuestions, optionIndex int
+					if len(parts) == 4 {
+						totalQuestions, _ = strconv.Atoi(parts[2])
+						optionIndex, _ = strconv.Atoi(parts[3])
+					} else {
+						optionIndex, _ = strconv.Atoi(parts[2])
+					}
 
 					// Edit message to show selection and remove buttons
 					if cb.Message != nil {
@@ -4240,15 +4236,55 @@ func listen() error {
 						editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID, newText)
 					}
 
+					// Store answer in history
+					if cb.Message != nil {
+						appendHistoryDedup(cb.Message.MessageThreadID, "human", fmt.Sprintf("Selected option %d", optionIndex+1))
+					}
+
+					// Resolve tmux session name and check local/remote
+					info, exists := config.Sessions[sessionName]
 					tmuxName := tmuxSessionName(sessionName)
-					if tmuxSessionExists(tmuxName) {
+
+					sendTmuxKeys := func(keys ...string) {
+						if exists && info.Host != "" {
+							// Remote session — send via SSH
+							address := getHostAddress(config, info.Host)
+							for _, key := range keys {
+								cmd := fmt.Sprintf("tmux send-keys -t %s %s", shellQuote(tmuxName), key)
+								runSSH(address, cmd, 5*time.Second)
+							}
+						} else {
+							// Local session
+							for _, key := range keys {
+								tmuxCmd("send-keys", "-t", tmuxName, key).Run()
+							}
+						}
+					}
+
+					// Check session exists
+					sessionExists := false
+					if exists && info.Host != "" {
+						address := getHostAddress(config, info.Host)
+						sessionExists = sshTmuxHasSession(address, tmuxName)
+					} else {
+						sessionExists = tmuxSessionExists(tmuxName)
+					}
+
+					if sessionExists {
 						// Send arrow down keys to select option, then Enter
 						for i := 0; i < optionIndex; i++ {
-							tmuxCmd( "send-keys", "-t", tmuxName, "Down").Run()
+							sendTmuxKeys("Down")
 							time.Sleep(50 * time.Millisecond)
 						}
-						tmuxCmd( "send-keys", "-t", tmuxName, "Enter").Run()
-						fmt.Printf("[callback] Selected option %d for %s\n", optionIndex, sessionName)
+						sendTmuxKeys("Enter")
+						fmt.Printf("[callback] Selected option %d for %s (question %d/%d)\n", optionIndex, sessionName, questionIndex+1, totalQuestions)
+
+						// After the last question, send Enter to confirm "Submit answers"
+						if totalQuestions > 0 && questionIndex == totalQuestions-1 {
+							time.Sleep(300 * time.Millisecond)
+							sendTmuxKeys("Enter")
+							fmt.Printf("[callback] Auto-submitted answers for %s\n", sessionName)
+						}
 					}
 				}
 				continue
