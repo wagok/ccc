@@ -444,6 +444,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleQuestionsCmd(encoder, cfg, req)
 		case "answer":
 			handleAnswerCmd(encoder, cfg, req)
+		case "continue":
+			handleContinueCmd(encoder, cfg, req)
 		case "subscribe":
 			handleSubscribeCmd(conn, encoder, cfg, req)
 			return // Subscribe keeps connection open until done
@@ -790,6 +792,98 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	// Response capture is handled by the Stop hook (no polling needed).
 }
 
+
+// handleContinueCmd handles the "continue" command - restarts Claude in a session with -c flag
+func handleContinueCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session required"})
+		return
+	}
+
+	info, exists := cfg.Sessions[req.Session]
+	if !exists || info.Deleted {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	_, projectName := parseSessionTarget(req.Session)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
+	workDir := info.Path
+	if workDir == "" {
+		workDir = resolveProjectPath(cfg, projectName)
+	}
+
+	if info.Host != "" {
+		// Remote session
+		address := getHostAddress(cfg, info.Host)
+		if address == "" {
+			encoder.Encode(APIResponse{OK: false, Error: "host not configured"})
+			return
+		}
+
+		// Kill existing tmux session if running
+		if sshTmuxHasSession(address, tmuxName) {
+			sshTmuxKillSession(address, tmuxName)
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		// Create directory if needed
+		if workDir != "" {
+			sshMkdir(address, workDir)
+		}
+
+		// Create new tmux session with -c (continue) flag
+		if err := sshTmuxNewSession(address, tmuxName, workDir, true); err != nil {
+			encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to start: %v", err)})
+			return
+		}
+
+		// Wait for Claude to initialize
+		time.Sleep(5 * time.Second)
+
+		if !isClaudeRunning(tmuxName, address) {
+			encoder.Encode(APIResponse{OK: false, Error: "session started but Claude failed to initialize"})
+			return
+		}
+	} else {
+		// Local session
+		// Kill existing tmux session if running
+		if tmuxSessionExists(tmuxName) {
+			killTmuxSession(tmuxName)
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		// Ensure work directory exists
+		if workDir != "" {
+			os.MkdirAll(workDir, 0755)
+		}
+
+		// Create new tmux session with -c (continue) flag
+		if err := createTmuxSession(tmuxName, workDir, true); err != nil {
+			encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to start: %v", err)})
+			return
+		}
+
+		// Wait for Claude to initialize
+		time.Sleep(5 * time.Second)
+
+		if !isClaudeRunning(tmuxName, "") {
+			encoder.Encode(APIResponse{OK: false, Error: "session started but Claude failed to initialize"})
+			return
+		}
+	}
+
+	// Notify Telegram
+	if info.TopicID > 0 {
+		agentLabel := req.From
+		if agentLabel == "" {
+			agentLabel = "api"
+		}
+		sendMessage(cfg, cfg.GroupID, info.TopicID, fmt.Sprintf("🔄 [%s] Session continued", agentLabel))
+	}
+
+	encoder.Encode(APIResponse{OK: true})
+}
 
 // handleHistoryCmd handles the "history" command
 func handleHistoryCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
