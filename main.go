@@ -188,8 +188,6 @@ var (
 	messageIDMutex   sync.Mutex
 )
 
-// activeCaptures tracks ongoing background response captures per session
-var activeCaptures sync.Map // key: session name (string), value: bool
 
 func nextMessageID() int64 {
 	messageIDMutex.Lock()
@@ -629,6 +627,10 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		sshAddr = getHostAddress(cfg, info.Host)
 	}
 
+	// Record timestamp before Claude starts processing.
+	// The Stop hook will store Claude's response in history when it finishes.
+	sentAt := time.Now()
+
 	// Wait for Claude to become busy (started processing)
 	time.Sleep(500 * time.Millisecond)
 
@@ -648,24 +650,15 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 			if state == "idle" {
 				idleCount++
 				if idleCount >= 2 {
-					// Claude is idle, get last response
-					response := getLastClaudeResponse(tmuxName, sshAddr, req.Text)
+					// Claude is idle. The Stop hook should have stored the response
+					// in history already. Poll history to retrieve it.
 					duration := time.Since(startTime).Milliseconds()
-
-					// Store Claude's response in history
-					responseMsgID := nextMessageID()
-					appendHistory(info.TopicID, HistoryMessage{
-						ID:        responseMsgID,
-						Timestamp: time.Now().Unix(),
-						From:      "claude",
-						Text:      response,
-					})
+					response := waitForHistoryResponse(info.TopicID, sentAt, 10*time.Second)
 
 					encoder.Encode(APIResponse{
-						OK:        true,
-						Response:  response,
-						MessageID: responseMsgID,
-						Duration:  duration,
+						OK:       true,
+						Response: response,
+						Duration: duration,
 					})
 					return
 				}
@@ -674,6 +667,24 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 			}
 		}
 	}
+}
+
+// waitForHistoryResponse polls history for a Claude response that arrived after sentAt.
+// Used by handleAskCmd to read the response stored by the Stop hook.
+func waitForHistoryResponse(topicID int64, sentAt time.Time, maxWait time.Duration) string {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		msgs, err := readHistory(topicID, 0, 3, "claude")
+		if err == nil {
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Timestamp >= sentAt.Unix() {
+					return msgs[i].Text
+				}
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return ""
 }
 
 // handleSendCmd handles the "send" command (non-blocking)
@@ -741,73 +752,9 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 
 	encoder.Encode(APIResponse{OK: true, MessageID: msgID})
-
-	// Start background capture for remote sessions
-	if info.Host != "" {
-		address := getHostAddress(cfg, info.Host)
-		captureResponseAsync(req.Session, tmuxName, address, info.TopicID)
-	}
+	// Response capture is handled by the Stop hook (no polling needed).
 }
 
-// captureResponseAsync polls a remote session in the background to capture
-// Claude's response after a message is sent. It stores the response in history.
-// Only one capture runs per session at a time (guarded by activeCaptures).
-func captureResponseAsync(sessionName string, tmuxName string, sshAddress string, topicID int64) {
-	// Per-session guard: skip if capture already running
-	if _, loaded := activeCaptures.LoadOrStore(sessionName, true); loaded {
-		return
-	}
-
-	go func() {
-		defer activeCaptures.Delete(sessionName)
-
-		// Wait for Claude to start processing
-		time.Sleep(1 * time.Second)
-
-		timeout := time.After(5 * time.Minute)
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-
-		idleCount := 0
-		for {
-			select {
-			case <-timeout:
-				fmt.Printf("[capture] timeout for session=%s\n", sessionName)
-				return
-			case <-ticker.C:
-				state := checkClaudeState(tmuxName, sshAddress)
-				if state == "idle" {
-					idleCount++
-					if idleCount >= 2 {
-						// Claude is idle, capture response
-						response := getLastClaudeResponse(tmuxName, sshAddress, "")
-						if response == "" {
-							return
-						}
-
-						// Dedup: check last claude message in history
-						msgs, err := readHistory(topicID, 0, 1, "claude")
-						if err == nil && len(msgs) > 0 && msgs[len(msgs)-1].Text == response {
-							fmt.Printf("[capture] dedup: response already in history for session=%s\n", sessionName)
-							return
-						}
-
-						appendHistory(topicID, HistoryMessage{
-							ID:        nextMessageID(),
-							Timestamp: time.Now().Unix(),
-							From:      "claude",
-							Text:      response,
-						})
-						fmt.Printf("[capture] stored response for session=%s (%d chars)\n", sessionName, len(response))
-						return
-					}
-				} else {
-					idleCount = 0
-				}
-			}
-		}
-	}()
-}
 
 // handleHistoryCmd handles the "history" command
 func handleHistoryCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
@@ -1005,199 +952,6 @@ func truncateRepeatingCharsInLines(s string) string {
 		lines[i] = truncateRepeatingChars(line)
 	}
 	return strings.Join(lines, "\n")
-}
-
-// getLastClaudeResponse captures the last response from Claude in tmux.
-// sentText is the message that was sent — used to skip echo of our own message.
-// It tries up to 3 times with increasing capture window if the result is empty,
-// since Claude Code's terminal UI may overwrite the response with spinners/prompts.
-func getLastClaudeResponse(tmuxName string, sshAddress string, sentText string) string {
-	// Try with increasing capture sizes; retry if result is empty
-	captureSizes := []int{200, 500, 500}
-	for attempt, captureSize := range captureSizes {
-		if attempt > 0 {
-			fmt.Printf("[getLastClaudeResponse] retry #%d (capture -S -%d)\n", attempt, captureSize)
-			time.Sleep(2 * time.Second)
-		}
-
-		result := captureClaudeResponse(tmuxName, sshAddress, captureSize, sentText)
-		if result != "" {
-			return result
-		}
-	}
-	fmt.Printf("[getLastClaudeResponse] all retries exhausted, returning empty\n")
-	return ""
-}
-
-// captureClaudeResponse does a single capture-pane and parses Claude's response.
-// sentText is used to detect and skip echo of the sent message in the capture.
-func captureClaudeResponse(tmuxName string, sshAddress string, captureLines int, sentText string) string {
-	var output string
-
-	if sshAddress != "" {
-		cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -%d", shellQuote(tmuxName), captureLines)
-		result, err := runSSH(sshAddress, cmd, 10*time.Second)
-		if err != nil {
-			return ""
-		}
-		output = result
-	} else {
-		cmd := tmuxCmd("capture-pane", "-t", tmuxName, "-p", "-S", fmt.Sprintf("-%d", captureLines))
-		result, err := cmd.Output()
-		if err != nil {
-			return ""
-		}
-		output = string(result)
-	}
-
-	// Debug: log raw capture-pane output before any filtering
-	fmt.Printf("[getLastClaudeResponse] raw capture-pane (%d bytes, %d lines, -S -%d):\n---RAW START---\n%s\n---RAW END---\n",
-		len(output), len(strings.Split(output, "\n")), captureLines, output)
-
-	// Parse output to find Claude's response
-	// Look for content after the prompt marker (❯) and before the next prompt
-	lines := strings.Split(output, "\n")
-	var responseLines []string
-	inResponse := false
-
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-
-		// Found prompt - start collecting response going backwards
-		if strings.Contains(line, "❯") && !inResponse {
-			inResponse = true
-			continue
-		}
-
-		// Found previous prompt - stop
-		if strings.Contains(line, "❯") && inResponse {
-			break
-		}
-
-		if inResponse && strings.TrimSpace(line) != "" {
-			if isClaudeUIArtifact(line) {
-				fmt.Printf("[getLastClaudeResponse] FILTERED: %q\n", line)
-				continue
-			}
-			// Strip Claude Code UI bullet prefix (● ) from response text
-			cleaned := line
-			trimmedLine := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmedLine, "● ") {
-				cleaned = strings.TrimPrefix(trimmedLine, "● ")
-			}
-			fmt.Printf("[getLastClaudeResponse] KEPT: %q -> %q\n", line, cleaned)
-			responseLines = append([]string{cleaned}, responseLines...)
-		}
-	}
-
-	result := strings.TrimSpace(strings.Join(responseLines, "\n"))
-
-	// Skip if result is echo of the sent message (or its tail due to tmux line wrapping)
-	if sentText != "" && result != "" {
-		sentNorm := strings.TrimSpace(sentText)
-		if result == sentNorm || strings.HasSuffix(sentNorm, result) || strings.HasSuffix(result, sentNorm) {
-			fmt.Printf("[getLastClaudeResponse] echo detected, skipping: %q\n", result)
-			return ""
-		}
-	}
-
-	fmt.Printf("[getLastClaudeResponse] final result (%d bytes): %q\n", len(result), result)
-	return result
-}
-
-// isClaudeUIArtifact returns true if a line is a Claude Code terminal UI element
-// (spinners, separators, tool markers, status bars) rather than actual response text.
-func isClaudeUIArtifact(line string) bool {
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "" {
-		return true
-	}
-
-	// Separator lines (──────)
-	if strings.TrimLeft(trimmed, "─") == "" {
-		return true
-	}
-
-	// Tool use markers: ● Bash(...), ● Edit(...), ● Read(...), etc.
-	// Also ● Searched for N patterns..., ● Wrote to file...
-	// Only match tool patterns — bare ● prefix is also used for Claude's text response.
-	if strings.HasPrefix(trimmed, "●") {
-		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "●"))
-		// Tool calls: ToolName( or ToolName:
-		for _, r := range rest {
-			if r == '(' || r == ':' {
-				return true
-			}
-			if r == ' ' || r < 'A' || (r > 'Z' && r < 'a') || r > 'z' {
-				break
-			}
-		}
-		// Tool summary lines: "Searched for N ...", "Wrote to ...", "Read N lines ..."
-		if strings.HasPrefix(rest, "Searched ") || strings.HasPrefix(rest, "Wrote ") ||
-			strings.HasPrefix(rest, "Read ") {
-			return true
-		}
-	}
-
-	// Nested tool output: ⎿ Added 16 lines..., ⎿ (No content), ⎿ (timeout 15s)
-	if strings.HasPrefix(trimmed, "⎿") {
-		return true
-	}
-
-	// Indented tool continuation lines (output under ⎿)
-	if strings.HasPrefix(line, "     ") && !strings.HasPrefix(trimmed, "●") {
-		// Lines deeply indented (5+ spaces) are typically tool output continuation
-		// Only skip if not a ● prefixed line (which could be Claude's response)
-		if strings.Contains(trimmed, "(ctrl+o to expand)") || strings.HasPrefix(trimmed, "…") ||
-			strings.HasPrefix(trimmed, "… +") {
-			return true
-		}
-	}
-
-	// Spinners and thinking indicators: ✶ ✢ ✽ ✻ · * (both Unicode and ASCII variants)
-	// Claude Code uses both Unicode (✶ Thinking…) and ASCII (* Cogitating…) formats
-	if strings.HasPrefix(trimmed, "✶") || strings.HasPrefix(trimmed, "✢") ||
-		strings.HasPrefix(trimmed, "✽") || strings.HasPrefix(trimmed, "✻") ||
-		strings.HasPrefix(trimmed, "·") || strings.HasPrefix(trimmed, "* ") {
-		return true
-	}
-
-	// Status bar
-	if strings.HasPrefix(trimmed, "⏵") {
-		return true
-	}
-
-	// Thinking statistics: "Cogitated for 2m", "Brewed for 1m 19s", "Cooked for 30s", etc.
-	if strings.Contains(trimmed, " for ") && (strings.HasSuffix(trimmed, "s") || strings.HasSuffix(trimmed, "m")) &&
-		(strings.HasPrefix(trimmed, "Cogitated") || strings.HasPrefix(trimmed, "Brewed") ||
-			strings.HasPrefix(trimmed, "Cooked") || strings.HasPrefix(trimmed, "Churned") ||
-			strings.HasPrefix(trimmed, "Marinated") || strings.HasPrefix(trimmed, "Cultivated")) {
-		return true
-	}
-
-	// Activity/permission indicators
-	if strings.Contains(line, "ctrl+c to interrupt") ||
-		strings.Contains(line, "bypass permissions") {
-		return true
-	}
-
-	// Collapsed output indicator: … +56 lines (ctrl+o to expand)
-	// Also: Searched for N patterns (ctrl+o to expand)
-	if strings.Contains(trimmed, "(ctrl+o to expand)") {
-		return true
-	}
-
-	// Timeout annotations: (timeout 5m), (timeout 15s)
-	if strings.HasPrefix(trimmed, "(timeout ") {
-		return true
-	}
-
-	// Tool output annotations: (No content)
-	if trimmed == "(No content)" {
-		return true
-	}
-
-	return false
 }
 
 // Config function wrappers - delegate to config package
@@ -2997,6 +2751,10 @@ func handlePermissionHook() error {
 	return nil
 }
 
+// getLastAssistantMessage reads a Claude Code transcript JSONL file and extracts
+// text blocks from the last assistant turn (after the last real user message).
+// Handles both nested (message.content) and flat (root-level content) JSONL formats.
+// Deduplicates streaming entries by requestId (last entry per requestId wins).
 func getLastAssistantMessage(transcriptPath string) string {
 	file, err := os.Open(transcriptPath)
 	if err != nil {
@@ -3005,67 +2763,157 @@ func getLastAssistantMessage(transcriptPath string) string {
 	}
 	defer file.Close()
 
-	var allTexts []string
-	var linesProcessed, assistantCount, textCount int
+	// Typed structs for parsing JSONL entries
+	type contentBlock struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+
+	type transcriptLine struct {
+		Type      string          `json:"type"`
+		RequestID string          `json:"requestId,omitempty"`
+		Role      string          `json:"role,omitempty"`
+		Content   json.RawMessage `json:"content,omitempty"`
+		Message   struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+
+	type parsedEntry struct {
+		entryType string
+		requestID string
+		role      string
+		content   json.RawMessage
+	}
+
+	var entries []parsedEntry
+	var linesProcessed int
 	scanner := bufio.NewScanner(file)
-	// Increase buffer size for large lines (up to 16MB for transcripts with images/PDFs)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
+	// 16MB buffer for large lines (transcripts with images/PDFs)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
 	for scanner.Scan() {
 		linesProcessed++
-		var entry map[string]interface{}
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+		line := scanner.Bytes()
+		if len(line) == 0 {
 			continue
 		}
-
-		entryType, _ := entry["type"].(string)
-
-		// Reset on actual user message (not tool_result) - start fresh collection
-		if entryType == "user" {
-			if msg, ok := entry["message"].(map[string]interface{}); ok {
-				// Case 1: content is a string (simple user message)
-				if _, ok := msg["content"].(string); ok {
-					allTexts = nil
-				} else if content, ok := msg["content"].([]interface{}); ok && len(content) > 0 {
-					// Case 2: content is an array
-					if block, ok := content[0].(map[string]interface{}); ok {
-						// Only reset if first content block is "text" (real user message),
-						// not "tool_result" which is just a response to tool_use
-						if block["type"] == "text" {
-							allTexts = nil
-						}
-					}
-				}
-			}
+		var tl transcriptLine
+		if json.Unmarshal(line, &tl) != nil {
+			continue
 		}
-
-		if entryType == "assistant" {
-			assistantCount++
-			if msg, ok := entry["message"].(map[string]interface{}); ok {
-				if content, ok := msg["content"].([]interface{}); ok {
-					for _, c := range content {
-						if block, ok := c.(map[string]interface{}); ok {
-							if block["type"] == "text" {
-								if text, ok := block["text"].(string); ok {
-									textCount++
-									allTexts = append(allTexts, text)
-								}
-							}
-						}
-					}
-				}
-			}
+		// Use nested message fields if present, otherwise fall back to root-level
+		role := tl.Message.Role
+		content := tl.Message.Content
+		if role == "" {
+			role = tl.Role
 		}
+		if len(content) == 0 {
+			content = tl.Content
+		}
+		entries = append(entries, parsedEntry{
+			entryType: tl.Type,
+			requestID: tl.RequestID,
+			role:      role,
+			content:   content,
+		})
 	}
-
 	if err := scanner.Err(); err != nil {
 		logHook("Parse", "scanner error after %d lines: %v", linesProcessed, err)
 	}
-	logHook("Parse", "processed %d lines, %d assistant entries, %d text blocks since last user msg", linesProcessed, assistantCount, len(allTexts))
+	if len(entries) == 0 {
+		return ""
+	}
 
-	// Join all text blocks from the last turn
+	// Find the last real user message (not a tool_result)
+	lastUserIdx := -1
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.entryType != "user" && e.role != "user" {
+			continue
+		}
+		// Check if content is a tool_result
+		if isToolResultContent(e.content) {
+			continue
+		}
+		lastUserIdx = i
+		break
+	}
+
+	// Collect assistant text blocks after the last user message.
+	// Streaming dedup: same requestId may have multiple entries with progressively
+	// updated text; for each requestId, the last entry's text blocks win.
+	startIdx := lastUserIdx + 1
+	if lastUserIdx < 0 {
+		startIdx = 0
+	}
+
+	reqTexts := make(map[string][]string) // requestId -> text blocks from last entry
+	var orderedKeys []string              // preserve order of first appearance
+	var noIDTexts []string                // texts from entries without requestId
+
+	for i := startIdx; i < len(entries); i++ {
+		e := entries[i]
+		if e.entryType != "assistant" && e.role != "assistant" {
+			continue
+		}
+
+		var blocks []contentBlock
+		if json.Unmarshal(e.content, &blocks) != nil {
+			continue
+		}
+
+		var entryTexts []string
+		for _, b := range blocks {
+			if b.Type != "text" {
+				continue
+			}
+			text := strings.TrimSpace(b.Text)
+			if text != "" && text != "(no content)" {
+				entryTexts = append(entryTexts, text)
+			}
+		}
+		if len(entryTexts) == 0 {
+			continue
+		}
+
+		if e.requestID == "" {
+			noIDTexts = append(noIDTexts, entryTexts...)
+		} else {
+			if _, seen := reqTexts[e.requestID]; !seen {
+				orderedKeys = append(orderedKeys, e.requestID)
+			}
+			reqTexts[e.requestID] = entryTexts // last entry with same requestId wins
+		}
+	}
+
+	var allTexts []string
+	for _, key := range orderedKeys {
+		allTexts = append(allTexts, reqTexts[key]...)
+	}
+	allTexts = append(allTexts, noIDTexts...)
+
+	logHook("Parse", "processed %d lines, %d entries, %d text blocks since last user msg", linesProcessed, len(entries), len(allTexts))
 	return strings.Join(allTexts, "\n\n")
+}
+
+// isToolResultContent checks if a JSONL content field contains tool_result entries
+func isToolResultContent(content json.RawMessage) bool {
+	if len(content) == 0 {
+		return false
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(content, &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type == "tool_result" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func handlePromptHook() error {
@@ -5223,10 +5071,8 @@ func listen() error {
 							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
 								stopContinuousTyping(sessionName)
 								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
-							} else {
-								// Start background capture for remote session response
-								captureResponseAsync(sessionName, tmuxName, address, threadID)
 							}
+							// Response capture is handled by the Stop hook.
 						} else {
 							sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
 						}
