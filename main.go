@@ -123,28 +123,31 @@ type HookData struct {
 
 // APIRequest represents an incoming request on the Unix socket
 type APIRequest struct {
-	Cmd        string   `json:"cmd"`                   // ping, sessions, ask, send, history, screenshot, subscribe
-	Session    string   `json:"session,omitempty"`     // session name
-	Text       string   `json:"text,omitempty"`        // message text
-	From       string   `json:"from,omitempty"`        // agent identifier
-	After      int64    `json:"after,omitempty"`       // for history: after message_id
-	Limit      int      `json:"limit,omitempty"`       // for history: max messages
-	FromFilter string   `json:"from_filter,omitempty"` // for history: filter by sender (human, claude, api)
-	Sessions   []string `json:"sessions,omitempty"`    // for subscribe: session list
+	Cmd           string   `json:"cmd"`                      // ping, sessions, ask, send, history, screenshot, subscribe, questions, answer
+	Session       string   `json:"session,omitempty"`        // session name
+	Text          string   `json:"text,omitempty"`           // message text
+	From          string   `json:"from,omitempty"`           // agent identifier
+	After         int64    `json:"after,omitempty"`          // for history: after message_id
+	Limit         int      `json:"limit,omitempty"`          // for history: max messages
+	FromFilter    string   `json:"from_filter,omitempty"`    // for history: filter by sender (human, claude, api)
+	Sessions      []string `json:"sessions,omitempty"`       // for subscribe: session list
+	QuestionIndex int      `json:"question_index,omitempty"` // for answer: which question (0-based)
+	OptionIndex   int      `json:"option_index,omitempty"`   // for answer: which option (0-based)
 }
 
 // APIResponse represents a response on the Unix socket
 type APIResponse struct {
-	OK             bool              `json:"ok"`
-	Error          string            `json:"error,omitempty"`
-	Sessions       []APISessionInfo  `json:"sessions,omitempty"`
-	Response       string            `json:"response,omitempty"`
-	MessageID      int64             `json:"message_id,omitempty"`
-	Messages       []HistoryMessage  `json:"messages,omitempty"`
-	Duration       int64             `json:"duration_ms,omitempty"`
-	Version        string            `json:"version,omitempty"`
-	UptimeSeconds  int64             `json:"uptime_seconds,omitempty"`
-	SessionsActive int              `json:"sessions_active,omitempty"`
+	OK             bool                `json:"ok"`
+	Error          string              `json:"error,omitempty"`
+	Sessions       []APISessionInfo    `json:"sessions,omitempty"`
+	Response       string              `json:"response,omitempty"`
+	MessageID      int64               `json:"message_id,omitempty"`
+	Messages       []HistoryMessage    `json:"messages,omitempty"`
+	Duration       int64               `json:"duration_ms,omitempty"`
+	Version        string              `json:"version,omitempty"`
+	UptimeSeconds  int64               `json:"uptime_seconds,omitempty"`
+	SessionsActive int                 `json:"sessions_active,omitempty"`
+	Questions      *PendingQuestionSet `json:"questions,omitempty"`
 }
 
 // APIEvent represents a streaming event for subscribe
@@ -187,6 +190,34 @@ var (
 	messageIDCounter int64
 	messageIDMutex   sync.Mutex
 )
+
+// pendingQuestions stores AskUserQuestion questions awaiting answers.
+// Key: session name, Value: *PendingQuestionSet
+var pendingQuestions sync.Map
+
+// PendingQuestionOption represents one option in a pending question
+type PendingQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// PendingQuestion represents a single question from AskUserQuestion
+type PendingQuestion struct {
+	Question    string                  `json:"question"`
+	Header      string                  `json:"header"`
+	Options     []PendingQuestionOption `json:"options"`
+	MultiSelect bool                    `json:"multi_select,omitempty"`
+	Answered    bool                    `json:"answered"`
+	AnswerIndex int                     `json:"answer_index,omitempty"`
+}
+
+// PendingQuestionSet represents all questions from one AskUserQuestion call
+type PendingQuestionSet struct {
+	Session   string            `json:"session"`
+	Questions []PendingQuestion `json:"questions"`
+	Timestamp int64             `json:"timestamp"`
+	TopicID   int64             `json:"-"`
+}
 
 
 func nextMessageID() int64 {
@@ -409,6 +440,10 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleHistoryCmd(encoder, cfg, req)
 		case "screenshot":
 			handleScreenshotCmd(encoder, cfg, req)
+		case "questions":
+			handleQuestionsCmd(encoder, cfg, req)
+		case "answer":
+			handleAnswerCmd(encoder, cfg, req)
 		case "subscribe":
 			handleSubscribeCmd(conn, encoder, cfg, req)
 			return // Subscribe keeps connection open until done
@@ -815,6 +850,135 @@ func handleScreenshotCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 
 	encoder.Encode(APIResponse{OK: true, Response: content})
+}
+
+// handleQuestionsCmd returns pending AskUserQuestion questions for a session.
+func handleQuestionsCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session required"})
+		return
+	}
+
+	// Clean expired questions (older than 5 minutes)
+	cleanExpiredQuestions()
+
+	val, exists := pendingQuestions.Load(req.Session)
+	if !exists {
+		encoder.Encode(APIResponse{OK: true}) // No pending questions
+		return
+	}
+
+	qs := val.(*PendingQuestionSet)
+	encoder.Encode(APIResponse{OK: true, Questions: qs})
+}
+
+// handleAnswerCmd answers a pending AskUserQuestion by sending keys to tmux.
+func handleAnswerCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if req.Session == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "session required"})
+		return
+	}
+
+	val, exists := pendingQuestions.Load(req.Session)
+	if !exists {
+		encoder.Encode(APIResponse{OK: false, Error: "no pending questions for this session"})
+		return
+	}
+
+	qs := val.(*PendingQuestionSet)
+	if req.QuestionIndex < 0 || req.QuestionIndex >= len(qs.Questions) {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("question_index out of range (0-%d)", len(qs.Questions)-1)})
+		return
+	}
+
+	q := &qs.Questions[req.QuestionIndex]
+	if q.Answered {
+		encoder.Encode(APIResponse{OK: false, Error: "question already answered"})
+		return
+	}
+
+	if req.OptionIndex < 0 || req.OptionIndex >= len(q.Options) {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("option_index out of range (0-%d)", len(q.Options)-1)})
+		return
+	}
+
+	// Resolve session info for tmux
+	info, sessionExists := cfg.Sessions[req.Session]
+	if !sessionExists || info.Deleted {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+
+	_, projectName := parseSessionTarget(req.Session)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
+
+	// Send tmux keys: Down × optionIndex, then Enter
+	var sendErr error
+	if info.Host != "" {
+		address := getHostAddress(cfg, info.Host)
+		for i := 0; i < req.OptionIndex; i++ {
+			cmd := fmt.Sprintf("tmux send-keys -t %s Down", shellQuote(tmuxName))
+			runSSH(address, cmd, 5*time.Second)
+			time.Sleep(50 * time.Millisecond)
+		}
+		cmd := fmt.Sprintf("tmux send-keys -t %s Enter", shellQuote(tmuxName))
+		_, sendErr = runSSH(address, cmd, 5*time.Second)
+	} else {
+		for i := 0; i < req.OptionIndex; i++ {
+			tmuxCmd("send-keys", "-t", tmuxName, "Down").Run()
+			time.Sleep(50 * time.Millisecond)
+		}
+		sendErr = tmuxCmd("send-keys", "-t", tmuxName, "Enter").Run()
+	}
+
+	if sendErr != nil {
+		encoder.Encode(APIResponse{OK: false, Error: fmt.Sprintf("failed to send keys: %v", sendErr)})
+		return
+	}
+
+	// Mark as answered
+	q.Answered = true
+	q.AnswerIndex = req.OptionIndex
+
+	// Auto-submit if this was the last question
+	allAnswered := true
+	for _, qq := range qs.Questions {
+		if !qq.Answered {
+			allAnswered = false
+			break
+		}
+	}
+	if allAnswered {
+		time.Sleep(300 * time.Millisecond)
+		if info.Host != "" {
+			address := getHostAddress(cfg, info.Host)
+			cmd := fmt.Sprintf("tmux send-keys -t %s Enter", shellQuote(tmuxName))
+			runSSH(address, cmd, 5*time.Second)
+		} else {
+			tmuxCmd("send-keys", "-t", tmuxName, "Enter").Run()
+		}
+		// Remove from pending
+		pendingQuestions.Delete(req.Session)
+		fmt.Printf("[answer] Auto-submitted all answers for %s\n", req.Session)
+	}
+
+	// Store answer in history
+	optLabel := q.Options[req.OptionIndex].Label
+	appendHistoryDedup(qs.TopicID, "human", fmt.Sprintf("Selected: %s", optLabel))
+
+	encoder.Encode(APIResponse{OK: true, Response: fmt.Sprintf("answered question %d with option %d (%s)", req.QuestionIndex, req.OptionIndex, optLabel)})
+}
+
+// cleanExpiredQuestions removes pending questions older than 5 minutes.
+func cleanExpiredQuestions() {
+	cutoff := time.Now().Unix() - 300
+	pendingQuestions.Range(func(key, value interface{}) bool {
+		qs := value.(*PendingQuestionSet)
+		if qs.Timestamp < cutoff {
+			pendingQuestions.Delete(key)
+		}
+		return true
+	})
 }
 
 // handleSubscribeCmd handles the "subscribe" command
@@ -2727,6 +2891,29 @@ func handlePermissionHook() error {
 	logHook("Permission", "tool=%s session=%s questions=%d", hookData.ToolName, sessionName, len(hookData.ToolInput.Questions))
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
 		totalQuestions := len(hookData.ToolInput.Questions)
+
+		// Store in pending questions for API access
+		pqs := &PendingQuestionSet{
+			Session:   sessionName,
+			Timestamp: time.Now().Unix(),
+			TopicID:   topicID,
+		}
+		for _, q := range hookData.ToolInput.Questions {
+			pq := PendingQuestion{
+				Question:    q.Question,
+				Header:      q.Header,
+				MultiSelect: q.MultiSelect,
+			}
+			for _, opt := range q.Options {
+				pq.Options = append(pq.Options, PendingQuestionOption{
+					Label:       opt.Label,
+					Description: opt.Description,
+				})
+			}
+			pqs.Questions = append(pqs.Questions, pq)
+		}
+		pendingQuestions.Store(sessionName, pqs)
+
 		go func() {
 			defer func() { recover() }()
 			for qIdx, q := range hookData.ToolInput.Questions {
@@ -4279,10 +4466,20 @@ func listen() error {
 						sendTmuxKeys("Enter")
 						fmt.Printf("[callback] Selected option %d for %s (question %d/%d)\n", optionIndex, sessionName, questionIndex+1, totalQuestions)
 
+						// Mark answered in pending questions (for API sync)
+						if val, ok := pendingQuestions.Load(sessionName); ok {
+							pqs := val.(*PendingQuestionSet)
+							if questionIndex < len(pqs.Questions) {
+								pqs.Questions[questionIndex].Answered = true
+								pqs.Questions[questionIndex].AnswerIndex = optionIndex
+							}
+						}
+
 						// After the last question, send Enter to confirm "Submit answers"
 						if totalQuestions > 0 && questionIndex == totalQuestions-1 {
 							time.Sleep(300 * time.Millisecond)
 							sendTmuxKeys("Enter")
+							pendingQuestions.Delete(sessionName)
 							fmt.Printf("[callback] Auto-submitted answers for %s\n", sessionName)
 						}
 					}
