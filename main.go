@@ -184,6 +184,7 @@ type HistoryMessage struct {
 
 // Server start time for uptime calculation
 var serverStartTime time.Time
+var lockFile *os.File // kept open to hold flock
 
 // Global message ID counter (in-memory, initialized from history on start)
 var (
@@ -4416,15 +4417,19 @@ claude: %s`, name, address, projectsDir, tmuxPath, claudePath)
 // Main listen loop
 
 func listen() error {
-	// Kill any other ccc listen instances to avoid Telegram API conflicts
-	myPid := os.Getpid()
-	cmd := exec.Command("pgrep", "-f", "ccc listen")
-	output, _ := cmd.Output()
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		if pid, err := strconv.Atoi(line); err == nil && pid != myPid {
-			syscall.Kill(pid, syscall.SIGTERM)
-		}
+	// Acquire exclusive lock to prevent multiple instances
+	lockPath := filepath.Join(os.Getenv("HOME"), ".ccc.lock")
+	var lockErr error
+	lockFile, lockErr = os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if lockErr != nil {
+		return fmt.Errorf("failed to open lock file: %w", lockErr)
 	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lockFile.Close()
+		lockFile = nil
+		return fmt.Errorf("another ccc listen instance is already running (lock: %s)", lockPath)
+	}
+	// lockFile is kept open at package level — lock released when process exits
 
 	config, err := loadConfig()
 	if err != nil {
