@@ -115,6 +115,10 @@ type HookData struct {
 				Description string `json:"description"`
 			} `json:"options"`
 		} `json:"questions"`
+		AllowedPrompts []struct {
+			Tool   string `json:"tool"`
+			Prompt string `json:"prompt"`
+		} `json:"allowedPrompts,omitempty"`
 	} `json:"tool_input"`
 }
 
@@ -3046,10 +3050,9 @@ func handlePermissionHook() error {
 		return nil
 	}
 
-	// In client mode, forward AskUserQuestion to server
-	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
-		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
-			// Build question summary for forwarding
+	// In client mode, forward to server
+	if config.Mode == "client" && config.Server != "" && config.HostName != "" {
+		if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
 			for _, q := range hookData.ToolInput.Questions {
 				if q.Question == "" {
 					continue
@@ -3063,6 +3066,18 @@ func handlePermissionHook() error {
 				}
 				forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, msg)
 			}
+			return nil
+		}
+		if hookData.ToolName == "ExitPlanMode" {
+			planText := readLatestPlanFile(hookData.Cwd)
+			if planText == "" {
+				planText = "(plan file not found)"
+			}
+			if len(planText) > 3900 {
+				planText = planText[:3900] + "\n\n... (truncated)"
+			}
+			msg := fmt.Sprintf("📋 Plan ready:\n\n%s", planText)
+			forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, msg)
 			return nil
 		}
 	}
@@ -3162,14 +3177,31 @@ func handlePermissionHook() error {
 		return nil
 	}
 
-	// Generic permission request — notify in Telegram (non-blocking)
-	go func() {
-		defer func() { recover() }()
-		if hookData.ToolName != "" {
-			msg := fmt.Sprintf("🔐 Permission requested: %s", hookData.ToolName)
+	// Handle ExitPlanMode — read plan file and forward to Telegram
+	if hookData.ToolName == "ExitPlanMode" {
+		go func() {
+			defer func() { recover() }()
+			planText := readLatestPlanFile(hookData.Cwd)
+			if planText == "" {
+				sendMessage(config, config.GroupID, topicID, "📋 Plan mode completed (plan file not found)")
+				return
+			}
+			// Truncate to Telegram's 4096 char limit (leave room for header)
+			if len(planText) > 3900 {
+				planText = planText[:3900] + "\n\n... (truncated)"
+			}
+			msg := fmt.Sprintf("📋 Plan ready:\n\n%s", planText)
 			sendMessage(config, config.GroupID, topicID, msg)
-		}
-	}()
+			// Store in history
+			appendHistory(topicID, HistoryMessage{
+				ID:        nextMessageID(),
+				Timestamp: time.Now().Unix(),
+				From:      "claude",
+				Text:      msg,
+			})
+		}()
+		return nil
+	}
 
 	return nil
 }
@@ -3319,6 +3351,44 @@ func getLastAssistantMessage(transcriptPath string) string {
 
 	logHook("Parse", "processed %d lines, %d entries, %d text blocks since last user msg", linesProcessed, len(entries), len(allTexts))
 	return strings.Join(allTexts, "\n\n")
+}
+
+// readLatestPlanFile finds and reads the most recently modified plan file.
+// Claude Code stores plans in ~/.claude/plans/<slug>.md
+func readLatestPlanFile(cwd string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	planDir := filepath.Join(homeDir, ".claude", "plans")
+	files, err := filepath.Glob(filepath.Join(planDir, "*.md"))
+	if err != nil || len(files) == 0 {
+		return ""
+	}
+
+	// Find the most recently modified file
+	var newest string
+	var newestTime time.Time
+	for _, f := range files {
+		info, err := os.Stat(f)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestTime) {
+			newestTime = info.ModTime()
+			newest = f
+		}
+	}
+
+	if newest == "" || time.Since(newestTime) > 5*time.Minute {
+		return "" // Too old, probably not from the current session
+	}
+
+	data, err := os.ReadFile(newest)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // isToolResultContent checks if a JSONL content field contains tool_result entries
