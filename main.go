@@ -3713,7 +3713,8 @@ func setBotCommands(botToken string) {
 			{"command": "away", "description": "Toggle notifications"},
 			{"command": "c", "description": "Local command: /c <cmd>"},
 			{"command": "screenshot", "description": "Take screenshot of display"},
-			{"command": "ping", "description": "Check bot status"}
+			{"command": "ping", "description": "Check bot status"},
+			{"command": "restart", "description": "Restart CCC process"}
 		]
 	}`
 
@@ -5001,7 +5002,8 @@ func listen() error {
 • /setdir \[host:\]<path> — Set projects directory
 • /away — Toggle notifications
 • /c <cmd> — Run local command
-• /ping — Check bot status`
+• /ping — Check bot status
+• /restart — Restart CCC process`
 				sendMessage(config, chatID, threadID, helpText)
 				continue
 			}
@@ -5009,6 +5011,23 @@ func listen() error {
 			if text == "/ping" {
 				sendMessage(config, chatID, threadID, "pong!")
 				continue
+			}
+
+			if text == "/restart" {
+				sendMessage(config, chatID, threadID, "🔄 Restarting...")
+				exe, err := os.Executable()
+				if err != nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed: %v", err))
+					continue
+				}
+				cmd := exec.Command(exe, "listen")
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				if err := cmd.Start(); err != nil {
+					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
+					continue
+				}
+				os.Exit(0)
 			}
 
 			if text == "/away" {
@@ -5664,6 +5683,7 @@ TELEGRAM COMMANDS:
     /setdir [host:]<path>   Set projects directory
     /c <cmd>                Execute local shell command
     /rc <host> <cmd>        Execute command on remote host
+    /restart                Restart CCC process
     /host add <name> <addr> [dir]  Add remote host
     /host del <name>        Remove remote host
     /host list              List configured hosts
