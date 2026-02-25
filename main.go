@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -140,6 +141,7 @@ type APIResponse struct {
 	OK             bool                `json:"ok"`
 	Error          string              `json:"error,omitempty"`
 	Sessions       []APISessionInfo    `json:"sessions,omitempty"`
+	Activity       []ActivityInfo      `json:"activity,omitempty"`
 	Response       string              `json:"response,omitempty"`
 	MessageID      int64               `json:"message_id,omitempty"`
 	Messages       []HistoryMessage    `json:"messages,omitempty"`
@@ -148,6 +150,15 @@ type APIResponse struct {
 	UptimeSeconds  int64               `json:"uptime_seconds,omitempty"`
 	SessionsActive int                 `json:"sessions_active,omitempty"`
 	Questions      *PendingQuestionSet `json:"questions,omitempty"`
+}
+
+// ActivityInfo represents last message summary for a session
+type ActivityInfo struct {
+	Name          string `json:"name"`
+	LastMessageID int64  `json:"lastMessageId"`
+	LastMessageTs int64  `json:"lastMessageTs"`
+	LastFrom      string `json:"lastFrom,omitempty"`
+	LastText      string `json:"lastText,omitempty"`
 }
 
 // APIEvent represents a streaming event for subscribe
@@ -439,6 +450,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleSendCmd(encoder, cfg, req)
 		case "history":
 			handleHistoryCmd(encoder, cfg, req)
+		case "activity":
+			handleActivityCmd(encoder, cfg)
 		case "screenshot":
 			handleScreenshotCmd(encoder, cfg, req)
 		case "questions":
@@ -906,6 +919,96 @@ func handleHistoryCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 
 	encoder.Encode(APIResponse{OK: true, Messages: messages})
+}
+
+// handleActivityCmd returns last message summary for all sessions
+func handleActivityCmd(encoder *json.Encoder, cfg *Config) {
+	var activity []ActivityInfo
+
+	for name, info := range cfg.Sessions {
+		if info.Deleted {
+			continue
+		}
+		ai := ActivityInfo{Name: name}
+
+		if info.TopicID > 0 {
+			if msg := readLastHistoryMessage(info.TopicID); msg != nil {
+				ai.LastMessageID = msg.ID
+				ai.LastMessageTs = msg.Timestamp
+				ai.LastFrom = msg.From
+				text := msg.Text
+				if text == "" && msg.Transcription != "" {
+					text = msg.Transcription
+				}
+				if text == "" && msg.Caption != "" {
+					text = msg.Caption
+				}
+				if len(text) > 100 {
+					text = text[:100] + "..."
+				}
+				ai.LastText = text
+			}
+		}
+
+		activity = append(activity, ai)
+	}
+
+	encoder.Encode(APIResponse{OK: true, Activity: activity})
+}
+
+// readLastHistoryMessage reads the last line from the newest history JSONL file
+func readLastHistoryMessage(topicID int64) *HistoryMessage {
+	dir := getHistoryDir(topicID)
+	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		return nil
+	}
+	// Files are named YYYY-MM-DD-HH.jsonl, lexicographic sort = chronological
+	sort.Strings(files)
+
+	// Read last non-empty line from newest file, fall back to older files
+	for i := len(files) - 1; i >= 0; i-- {
+		if msg := readLastLine(files[i]); msg != nil {
+			return msg
+		}
+	}
+	return nil
+}
+
+// readLastLine reads the last non-empty JSONL line from a file using tail seek
+func readLastLine(path string) *HistoryMessage {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil || stat.Size() == 0 {
+		return nil
+	}
+
+	// Read up to last 8KB to find the last line
+	bufSize := int64(8192)
+	if stat.Size() < bufSize {
+		bufSize = stat.Size()
+	}
+	buf := make([]byte, bufSize)
+	f.ReadAt(buf, stat.Size()-bufSize)
+
+	// Find last newline-terminated JSON line
+	lines := bytes.Split(buf, []byte("\n"))
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 {
+			continue
+		}
+		var msg HistoryMessage
+		if json.Unmarshal(line, &msg) == nil && msg.ID > 0 {
+			return &msg
+		}
+	}
+	return nil
 }
 
 // handleScreenshotCmd handles the "screenshot" command — returns raw tmux capture-pane
