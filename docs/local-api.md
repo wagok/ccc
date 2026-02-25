@@ -10,6 +10,7 @@ The Local API allows external programs running on the same host to:
 - Send messages to sessions — blocking (`ask`) or non-blocking (`send`)
 - Restart crashed or stopped sessions (`continue`)
 - Retrieve message history with filtering (`history`)
+- Poll last activity across all sessions (`activity`)
 - Capture raw tmux terminal output (`screenshot`)
 - Handle interactive questions from Claude (`questions`, `answer`)
 - Subscribe to real-time status updates (`subscribe`)
@@ -302,6 +303,58 @@ Retrieve message history for a session.
 
 ---
 
+### activity
+
+Get last message summary for all sessions in a single call. Designed for external agent polling — compare `lastMessageId` with a saved index to detect new activity without calling `history` per session.
+
+**Request:**
+```json
+{"cmd": "activity"}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "activity": [
+    {
+      "name": "ccc",
+      "lastMessageId": 445,
+      "lastMessageTs": 1772021789,
+      "lastFrom": "claude",
+      "lastText": "Done. All tests pass, deployed to..."
+    },
+    {
+      "name": "msi:openClaw_dev",
+      "lastMessageId": 312,
+      "lastMessageTs": 1772020100,
+      "lastFrom": "human",
+      "lastText": "Update the CCC plugin"
+    },
+    {
+      "name": "testproject",
+      "lastMessageId": 0,
+      "lastMessageTs": 0
+    }
+  ]
+}
+```
+
+**Activity fields:**
+- `name` - Session name
+- `lastMessageId` - ID of the last message (0 if no history)
+- `lastMessageTs` - Unix timestamp of the last message (0 if no history)
+- `lastFrom` - Sender of the last message: `"human"`, `"claude"`, or `"api"`
+- `lastText` - First 100 characters of the last message (truncated with `...`)
+
+**Notes:**
+- No parameters required — returns data for all configured (non-deleted) sessions
+- Fast: reads only the last 8KB of each JSONL history file (tail seek), no full scan
+- Sessions with no history return `lastMessageId: 0, lastMessageTs: 0`
+- For voice messages, `lastText` contains the transcription; for photos, the caption
+
+---
+
 ### screenshot
 
 Capture raw tmux terminal output for a session. Returns the visible text content of the tmux pane.
@@ -511,6 +564,9 @@ echo '{"cmd":"history","session":"myproject","limit":10}' | nc -U ~/.ccc.sock -q
 
 # Get only Claude's messages
 echo '{"cmd":"history","session":"myproject","from_filter":"claude","limit":5}' | nc -U ~/.ccc.sock -q 1
+
+# Poll activity across all sessions
+echo '{"cmd":"activity"}' | nc -U ~/.ccc.sock -q 1
 
 # Capture terminal output (100 lines)
 echo '{"cmd":"screenshot","session":"myproject","limit":100}' | nc -U ~/.ccc.sock -q 1
