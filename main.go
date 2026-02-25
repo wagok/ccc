@@ -5371,74 +5371,36 @@ func listen() error {
 					_, projectName := parseSessionTarget(sessionName)
 					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
-					if hostName != "" {
-						// Remote session
-						address := getHostAddress(config, hostName)
-						if address == "" {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host '%s' not configured", hostName))
-							continue
-						}
-
-						if sshTmuxHasSession(address, tmuxName) {
-							// Check if Claude is actually running (not crashed to bash)
-							if !isClaudeRunning(tmuxName, address) {
-								// Auto-restart Claude
-								sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
-								if !restartClaudeInSession(tmuxName, address) {
-									sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
-									continue
-								}
-								sendMessage(config, chatID, threadID, "✅ Session restarted")
-							}
-							startContinuousTyping(config, chatID, threadID, sessionName)
-							// Store in history
-							appendHistory(threadID, HistoryMessage{
-								ID:        nextMessageID(),
-								Timestamp: time.Now().Unix(),
-								From:      "human",
-								Text:      text,
-								Username:  msg.From.Username,
-							})
-							markTelegramSent(threadID)
-							if err := sshTmuxSendKeys(address, tmuxName, text); err != nil {
-								stopContinuousTyping(sessionName)
-								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
-							}
-							// Response capture is handled by the Stop hook.
-						} else {
-							sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
-						}
-					} else {
-						// Local session
-						if tmuxSessionExists(tmuxName) {
-							// Check if Claude is actually running (not crashed to bash)
-							if !isClaudeRunning(tmuxName, "") {
-								// Auto-restart Claude
-								sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
-								if !restartClaudeInSession(tmuxName, "") {
-									sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
-									continue
-								}
-								sendMessage(config, chatID, threadID, "✅ Session restarted")
-							}
-							startContinuousTyping(config, chatID, threadID, sessionName)
-							// Store in history
-							appendHistory(threadID, HistoryMessage{
-								ID:        nextMessageID(),
-								Timestamp: time.Now().Unix(),
-								From:      "human",
-								Text:      text,
-								Username:  msg.From.Username,
-							})
-							markTelegramSent(threadID)
-							if err := sendToTmux(tmuxName, text); err != nil {
-								stopContinuousTyping(sessionName)
-								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
-							}
-						} else {
-							sendMessage(config, chatID, threadID, "⚠️ Session not running. Use /new or /continue to restart.")
-						}
+					// Ensure session is running (auto-start if stopped, auto-restart if crashed)
+					if errMsg := ensureSessionRunning(config, sessionName, sessionInfo); errMsg != "" {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ %s", errMsg))
+						continue
 					}
+
+					startContinuousTyping(config, chatID, threadID, sessionName)
+					// Store in history
+					appendHistory(threadID, HistoryMessage{
+						ID:        nextMessageID(),
+						Timestamp: time.Now().Unix(),
+						From:      "human",
+						Text:      text,
+						Username:  msg.From.Username,
+					})
+					markTelegramSent(threadID)
+
+					// Send to tmux (remote or local)
+					var sendErr error
+					if hostName != "" {
+						address := getHostAddress(config, hostName)
+						sendErr = sshTmuxSendKeys(address, tmuxName, text)
+					} else {
+						sendErr = sendToTmux(tmuxName, text)
+					}
+					if sendErr != nil {
+						stopContinuousTyping(sessionName)
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", sendErr))
+					}
+					// Response capture is handled by the Stop hook.
 					continue
 				}
 			}
