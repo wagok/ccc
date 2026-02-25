@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -201,6 +202,7 @@ type HistoryMessage struct {
 var serverStartTime time.Time
 var lockFile *os.File    // kept open to hold flock
 var activeCaptures sync.Map // key: session name, prevents concurrent response captures
+var updateInProgress int32  // atomic flag to prevent concurrent /update
 
 // Global message ID counter (in-memory, initialized from history on start)
 var (
@@ -3833,6 +3835,121 @@ func installHook() error {
 	return nil
 }
 
+// findCCCSourceDir locates the CCC source directory by looking for go.mod + .git
+// in known locations. Returns empty string if not found.
+func findCCCSourceDir() string {
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, "Projects", "teleclaude", "ccc"), // wagok-server
+		filepath.Join(home, "Projects", "ccc"),               // msi, XPS
+		filepath.Join(home, "Public", "Tools", "ccc"),        // dell17
+	}
+	// Also check directory of the running binary
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			candidates = append([]string{filepath.Dir(resolved)}, candidates...)
+		}
+	}
+	for _, dir := range candidates {
+		goMod := filepath.Join(dir, "go.mod")
+		gitDir := filepath.Join(dir, ".git")
+		if _, err := os.Stat(goMod); err == nil {
+			if _, err := os.Stat(gitDir); err == nil {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
+// handleUpdateCmd performs git pull + go build + backup + replace + restart.
+// Runs in a goroutine to avoid blocking the Telegram polling loop.
+func handleUpdateCmd(cfg *Config, chatID int64, threadID int64) {
+	defer atomic.StoreInt32(&updateInProgress, 0)
+
+	sourceDir := findCCCSourceDir()
+	if sourceDir == "" {
+		sendMessage(cfg, chatID, threadID, "❌ Source directory not found (need go.mod + .git)")
+		return
+	}
+
+	// Step 1: git pull
+	sendMessage(cfg, chatID, threadID, fmt.Sprintf("📦 Pulling from git...\n`%s`", sourceDir))
+	pullCmd := exec.Command("git", "-C", sourceDir, "pull")
+	pullOut, err := pullCmd.CombinedOutput()
+	pullText := strings.TrimSpace(string(pullOut))
+	if err != nil {
+		sendMessage(cfg, chatID, threadID, fmt.Sprintf("❌ git pull failed:\n```\n%s\n```", pullText))
+		return
+	}
+
+	if pullText == "Already up to date." {
+		sendMessage(cfg, chatID, threadID, "✅ Already up to date, no rebuild needed.")
+		return
+	}
+
+	// Step 2: go build
+	sendMessage(cfg, chatID, threadID, "🔨 Building...")
+	newBinary := filepath.Join(sourceDir, "ccc-new")
+	buildCmd := exec.Command("go", "build", "-o", newBinary, ".")
+	buildCmd.Dir = sourceDir
+	buildOut, err := buildCmd.CombinedOutput()
+	if err != nil {
+		buildText := strings.TrimSpace(string(buildOut))
+		if len(buildText) > 3000 {
+			buildText = buildText[:3000] + "\n..."
+		}
+		sendMessage(cfg, chatID, threadID, fmt.Sprintf("❌ Build failed:\n```\n%s\n```", buildText))
+		os.Remove(newBinary)
+		return
+	}
+
+	// Step 3: Validate new binary (must be > 1MB)
+	if stat, err := os.Stat(newBinary); err != nil || stat.Size() < 1*1024*1024 {
+		sendMessage(cfg, chatID, threadID, "❌ Built binary too small or missing, aborting")
+		os.Remove(newBinary)
+		return
+	}
+
+	// Step 4: Find current binary and backup
+	exe, err := os.Executable()
+	if err != nil {
+		sendMessage(cfg, chatID, threadID, fmt.Sprintf("❌ Cannot find current binary: %v", err))
+		os.Remove(newBinary)
+		return
+	}
+	exePath, _ := filepath.EvalSymlinks(exe)
+	backupPath := exePath + ".bak"
+
+	// Copy current binary as backup (ignore error if first run)
+	exec.Command("cp", exePath, backupPath).Run()
+
+	// Step 5: Replace binary (rm + cp to handle "text file busy")
+	os.Remove(exePath)
+	cpCmd := exec.Command("cp", newBinary, exePath)
+	if err := cpCmd.Run(); err != nil {
+		// Restore from backup
+		sendMessage(cfg, chatID, threadID, fmt.Sprintf("❌ Failed to replace binary: %v\nRestoring backup...", err))
+		exec.Command("cp", backupPath, exePath).Run()
+		os.Remove(newBinary)
+		return
+	}
+	os.Chmod(exePath, 0755)
+	os.Remove(newBinary)
+
+	sendMessage(cfg, chatID, threadID, fmt.Sprintf("✅ Updated!\n```\n%s\n```\n🔄 Restarting...", pullText))
+
+	// Step 6: Restart (same as /restart)
+	cmd := exec.Command(exePath, "listen")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		sendMessage(cfg, chatID, threadID, fmt.Sprintf("❌ Failed to restart: %v\nBinary updated but not restarted.", err))
+		return
+	}
+	os.Exit(0)
+}
+
 // Bot commands
 
 func setBotCommands(botToken string) {
@@ -3851,6 +3968,7 @@ func setBotCommands(botToken string) {
 			{"command": "c", "description": "Local command: /c <cmd>"},
 			{"command": "screenshot", "description": "Take screenshot of display"},
 			{"command": "ping", "description": "Check bot status"},
+			{"command": "update", "description": "Pull, build and restart CCC"},
 			{"command": "restart", "description": "Restart CCC process"}
 		]
 	}`
@@ -5140,6 +5258,7 @@ func listen() error {
 • /away — Toggle notifications
 • /c <cmd> — Run local command
 • /ping — Check bot status
+• /update — Pull, build and restart CCC
 • /restart — Restart CCC process`
 				sendMessage(config, chatID, threadID, helpText)
 				continue
@@ -5165,6 +5284,15 @@ func listen() error {
 					continue
 				}
 				os.Exit(0)
+			}
+
+			if text == "/update" {
+				if !atomic.CompareAndSwapInt32(&updateInProgress, 0, 1) {
+					sendMessage(config, chatID, threadID, "⏳ Update already in progress...")
+					continue
+				}
+				go handleUpdateCmd(config, chatID, threadID)
+				continue
 			}
 
 			if text == "/away" {
@@ -5821,6 +5949,7 @@ TELEGRAM COMMANDS:
     /setdir [host:]<path>   Set projects directory
     /c <cmd>                Execute local shell command
     /rc <host> <cmd>        Execute command on remote host
+    /update                 Pull, build and restart CCC
     /restart                Restart CCC process
     /host add <name> <addr> [dir]  Add remote host
     /host del <name>        Remove remote host
