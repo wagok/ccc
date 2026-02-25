@@ -199,7 +199,8 @@ type HistoryMessage struct {
 
 // Server start time for uptime calculation
 var serverStartTime time.Time
-var lockFile *os.File // kept open to hold flock
+var lockFile *os.File    // kept open to hold flock
+var activeCaptures sync.Map // key: session name, prevents concurrent response captures
 
 // Global message ID counter (in-memory, initialized from history on start)
 var (
@@ -742,6 +743,112 @@ func waitForHistoryResponse(topicID int64, sentAt time.Time, maxWait time.Durati
 	return ""
 }
 
+// captureResponseAsync polls a remote session in the background to capture
+// Claude's response and store it in history. This is a fallback for cases
+// where client-mode forwarding isn't active — if the Stop hook already
+// forwarded the response (Fix 1), this is a no-op due to dedup.
+func captureResponseAsync(cfg *Config, sessionName string, info *SessionInfo) {
+	if info.Host == "" || info.TopicID == 0 {
+		return
+	}
+
+	// Per-session guard: only one capture goroutine per session
+	if _, loaded := activeCaptures.LoadOrStore(sessionName, true); loaded {
+		return
+	}
+
+	go func() {
+		defer activeCaptures.Delete(sessionName)
+
+		_, projectName := parseSessionTarget(sessionName)
+		tmuxName := tmuxSessionName(extractProjectName(projectName))
+		sshAddr := getHostAddress(cfg, info.Host)
+		sentAt := time.Now()
+
+		// Wait for Claude to start processing
+		time.Sleep(2 * time.Second)
+
+		// Poll until Claude becomes idle
+		timeout := time.After(5 * time.Minute)
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		idleCount := 0
+		for {
+			select {
+			case <-timeout:
+				fmt.Printf("[capture] timeout waiting for idle session=%s\n", sessionName)
+				return
+			case <-ticker.C:
+				state := checkClaudeState(tmuxName, sshAddr)
+				if state == "idle" {
+					idleCount++
+					if idleCount >= 2 {
+						// Claude is idle — check if response already in history (from Stop hook + Fix 1)
+						response := waitForHistoryResponse(info.TopicID, sentAt, 5*time.Second)
+						if response != "" {
+							fmt.Printf("[capture] response already in history session=%s\n", sessionName)
+							return
+						}
+
+						// No response in history — capture from remote transcript
+						response = getRemoteLastResponse(sshAddr, info.Path)
+						if response != "" {
+							appendHistoryDedup(info.TopicID, "claude", response)
+							fmt.Printf("[capture] stored remote response session=%s len=%d\n", sessionName, len(response))
+						} else {
+							fmt.Printf("[capture] no response captured session=%s\n", sessionName)
+						}
+						return
+					}
+				} else {
+					idleCount = 0
+				}
+			}
+		}
+	}()
+}
+
+// getRemoteLastResponse reads the last Claude response from a remote machine's
+// transcript file via SSH. Used as a fallback when client-mode forwarding is not active.
+func getRemoteLastResponse(sshAddr string, projectPath string) string {
+	if sshAddr == "" || projectPath == "" {
+		return ""
+	}
+
+	// Claude encodes project path by replacing / with -
+	encodedPath := strings.ReplaceAll(projectPath, "/", "-")
+
+	// Find the most recent transcript file for this project
+	findCmd := fmt.Sprintf(
+		"ls -t ~/.claude/projects/%s/*/transcript.jsonl 2>/dev/null | head -1",
+		encodedPath,
+	)
+	result, err := runSSH(sshAddr, findCmd, 10*time.Second)
+	if err != nil || strings.TrimSpace(result) == "" {
+		return ""
+	}
+	transcriptPath := strings.TrimSpace(result)
+
+	// Read the last 200KB of the transcript (enough for the last turn)
+	readCmd := fmt.Sprintf("tail -c 204800 %s", shellQuote(transcriptPath))
+	content, err := runSSH(sshAddr, readCmd, 15*time.Second)
+	if err != nil || content == "" {
+		return ""
+	}
+
+	// Write to temp file and parse with existing getLastAssistantMessage
+	tmpFile, err := os.CreateTemp("", "ccc-transcript-*.jsonl")
+	if err != nil {
+		return ""
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.WriteString(content)
+	tmpFile.Close()
+
+	return getLastAssistantMessage(tmpFile.Name())
+}
+
 // handleSendCmd handles the "send" command (non-blocking)
 func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	if req.Session == "" || req.Text == "" {
@@ -807,7 +914,9 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 
 	encoder.Encode(APIResponse{OK: true, MessageID: msgID})
-	// Response capture is handled by the Stop hook (no polling needed).
+
+	// Background capture for remote sessions (fallback if client-mode forwarding is inactive)
+	captureResponseAsync(cfg, req.Session, info)
 }
 
 
@@ -5592,7 +5701,8 @@ func listen() error {
 						stopContinuousTyping(sessionName)
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", sendErr))
 					}
-					// Response capture is handled by the Stop hook.
+					// Background capture for remote sessions (fallback if client-mode forwarding is inactive)
+					captureResponseAsync(config, sessionName, sessionInfo)
 					continue
 				}
 			}
