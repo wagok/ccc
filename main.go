@@ -3651,9 +3651,9 @@ func handleOutputHook() error {
 		return nil
 	}
 
-	// Truncate long messages
-	if len(msg) > 1000 {
-		msg = msg[:1000] + "..."
+	// Cap at 20000 chars (~5 Telegram messages); sendMessage handles splitting
+	if len(msg) > 20000 {
+		msg = msg[:20000] + "\n\n... (truncated)"
 	}
 
 	// In client mode, forward to server
