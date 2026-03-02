@@ -496,9 +496,19 @@ func handlePingCmd(encoder *json.Encoder, cfg *Config) {
 
 // handleSessionsCmd handles the "sessions" command
 func handleSessionsCmd(encoder *json.Encoder, cfg *Config) {
+	// Reload config from disk to pick up sessions created by hook processes
+	// (handleRemoteMessage runs as a separate CLI invocation and writes to disk)
+	freshCfg, err := loadConfig()
+	if err == nil {
+		cfg = freshCfg
+	}
+
 	var sessions []APISessionInfo
 
 	for name, info := range cfg.Sessions {
+		if info == nil {
+			continue
+		}
 		if info.Deleted {
 			continue
 		}
@@ -4562,16 +4572,14 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		}
 	}
 
-	// Find session matching fromHost and path
+	// Find session matching fromHost and path (exact match first, then subdirectory)
+	var subdirMatch string
+	var subdirInfo *SessionInfo
 	for name, info := range config.Sessions {
-		if info == nil {
+		if info == nil || info.Host != fromHost {
 			continue
 		}
-		// Check if this is a session from the specified host
-		if info.Host != fromHost {
-			continue
-		}
-		// Check if path matches (use resolved projectPath)
+		// Exact match
 		if info.Path == projectPath {
 			// Skip prompt messages that were just sent from Telegram (cooldown 10s)
 			if strings.HasPrefix(message, "💬") && wasTelegramSent(info.TopicID) {
@@ -4580,11 +4588,31 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 			}
 			logHook("Remote", "matched session=%s topic=%d, sending", name, info.TopicID)
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
-			// Store forwarded message in history (with dedup)
 			histFrom, histText := parseRemoteMessagePrefix(message)
 			appendHistoryDedup(info.TopicID, histFrom, histText)
 			return sendMessage(config, config.GroupID, info.TopicID, message)
 		}
+		// Subdirectory match: projectPath is under this session's path
+		if strings.HasPrefix(projectPath, info.Path+"/") {
+			// Pick the longest (most specific) parent path
+			if subdirInfo == nil || len(info.Path) > len(subdirInfo.Path) {
+				subdirMatch = name
+				subdirInfo = info
+			}
+		}
+	}
+
+	// Use subdirectory match if found (cwd is inside an existing session's project)
+	if subdirInfo != nil {
+		if strings.HasPrefix(message, "💬") && wasTelegramSent(subdirInfo.TopicID) {
+			logHook("Remote", "skipping prompt (telegram cooldown) session=%s topic=%d", subdirMatch, subdirInfo.TopicID)
+			return nil
+		}
+		logHook("Remote", "subdir match session=%s topic=%d (cwd=%s)", subdirMatch, subdirInfo.TopicID, projectPath)
+		fmt.Printf("[remote] from=%s session=%s (subdir match)\n", fromHost, subdirMatch)
+		histFrom, histText := parseRemoteMessagePrefix(message)
+		appendHistoryDedup(subdirInfo.TopicID, histFrom, histText)
+		return sendMessage(config, config.GroupID, subdirInfo.TopicID, message)
 	}
 
 	// No matching session found - auto-create topic (fallback for client-initiated sessions)
