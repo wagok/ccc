@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.12.2"
+const version = "1.12.3"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -446,6 +446,12 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			continue
 		}
 
+		// Reload config from disk to pick up sessions created by external
+		// processes (hook CLIs, handleRemoteMessage, etc.)
+		if freshCfg, err := loadConfig(); err == nil {
+			cfg = freshCfg
+		}
+
 		switch req.Cmd {
 		case "ping":
 			handlePingCmd(encoder, cfg)
@@ -496,13 +502,6 @@ func handlePingCmd(encoder *json.Encoder, cfg *Config) {
 
 // handleSessionsCmd handles the "sessions" command
 func handleSessionsCmd(encoder *json.Encoder, cfg *Config) {
-	// Reload config from disk to pick up sessions created by hook processes
-	// (handleRemoteMessage runs as a separate CLI invocation and writes to disk)
-	freshCfg, err := loadConfig()
-	if err == nil {
-		cfg = freshCfg
-	}
-
 	var sessions []APISessionInfo
 
 	for name, info := range cfg.Sessions {
@@ -4921,6 +4920,12 @@ func listen() error {
 	}()
 
 	for {
+		// Reload config from disk to pick up sessions created by external
+		// processes (hook CLIs, handleRemoteMessage, etc.)
+		if freshCfg, err := loadConfig(); err == nil {
+			config = freshCfg
+		}
+
 		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
