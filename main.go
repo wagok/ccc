@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.12.3"
+const version = "1.12.4"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2968,8 +2968,18 @@ func extractProjectDirFromTranscript(transcriptPath string) string {
 	return rest
 }
 
-// resolveProjectPathFromTranscript finds the actual project path by matching encoded transcript dir with cwd segments
-// Returns the project path if found, empty string otherwise
+// encodeProjectPath encodes a filesystem path the same way Claude Code does:
+// replaces both "/" and "_" with "-".
+func encodeProjectPath(path string) string {
+	s := strings.ReplaceAll(path, "/", "-")
+	s = strings.ReplaceAll(s, "_", "-")
+	return s
+}
+
+// resolveProjectPathFromTranscript finds the actual project path by matching
+// encoded transcript dir against progressively longer prefixes of cwd.
+// Claude Code encodes project paths by replacing "/" and "_" with "-".
+// Returns the project path if found, empty string otherwise.
 func resolveProjectPathFromTranscript(encodedProjectDir string, cwd string) string {
 	if encodedProjectDir == "" || cwd == "" {
 		return ""
@@ -2981,10 +2991,8 @@ func resolveProjectPathFromTranscript(encodedProjectDir string, cwd string) stri
 		cwd = home + cwd[1:]
 	}
 
-	// Split into segments
+	// Split into segments and build path incrementally
 	segments := strings.Split(cwd, "/")
-
-	// Build path incrementally and check for match
 	currentPath := ""
 	for _, segment := range segments {
 		if segment == "" {
@@ -2992,10 +3000,7 @@ func resolveProjectPathFromTranscript(encodedProjectDir string, cwd string) stri
 		}
 		currentPath += "/" + segment
 
-		// Encode current path the same way Claude does: replace / with -
-		encoded := strings.ReplaceAll(currentPath, "/", "-")
-
-		if encoded == encodedProjectDir {
+		if encodeProjectPath(currentPath) == encodedProjectDir {
 			return currentPath
 		}
 	}
