@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.12.4"
+const version = "1.12.5"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -203,6 +203,31 @@ var serverStartTime time.Time
 var lockFile *os.File    // kept open to hold flock
 var activeCaptures sync.Map // key: session name, prevents concurrent response captures
 var updateInProgress int32  // atomic flag to prevent concurrent /update
+
+// processedMessages deduplicates Telegram updates in forum groups.
+// Telegram can send two updates with different update_id but the same message_id
+// for a single message in a forum topic. We track recently processed message IDs
+// to avoid handling the same message twice (e.g. double transcription of voice).
+var processedMessages struct {
+	sync.Mutex
+	ids [64]int // ring buffer of recent message IDs
+	pos int
+}
+
+// isMessageProcessed returns true if this message_id was already processed.
+// If not, it records the ID and returns false.
+func isMessageProcessed(messageID int) bool {
+	processedMessages.Lock()
+	defer processedMessages.Unlock()
+	for _, id := range processedMessages.ids {
+		if id == messageID && id != 0 {
+			return true
+		}
+	}
+	processedMessages.ids[processedMessages.pos] = messageID
+	processedMessages.pos = (processedMessages.pos + 1) % len(processedMessages.ids)
+	return false
+}
 
 // Global message ID counter (in-memory, initialized from history on start)
 var (
@@ -5057,6 +5082,12 @@ func listen() error {
 
 			// Only accept from authorized user
 			if msg.From.ID != config.ChatID {
+				continue
+			}
+
+			// Deduplicate: Telegram forum groups can send two updates with
+			// different update_id but the same message_id for a single message.
+			if isMessageProcessed(msg.MessageID) {
 				continue
 			}
 
