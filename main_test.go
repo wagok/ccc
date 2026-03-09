@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestSessionName tests the sessionName function
-func TestSessionName(t *testing.T) {
+// TestTmuxSessionName tests the tmuxSessionName function
+func TestTmuxSessionName(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
@@ -23,9 +23,9 @@ func TestSessionName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := sessionName(tt.input)
+			result := tmuxSessionName(tt.input)
 			if result != tt.expected {
-				t.Errorf("sessionName(%q) = %q, want %q", tt.input, result, tt.expected)
+				t.Errorf("tmuxSessionName(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
 	}

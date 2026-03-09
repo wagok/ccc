@@ -22,6 +22,13 @@ type HostInfo struct {
 	ProjectsDir string `json:"projects_dir,omitempty"` // Base directory for projects on this host
 }
 
+// WebhookConfig stores configuration for an outgoing webhook
+type WebhookConfig struct {
+	URL    string   `json:"url"`
+	Token  string   `json:"token,omitempty"`
+	Events []string `json:"events"`
+}
+
 // Config stores bot configuration and session mappings
 type Config struct {
 	BotToken         string                  `json:"bot_token"`
@@ -39,6 +46,9 @@ type Config struct {
 	Mode     string `json:"mode,omitempty"`      // "client" or "" (server/standalone)
 	Server   string `json:"server,omitempty"`    // SSH target for server (client mode)
 	HostName string `json:"host_name,omitempty"` // This machine's identifier
+
+	// Outgoing webhooks
+	Webhooks []WebhookConfig `json:"webhooks,omitempty"`
 }
 
 // Path returns the config file path (~/.ccc.json)

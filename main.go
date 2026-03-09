@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.12.5"
+const version = "1.13.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -235,6 +235,98 @@ var (
 	messageIDMutex   sync.Mutex
 )
 
+// Webhook configuration (set when config is loaded)
+var (
+	webhookMu  sync.RWMutex
+	webhookCfg *Config
+)
+var webhookClient = &http.Client{Timeout: 5 * time.Second}
+
+func setWebhookConfig(cfg *Config) {
+	webhookMu.Lock()
+	webhookCfg = cfg
+	webhookMu.Unlock()
+}
+
+func getWebhookConfig() *Config {
+	webhookMu.RLock()
+	defer webhookMu.RUnlock()
+	return webhookCfg
+}
+
+// WebhookPayload is the JSON body sent to webhook endpoints
+type WebhookPayload struct {
+	Event     string `json:"event"`
+	Session   string `json:"session"`
+	From      string `json:"from"`
+	Timestamp string `json:"timestamp"`
+	MessageID int64  `json:"messageId"`
+	Preview   string `json:"preview"`
+}
+
+// dispatchWebhooks sends a POST to each configured webhook that subscribes to "message" events
+func dispatchWebhooks(webhooks []config.WebhookConfig, sessionName string, msg HistoryMessage) {
+	preview := msg.Text
+	if preview == "" {
+		preview = msg.Transcription
+	}
+	if preview == "" {
+		preview = msg.Caption
+	}
+	if preview == "" && msg.Type != "" {
+		preview = "[" + msg.Type + "]"
+	}
+	if len(preview) > 200 {
+		preview = preview[:200]
+	}
+
+	payload := WebhookPayload{
+		Event:     "message",
+		Session:   sessionName,
+		From:      msg.From,
+		Timestamp: time.Unix(msg.Timestamp, 0).UTC().Format(time.RFC3339),
+		MessageID: msg.ID,
+		Preview:   preview,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	for _, wh := range webhooks {
+		hasMessageEvent := false
+		for _, ev := range wh.Events {
+			if ev == "message" {
+				hasMessageEvent = true
+				break
+			}
+		}
+		if !hasMessageEvent {
+			continue
+		}
+
+		req, err := http.NewRequest("POST", wh.URL, bytes.NewReader(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "webhook: bad request for %s: %v\n", wh.URL, err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if wh.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+wh.Token)
+		}
+
+		resp, err := webhookClient.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "webhook: POST %s failed: %v\n", wh.URL, err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			fmt.Fprintf(os.Stderr, "webhook: POST %s returned %d\n", wh.URL, resp.StatusCode)
+		}
+	}
+}
+
 // pendingQuestions stores AskUserQuestion questions awaiting answers.
 // Key: session name, Value: *PendingQuestionSet
 var pendingQuestions sync.Map
@@ -341,7 +433,17 @@ func appendHistory(topicID int64, msg HistoryMessage) error {
 	}
 	defer f.Close()
 
-	return json.NewEncoder(f).Encode(msg)
+	if err := json.NewEncoder(f).Encode(msg); err != nil {
+		return err
+	}
+
+	// Fire webhooks asynchronously
+	if cfg := getWebhookConfig(); cfg != nil && len(cfg.Webhooks) > 0 {
+		sessionName := getSessionByTopic(cfg, topicID)
+		go dispatchWebhooks(cfg.Webhooks, sessionName, msg)
+	}
+
+	return nil
 }
 
 // readHistory reads messages from history files
@@ -4584,6 +4686,7 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		logHook("Remote", "ERROR: not configured: %v", err)
 		return fmt.Errorf("not configured: %v", err)
 	}
+	setWebhookConfig(config)
 
 	// cwd is passed from remote client via --cwd flag
 	if cwd == "" {
@@ -4921,6 +5024,7 @@ func listen() error {
 	if err != nil {
 		return fmt.Errorf("not configured. Run: ccc setup <bot_token>")
 	}
+	setWebhookConfig(config)
 
 	fmt.Printf("Bot listening... (chat: %d, group: %d)\n", config.ChatID, config.GroupID)
 	fmt.Printf("Active sessions: %d\n", len(config.Sessions))
@@ -4954,6 +5058,7 @@ func listen() error {
 		// processes (hook CLIs, handleRemoteMessage, etc.)
 		if freshCfg, err := loadConfig(); err == nil {
 			config = freshCfg
+			setWebhookConfig(config)
 		}
 
 		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", config.BotToken, offset)
