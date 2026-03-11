@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.13.0"
+const version = "1.13.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -4680,6 +4680,9 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		logMsg = logMsg[:100] + "..."
 	}
 	logHook("Remote", "from=%s cwd=%s project=%s msg=%s", fromHost, cwd, encodedProjectDir, logMsg)
+
+	// Initialize message ID counter from history (CLI subprocess doesn't run listen())
+	initMessageIDCounter()
 
 	config, err := loadConfig()
 	if err != nil {
