@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.13.1"
+const version = "1.13.2"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -4080,14 +4080,7 @@ func handleUpdateCmd(cfg *Config, chatID int64, threadID int64) {
 
 	sendMessage(cfg, chatID, threadID, fmt.Sprintf("✅ Updated!\n```\n%s\n```\n🔄 Restarting...", pullText))
 
-	// Step 6: Restart (same as /restart)
-	cmd := exec.Command(exePath, "listen")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		sendMessage(cfg, chatID, threadID, fmt.Sprintf("❌ Failed to restart: %v\nBinary updated but not restarted.", err))
-		return
-	}
+	// Step 6: Exit and let systemd restart the service with the new binary
 	os.Exit(0)
 }
 
@@ -5448,18 +5441,13 @@ func listen() error {
 
 			if text == "/restart" {
 				sendMessage(config, chatID, threadID, "🔄 Restarting...")
-				exe, err := os.Executable()
-				if err != nil {
-					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed: %v", err))
-					continue
+				// Commit the offset to Telegram so the /restart message is not re-delivered
+				// to the next process instance (prevents restart loop)
+				commitURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=1", config.BotToken, offset)
+				if commitResp, err := client.Get(commitURL); err == nil {
+					commitResp.Body.Close()
 				}
-				cmd := exec.Command(exe, "listen")
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-				if err := cmd.Start(); err != nil {
-					sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
-					continue
-				}
+				// Just exit — systemd will restart the service
 				os.Exit(0)
 			}
 
