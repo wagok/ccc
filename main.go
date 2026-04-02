@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.13.2"
+const version = "1.13.3"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -5262,6 +5262,8 @@ func listen() error {
 									Transcription: transcription,
 									Username:      msg.From.Username,
 								})
+								// Mark as sent to suppress prompt hook echo
+								markTelegramSent(threadID)
 								// Start typing indicator and send to appropriate tmux
 								startContinuousTyping(config, chatID, threadID, sessionName)
 								if hostName != "" {
