@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.15.0"
+const version = "1.15.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2129,6 +2129,42 @@ func runSSH(address string, command string, timeout time.Duration) (string, erro
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// runSSHWithInput is runSSH but feeds `input` to the remote command's stdin.
+// Used to pass large payloads (e.g. a letter body) without embedding them in the
+// command line, which would hit the shell/tmux "too long" limits.
+func runSSHWithInput(address string, command string, input string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	wrappedCmd := fmt.Sprintf("bash -i -l -c %s", shellQuote(command))
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
+		address,
+		wrappedCmd,
+	)
+	cmd.Stdin = strings.NewReader(input)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("timeout after %v", timeout)
+	}
+	if err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return "", fmt.Errorf("%s: %s", err, errMsg)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 // scpToHost copies a file to a remote host via scp
 func scpToHost(address string, localPath string, remotePath string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -2247,13 +2283,26 @@ func sshTmuxSendKeys(address string, sessionName string, text string) error {
 	// Encode text as Base64 to avoid escaping issues
 	encoded := base64.StdEncoding.EncodeToString([]byte(text))
 
-	// Decode on remote and send to tmux
-	cmd := fmt.Sprintf(
-		"echo %s | base64 -d | xargs -0 tmux send-keys -t %s -l",
-		encoded, shellQuote(sessionName),
-	)
-	if _, err := runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second); err != nil {
-		return err
+	if len(text) <= tmuxLiteralLimit {
+		// Small text: decode inline and type it literally (proven path).
+		cmd := fmt.Sprintf(
+			"echo %s | base64 -d | xargs -0 tmux send-keys -t %s -l",
+			encoded, shellQuote(sessionName),
+		)
+		if _, err := runSSH(address, cmd, time.Duration(sshCommandTimeout)*time.Second); err != nil {
+			return err
+		}
+	} else {
+		// Large text: pipe base64 via stdin (no command-length limit), decode
+		// into a tmux buffer (no send-keys "command too long" limit), and paste.
+		buf := mailBufName()
+		cmd := fmt.Sprintf(
+			"base64 -d | tmux load-buffer -b %s - && tmux paste-buffer -b %s -t %s -d",
+			shellQuote(buf), shellQuote(buf), shellQuote(sessionName),
+		)
+		if _, err := runSSHWithInput(address, cmd, encoded, time.Duration(sshCommandTimeout)*time.Second); err != nil {
+			return err
+		}
 	}
 
 	// Always wait 2 seconds before Enter to ensure text is fully processed
@@ -2767,6 +2816,33 @@ func startSession(continueSession bool) error {
 	return cmd.Run()
 }
 
+// tmuxLiteralLimit is the largest text we pass to `tmux send-keys -l <arg>`.
+// Above it tmux returns "command too long", so we inject via a tmux buffer
+// (load-buffer reads stdin — no length limit) and paste it into the pane.
+const tmuxLiteralLimit = 16000
+
+var mailBufSeq int64
+
+func mailBufName() string {
+	return fmt.Sprintf("ccc-%d-%d", time.Now().UnixNano(), atomic.AddInt64(&mailBufSeq, 1))
+}
+
+// tmuxInjectLocal injects text into a local tmux pane. Small text uses
+// send-keys -l (the proven path); large text is pasted via a one-shot buffer so
+// it does not hit tmux's per-argument "command too long" limit.
+func tmuxInjectLocal(session, text string) error {
+	if len(text) <= tmuxLiteralLimit {
+		return tmuxCmd("send-keys", "-t", session, "-l", text).Run()
+	}
+	buf := mailBufName()
+	lc := tmuxCmd("load-buffer", "-b", buf, "-")
+	lc.Stdin = strings.NewReader(text)
+	if err := lc.Run(); err != nil {
+		return fmt.Errorf("tmux load-buffer: %w", err)
+	}
+	return tmuxCmd("paste-buffer", "-b", buf, "-t", session, "-d").Run()
+}
+
 func sendToTmux(session string, text string) error {
 	// Always use 2 second delay before Enter to ensure text is fully processed
 	// Without this delay, Enter may be interpreted as newline instead of submit
@@ -2774,9 +2850,8 @@ func sendToTmux(session string, text string) error {
 }
 
 func sendToTmuxWithDelay(session string, text string, delay time.Duration) error {
-	// Send text literally
-	cmd := tmuxCmd( "send-keys", "-t", session, "-l", text)
-	if err := cmd.Run(); err != nil {
+	// Inject text (buffer-paste for very large text send-keys -l cannot handle)
+	if err := tmuxInjectLocal(session, text); err != nil {
 		return err
 	}
 
@@ -2784,12 +2859,12 @@ func sendToTmuxWithDelay(session string, text string, delay time.Duration) error
 	time.Sleep(delay)
 
 	// Send Enter twice (Claude Code needs double Enter)
-	cmd = tmuxCmd( "send-keys", "-t", session, "C-m")
+	cmd := tmuxCmd("send-keys", "-t", session, "C-m")
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 	time.Sleep(50 * time.Millisecond)
-	cmd = tmuxCmd( "send-keys", "-t", session, "C-m")
+	cmd = tmuxCmd("send-keys", "-t", session, "C-m")
 	return cmd.Run()
 }
 
