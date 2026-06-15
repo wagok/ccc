@@ -153,6 +153,27 @@ func Deliver(agent string, letter Letter) (string, error) {
 	return fileName, nil
 }
 
+// ReadLetter loads a letter by ticket from an agent's inbox, falling back to its
+// archive. Lets CCC forward the stored original body byte-for-byte instead of
+// having the secretary reproduce it. ok is false if the ticket is not found.
+func ReadLetter(agent, ticket string) (Letter, bool, error) {
+	for _, dir := range []string{InboxDir(agent), ArchiveDir(agent)} {
+		data, err := os.ReadFile(filepath.Join(dir, ticket+".json"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return Letter{}, false, err
+		}
+		var l Letter
+		if err := json.Unmarshal(data, &l); err != nil {
+			return Letter{}, false, fmt.Errorf("read letter %s: %w", ticket, err)
+		}
+		return l, true, nil
+	}
+	return Letter{}, false, nil
+}
+
 // LogEvent appends an arbitrary mailbox event to an agent's journal — used for
 // delivery-state tracking (delivered/delivery_failed/acked/replied/timeout).
 // CCC only ever appends; the owning agent folds and archives the journal.

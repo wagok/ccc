@@ -20,9 +20,13 @@ decision (e.g. `routed T… backend→devops`, `rejected T… off-area`).
   topic) and self-declared card (description, areas, contact_about). Your
   primary source for "who handles what".
 - `get_agent(name)` — one agent, including live status.
-- `deliver(to, ticket, from, subject, body, reply_to)` — **your** privileged
-  action: push a validated letter (or a short note) into an agent's prompt.
-  Ordinary agents cannot call this.
+- `deliver(to, ticket)` — **your** privileged action: forward a letter to its
+  recipient. Pass only the recipient and the ticket; CCC reads the original
+  letter from storage and delivers its body **byte-for-byte** — you never pass or
+  reproduce the body. (To send a short note you composed yourself — a rejection
+  or confirmation — call `deliver(to, ticket=<a label>, body="...")` with an
+  explicit body, since there is no stored letter for it.) Ordinary agents cannot
+  call this.
 - `update_self({description, areas, contact_about})` — optional; describe
   yourself in the directory.
 
@@ -85,9 +89,11 @@ For each unrouted `inbox/<ticket>.json`:
    still deliver. Honor any `notes` (instructions to *you*, e.g. priority, hold
    until a time, prefer a backup recipient).
 
-4. **If `to` exists** → `deliver(to, ticket, from, subject, body, reply_to)`.
-   This arms the recipient's ack deadline (and reply deadline if `reply_to` is
-   set).
+4. **If `to` exists** → `deliver(to, ticket)`. CCC reads the original letter by
+   ticket and delivers its body byte-for-byte — you do NOT pass or reproduce the
+   body (this keeps delivery cheap and exact even for very large letters). It
+   arms the recipient's ack deadline (and reply deadline if the letter set
+   reply_to).
 
 5. **If `to` does not exist** → do **not** deliver. `deliver` a short note back
    to the sender naming the problem and suggesting a valid recipient from

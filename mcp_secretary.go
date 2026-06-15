@@ -415,7 +415,20 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 
-	text := renderRecipientLetter(p.From, p.Subject, p.Body, p.ReplyTo, p.Ticket)
+	// Load the stored original by ticket so CCC forwards the body byte-for-byte;
+	// the secretary need not reproduce it. Any payload field overrides the stored
+	// one (back-compat with the old contract, and lets the secretary annotate).
+	letter, found, _ := mail.ReadLetter(mail.SecretaryAgent, p.Ticket)
+	from := pick(p.From, letter.From)
+	subject := pick(p.Subject, letter.Subject)
+	body := pick(p.Body, letter.Body)
+	replyTo := pick(p.ReplyTo, letter.ReplyTo)
+	if body == "" && !found {
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: ticket " + p.Ticket + " not found in mailbox and no body provided"})
+		return
+	}
+
+	text := renderRecipientLetter(from, subject, body, replyTo, p.Ticket)
 	err := wakeAgent(cfg, p.To, text)
 
 	event, detail := "delivered", ""
@@ -423,15 +436,24 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		event, detail = "delivery_failed", err.Error()
 	}
 	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{
-		Ticket: p.Ticket, Event: event, To: p.To, From: p.From, Subject: p.Subject, ReplyTo: p.ReplyTo, Detail: detail,
+		Ticket: p.Ticket, Event: event, To: p.To, From: from, Subject: subject, ReplyTo: replyTo, Detail: detail,
 	})
 	if err != nil {
 		encoder.Encode(APIResponse{OK: false, Error: "deliver: " + err.Error()})
 		return
 	}
 	// Delivery confirmed at the tmux level — arm the ack (and reply) deadlines.
-	armDeliveryTimers(p.Ticket, p.ReplyTo)
+	armDeliveryTimers(p.Ticket, replyTo)
 	encoder.Encode(APIResponse{OK: true})
+}
+
+// pick returns a if non-empty, else b. Used to let an explicit payload field
+// override a value loaded from the stored letter.
+func pick(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // handleMailAckCmd handles "mail.ack": a recipient confirms it saw a letter.
@@ -687,9 +709,9 @@ func secretaryTools() []map[string]interface{} {
 		},
 		{
 			"name":        "deliver",
-			"description": "SECRETARY ONLY. Forward a validated letter to its real recipient: the full letter is injected into the recipient's prompt. Fields: to, ticket, from, subject, body, reply_to.",
+			"description": "SECRETARY ONLY. Forward a letter to its recipient. Pass just `to` (recipient) and `ticket` — CCC reads the original letter from storage by ticket and delivers its body BYTE-FOR-BYTE. You do NOT pass or reproduce the body. (`body` is an optional override for the rare case you need to annotate.)",
 			"inputSchema": obj(map[string]interface{}{
-				"to": str, "ticket": str, "from": str, "subject": str, "body": str, "reply_to": str,
+				"to": str, "ticket": str, "body": str,
 			}, "to", "ticket"),
 		},
 		{

@@ -375,8 +375,9 @@ func TestMailDeliverUnknownRecipientLogsFailure(t *testing.T) {
 		"secretary": {Path: filepath.Join(home, "secretary")},
 	})
 	// Recipient "ghost" has no session -> wakeAgent fails before any tmux call.
+	// (body provided inline, exercising the override / old-contract path.)
 	enc.Encode(APIRequest{Cmd: "mail.deliver", Cwd: filepath.Join(home, "secretary"),
-		Payload: json.RawMessage(`{"to":"ghost","ticket":"T9","from":"backend","subject":"x"}`)})
+		Payload: json.RawMessage(`{"to":"ghost","ticket":"T9","from":"backend","subject":"x","body":"hi"}`)})
 	var r APIResponse
 	dec.Decode(&r)
 	if r.OK {
@@ -384,6 +385,45 @@ func TestMailDeliverUnknownRecipientLogsFailure(t *testing.T) {
 	}
 	if e := journalHas(readSecretaryJournal(t), "T9", "delivery_failed"); e == nil {
 		t.Fatalf("delivery_failed not journaled: %+v", readSecretaryJournal(t))
+	}
+}
+
+// TestMailDeliverByTicketLoadsStoredBody: deliver with only to+ticket pulls the
+// original from/subject/body from the stored letter (secretary doesn't reproduce
+// the body). Verified via the journal fields, which come from the loaded letter.
+func TestMailDeliverByTicketLoadsStoredBody(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Store a letter in the secretary's inbox (as a normal send would).
+	stored := mail.Letter{Ticket: "T42", From: "backend", To: "ghost", Subject: "real subject", Body: "real body bytes"}
+	if _, err := mail.Deliver(mail.SecretaryAgent, stored); err != nil {
+		t.Fatal(err)
+	}
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"secretary": {Path: filepath.Join(home, "secretary")},
+	})
+	// Minimal deliver: only to + ticket, NO body/from/subject.
+	enc.Encode(APIRequest{Cmd: "mail.deliver", Cwd: filepath.Join(home, "secretary"),
+		Payload: json.RawMessage(`{"to":"ghost","ticket":"T42"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	// ghost has no session so delivery fails — but the event must carry the
+	// from/subject LOADED from the stored letter, proving deliver-by-ticket.
+	e := journalHas(readSecretaryJournal(t), "T42", "delivery_failed")
+	if e == nil {
+		t.Fatalf("no delivery_failed for T42: %+v", readSecretaryJournal(t))
+	}
+	if e.From != "backend" || e.Subject != "real subject" {
+		t.Fatalf("deliver did not load stored letter fields: %+v", e)
+	}
+
+	// A deliver for an unknown ticket with no body is rejected outright.
+	enc.Encode(APIRequest{Cmd: "mail.deliver", Cwd: filepath.Join(home, "secretary"),
+		Payload: json.RawMessage(`{"to":"ghost","ticket":"NOPE"}`)})
+	var r2 APIResponse
+	dec.Decode(&r2)
+	if r2.OK || !strings.Contains(r2.Error, "not found") {
+		t.Fatalf("expected not-found rejection, got OK=%v err=%q", r2.OK, r2.Error)
 	}
 }
 
