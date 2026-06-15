@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +95,46 @@ func TestSecretaryEnabledMarker(t *testing.T) {
 	// Disabling again is a no-op, not an error.
 	if err := setSecretaryEnabled(false); err != nil {
 		t.Fatalf("double-disable: %v", err)
+	}
+}
+
+func TestEnsureSecretaryTrusted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	claudeJSON := filepath.Join(home, ".claude.json")
+	// Pre-existing config with a large integer that must NOT become a float.
+	if err := os.WriteFile(claudeJSON,
+		[]byte(`{"numStartups":42,"projects":{"/other":{"hasTrustDialogAccepted":true,"projectOnboardingSeenCount":1700000000}}}`),
+		0644); err != nil {
+		t.Fatal(err)
+	}
+	dir := mail.MailboxDir(mail.SecretaryAgent)
+
+	if err := ensureSecretaryTrusted(dir); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(claudeJSON)
+	// Integers preserved exactly (no 1.7e+09 / float mangling).
+	if !strings.Contains(string(raw), "1700000000") || !strings.Contains(string(raw), "\"numStartups\": 42") {
+		t.Fatalf("integers mangled: %s", raw)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("result not valid JSON: %v", err)
+	}
+	projects := root["projects"].(map[string]any)
+	// Our entry added, the other project preserved.
+	if projects["/other"] == nil {
+		t.Fatal("existing project entry was dropped")
+	}
+	entry, ok := projects[dir].(map[string]any)
+	if !ok || entry["hasTrustDialogAccepted"] != true {
+		t.Fatalf("secretary folder not marked trusted: %+v", projects[dir])
+	}
+
+	// Idempotent: a second call must not error and leaves it trusted.
+	if err := ensureSecretaryTrusted(dir); err != nil {
+		t.Fatal(err)
 	}
 }
 

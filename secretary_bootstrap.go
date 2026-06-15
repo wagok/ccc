@@ -9,7 +9,9 @@ package main
 // startup; `ccc secretary start` triggers the first launch.
 
 import (
+	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -81,7 +83,7 @@ func watchSecretary() {
 		}
 		secretaryRestarts++
 		fmt.Fprintf(os.Stderr, "watchdog: secretary down, restarting (attempt %d)\n", secretaryRestarts)
-		if err := createTmuxSession(tmux, info.Path, true); err != nil {
+		if err := launchSecretary(cfg, info); err != nil {
 			fmt.Fprintf(os.Stderr, "watchdog: restart failed: %v\n", err)
 			continue
 		}
@@ -148,10 +150,75 @@ func bootstrapSecretary(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	// Pre-accept the folder-trust dialog so the autonomous secretary never
+	// blocks on it (skip-permissions does NOT cover folder trust). Best-effort.
+	if err := ensureSecretaryTrusted(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not pre-accept secretary folder trust: %v\n", err)
+	}
 	if _, err := getOrCreateTopic(cfg, mail.SecretaryAgent, dir, ""); err != nil {
 		return fmt.Errorf("secretary topic: %w", err)
 	}
 	return nil
+}
+
+// ensureSecretaryTrusted sets projects[dir].hasTrustDialogAccepted=true in
+// ~/.claude.json so Claude Code does not show the trust prompt for the
+// secretary's folder (which --dangerously-skip-permissions does not suppress).
+// Idempotent (no write if already set). Uses UseNumber + full preserve so the
+// rest of the user's claude config is kept byte-faithful; atomic rename.
+func ensureSecretaryTrusted(dir string) error {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".claude.json")
+
+	root := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber() // keep integers exact, do not turn them into floats
+		if err := dec.Decode(&root); err != nil {
+			return fmt.Errorf("parse ~/.claude.json: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	projects, ok := root["projects"].(map[string]interface{})
+	if !ok || projects == nil {
+		projects = map[string]interface{}{}
+		root["projects"] = projects
+	}
+	entry, ok := projects[dir].(map[string]interface{})
+	if !ok || entry == nil {
+		entry = map[string]interface{}{}
+		projects[dir] = entry
+	}
+	if trusted, _ := entry["hasTrustDialogAccepted"].(bool); trusted {
+		return nil // already trusted — no write
+	}
+	entry["hasTrustDialogAccepted"] = true
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".ccc.tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// launchSecretary starts a FRESH secretary session (no -c). The secretary's
+// durable state is its files (inbox/journal), so it reconciles on start and
+// needs no claude conversation continuity — which also avoids the "No
+// conversation found to continue" failure of a first launch. A stale/dead
+// session is killed first.
+func launchSecretary(cfg *Config, info *SessionInfo) error {
+	tmux := tmuxSessionName(mail.SecretaryAgent)
+	if tmuxSessionExists(tmux) {
+		tmuxCmd("kill-session", "-t", tmux).Run()
+		time.Sleep(300 * time.Millisecond)
+	}
+	return createTmuxSession(tmux, info.Path, false)
 }
 
 // secretaryCommand implements `ccc secretary [start|status]`.
@@ -182,8 +249,13 @@ func secretaryCommand(args []string) error {
 			return err
 		}
 		secretaryRestarts = 0
-		if msg := ensureSessionRunning(cfg, mail.SecretaryAgent, info); msg != "" {
-			return fmt.Errorf("start failed: %s", msg)
+		tmux := tmuxSessionName(mail.SecretaryAgent)
+		if isClaudeRunning(tmux, "") {
+			fmt.Printf("Secretary already running — topic %d.\n", info.TopicID)
+			return nil
+		}
+		if err := launchSecretary(cfg, info); err != nil {
+			return fmt.Errorf("start failed: %w", err)
 		}
 		fmt.Printf("✅ Secretary started (supervised) — topic %d, dir %s\n", info.TopicID, info.Path)
 		return nil

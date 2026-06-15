@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.14.0"
+const version = "1.14.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
