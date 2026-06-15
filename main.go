@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.13.3"
+const version = "1.14.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -139,6 +139,8 @@ type APIRequest struct {
 	Sessions      []string `json:"sessions,omitempty"`       // for subscribe: session list
 	QuestionIndex int      `json:"question_index,omitempty"` // for answer: which question (0-based)
 	OptionIndex   int      `json:"option_index,omitempty"`   // for answer: which option (0-based)
+	Cwd           string   `json:"cwd,omitempty"`            // caller working dir (mcp-secretary: trusted identity source)
+	Payload       json.RawMessage `json:"payload,omitempty"`  // command-specific args (mail/agent commands)
 }
 
 // APIResponse represents a response on the Unix socket
@@ -155,6 +157,7 @@ type APIResponse struct {
 	UptimeSeconds  int64               `json:"uptime_seconds,omitempty"`
 	SessionsActive int                 `json:"sessions_active,omitempty"`
 	Questions      *PendingQuestionSet `json:"questions,omitempty"`
+	Result         json.RawMessage     `json:"result,omitempty"` // command-specific result (mail/agent commands)
 }
 
 // ActivityInfo represents last message summary for a session
@@ -603,6 +606,12 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 		case "subscribe":
 			handleSubscribeCmd(conn, encoder, cfg, req)
 			return // Subscribe keeps connection open until done
+		case "agent.list":
+			handleAgentListCmd(encoder, cfg)
+		case "agent.get":
+			handleAgentGetCmd(encoder, cfg, req)
+		case "agent.update_self":
+			handleAgentUpdateSelfCmd(encoder, cfg, req)
 		default:
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
@@ -6193,6 +6202,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+
+	case "mcp-secretary":
+		// Stateless MCP (JSON-RPC over stdio) server registered in each agent's
+		// .mcp.json; translates tool calls into Unix-socket requests to the
+		// running CCC server. See mcp_secretary.go.
+		if err := mcpSecretary(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 
 	case "doctor":
 		doctor()
