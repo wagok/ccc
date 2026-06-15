@@ -37,16 +37,20 @@ type Letter struct {
 }
 
 // JournalEntry is an append-only record of a mailbox event. The secretary reads
-// the journal to decide what to act on and rewrites/archives it itself.
+// the journal to fold per-ticket state and rewrites/archives it itself. Events:
+// received, delivered, delivery_failed, acked, replied, timeout.
 type JournalEntry struct {
 	Ticket    string `json:"ticket"`
-	Event     string `json:"event"` // "received"
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Subject   string `json:"subject"`
+	Event     string `json:"event"`
+	From      string `json:"from,omitempty"`
+	To        string `json:"to,omitempty"`
+	Subject   string `json:"subject,omitempty"`
 	ReplyTo   string `json:"reply_to,omitempty"`
 	InReplyTo string `json:"in_reply_to,omitempty"`
-	File      string `json:"file"` // inbox filename for the letter
+	By        string `json:"by,omitempty"`     // acting agent (e.g. who acked/replied)
+	Stage     string `json:"stage,omitempty"`  // for timeout events: tmux/ack/reply
+	Detail    string `json:"detail,omitempty"` // freeform note (error text, "via <ticket>", ...)
+	File      string `json:"file,omitempty"`   // inbox filename for the letter (received only)
 	Timestamp int64  `json:"ts"`
 }
 
@@ -147,6 +151,16 @@ func Deliver(agent string, letter Letter) (string, error) {
 	}
 
 	return fileName, nil
+}
+
+// LogEvent appends an arbitrary mailbox event to an agent's journal — used for
+// delivery-state tracking (delivered/delivery_failed/acked/replied/timeout).
+// CCC only ever appends; the owning agent folds and archives the journal.
+func LogEvent(agent string, e JournalEntry) error {
+	if e.Timestamp == 0 {
+		e.Timestamp = time.Now().Unix()
+	}
+	return appendJournal(agent, e)
 }
 
 // appendJournal appends one newline-delimited JSON entry to the agent's

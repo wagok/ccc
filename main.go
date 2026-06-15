@@ -614,6 +614,10 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleAgentUpdateSelfCmd(encoder, cfg, req)
 		case "mail.send":
 			handleMailSendCmd(encoder, cfg, req)
+		case "mail.deliver":
+			handleMailDeliverCmd(encoder, cfg, req)
+		case "mail.ack":
+			handleMailAckCmd(encoder, cfg, req)
 		default:
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
@@ -5043,6 +5047,11 @@ func listen() error {
 	// Start Unix socket API server
 	if err := startSocketServer(config); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start API socket: %v\n", err)
+	}
+
+	// Start the inter-agent mail delivery-deadline engine (smart secretary).
+	if err := initMailScheduler(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to start mail scheduler: %v\n", err)
 	}
 
 	setBotCommands(config.BotToken)

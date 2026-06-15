@@ -5,10 +5,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kidandcat/ccc/internal/mail"
 	"github.com/kidandcat/ccc/internal/registry"
+	"github.com/kidandcat/ccc/internal/scheduler"
 )
 
 func rpc(method, params string, id string) rpcRequest {
@@ -277,5 +279,211 @@ func TestMailSendStoresInSecretaryInbox(t *testing.T) {
 	if letter.From != "backend" || letter.To != "devops" || letter.Subject != "deploy v2" ||
 		letter.ReplyTo != "backend" || !letter.NeedsConfirmation || letter.Ticket != res["ticket"] {
 		t.Fatalf("stored letter wrong: %+v", letter)
+	}
+}
+
+// readSecretaryJournal returns the secretary's journal entries.
+func readSecretaryJournal(t *testing.T) []mail.JournalEntry {
+	t.Helper()
+	data, err := os.ReadFile(mail.JournalPath(mail.SecretaryAgent))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	var out []mail.JournalEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e mail.JournalEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("bad journal line %q: %v", line, err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func journalHas(entries []mail.JournalEntry, ticket, event string) *mail.JournalEntry {
+	for i := range entries {
+		if entries[i].Ticket == ticket && entries[i].Event == event {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// mailTestServer wires a net.Pipe to handleSocketConnection with the given
+// sessions persisted to disk, and returns an encoder/decoder pair.
+func mailTestServer(t *testing.T, sessions map[string]*SessionInfo) (*json.Encoder, *json.Decoder) {
+	t.Helper()
+	cfg := &Config{Sessions: sessions}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cli, srv := net.Pipe()
+	go handleSocketConnection(srv, cfg)
+	t.Cleanup(func() { cli.Close() })
+	return json.NewEncoder(cli), json.NewDecoder(cli)
+}
+
+func TestMailDeliverSecretaryOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"backend":   {Path: filepath.Join(home, "backend")},
+		"secretary": {Path: filepath.Join(home, "secretary")},
+	})
+	// A non-secretary caller cannot deliver.
+	enc.Encode(APIRequest{Cmd: "mail.deliver", Cwd: filepath.Join(home, "backend"),
+		Payload: json.RawMessage(`{"to":"devops","ticket":"T1"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	if r.OK || !strings.Contains(r.Error, "secretary-only") {
+		t.Fatalf("expected secretary-only rejection, got OK=%v err=%q", r.OK, r.Error)
+	}
+}
+
+func TestMailDeliverUnknownRecipientLogsFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"secretary": {Path: filepath.Join(home, "secretary")},
+	})
+	// Recipient "ghost" has no session -> wakeAgent fails before any tmux call.
+	enc.Encode(APIRequest{Cmd: "mail.deliver", Cwd: filepath.Join(home, "secretary"),
+		Payload: json.RawMessage(`{"to":"ghost","ticket":"T9","from":"backend","subject":"x"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	if r.OK {
+		t.Fatal("deliver to unknown recipient must fail")
+	}
+	if e := journalHas(readSecretaryJournal(t), "T9", "delivery_failed"); e == nil {
+		t.Fatalf("delivery_failed not journaled: %+v", readSecretaryJournal(t))
+	}
+}
+
+func TestMailAckLogsEvent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"devops": {Path: filepath.Join(home, "devops")},
+	})
+	enc.Encode(APIRequest{Cmd: "mail.ack", Cwd: filepath.Join(home, "devops"),
+		Payload: json.RawMessage(`{"ticket":"T5"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	if !r.OK {
+		t.Fatalf("ack failed: %s", r.Error)
+	}
+	e := journalHas(readSecretaryJournal(t), "T5", "acked")
+	if e == nil || e.By != "devops" {
+		t.Fatalf("acked event missing or wrong actor: %+v", readSecretaryJournal(t))
+	}
+}
+
+func TestMailSendReplyLogsRepliedEvent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"backend": {Path: filepath.Join(home, "backend")},
+	})
+	// A reply (in_reply_to set) marks the original ticket replied.
+	enc.Encode(APIRequest{Cmd: "mail.send", Cwd: filepath.Join(home, "backend"),
+		Payload: json.RawMessage(`{"to":"secretary","subject":"re: x","body":"done","in_reply_to":"T1"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	if !r.OK {
+		t.Fatalf("reply send failed: %s", r.Error)
+	}
+	e := journalHas(readSecretaryJournal(t), "T1", "replied")
+	if e == nil || e.By != "backend" {
+		t.Fatalf("replied event missing or wrong actor: %+v", readSecretaryJournal(t))
+	}
+}
+
+// withMailScheduler installs a temp-backed scheduler for the duration of a test.
+func withMailScheduler(t *testing.T) *scheduler.Scheduler {
+	t.Helper()
+	s, err := scheduler.New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailScheduler = s
+	t.Cleanup(func() { mailScheduler = nil })
+	return s
+}
+
+func TestArmDeliveryTimers(t *testing.T) {
+	s := withMailScheduler(t)
+	armDeliveryTimers("T1", "backend") // reply expected -> both timers
+	if _, ok := s.Get("ack:T1"); !ok {
+		t.Fatal("ack timer not armed")
+	}
+	if _, ok := s.Get("reply:T1"); !ok {
+		t.Fatal("reply timer not armed")
+	}
+
+	armDeliveryTimers("T2", "") // one-way -> ack only
+	if _, ok := s.Get("ack:T2"); !ok {
+		t.Fatal("ack timer not armed for T2")
+	}
+	if _, ok := s.Get("reply:T2"); ok {
+		t.Fatal("reply timer should not exist for a one-way letter")
+	}
+}
+
+func TestAckCancelsAckTimer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := withMailScheduler(t)
+	armDeliveryTimers("T7", "backend")
+
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"devops": {Path: filepath.Join(home, "devops")},
+	})
+	enc.Encode(APIRequest{Cmd: "mail.ack", Cwd: filepath.Join(home, "devops"), Payload: json.RawMessage(`{"ticket":"T7"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	if !r.OK {
+		t.Fatalf("ack failed: %s", r.Error)
+	}
+	if _, ok := s.Get("ack:T7"); ok {
+		t.Fatal("ack timer should be cancelled after ack")
+	}
+	if _, ok := s.Get("reply:T7"); !ok {
+		t.Fatal("reply timer should survive an ack")
+	}
+}
+
+func TestReplyCancelsReplyTimer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := withMailScheduler(t)
+	armDeliveryTimers("T1", "backend")
+
+	enc, dec := mailTestServer(t, map[string]*SessionInfo{
+		"devops": {Path: filepath.Join(home, "devops")},
+	})
+	enc.Encode(APIRequest{Cmd: "mail.send", Cwd: filepath.Join(home, "devops"),
+		Payload: json.RawMessage(`{"to":"secretary","subject":"re","body":"done","in_reply_to":"T1"}`)})
+	var r APIResponse
+	dec.Decode(&r)
+	if !r.OK {
+		t.Fatalf("reply send failed: %s", r.Error)
+	}
+	if _, ok := s.Get("reply:T1"); ok {
+		t.Fatal("reply timer should be cancelled after the reply arrives")
+	}
+}
+
+func TestOnMailTimerJournalsTimeout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	onMailTimer(scheduler.Timer{Ticket: "T3", Stage: "ack"})
+	e := journalHas(readSecretaryJournal(t), "T3", "timeout")
+	if e == nil || e.Stage != "ack" {
+		t.Fatalf("timeout event not journaled: %+v", readSecretaryJournal(t))
 	}
 }

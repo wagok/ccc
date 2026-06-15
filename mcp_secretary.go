@@ -13,17 +13,86 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kidandcat/ccc/internal/mail"
 	"github.com/kidandcat/ccc/internal/registry"
+	"github.com/kidandcat/ccc/internal/scheduler"
 )
+
+// Delivery-stage deadlines. The tmux stage is synchronous (send-keys success is
+// known immediately), so only ack and reply get timers. Defaults are generous;
+// the escalation REACTION is the secretary's job, not CCC's.
+const (
+	ackTimeoutSecs   = 600  // 10 min: recipient should ack quickly after reading
+	replyTimeoutSecs = 3600 // 60 min: complex tasks may take a while
+)
+
+// mailScheduler is the live delivery-deadline engine. It is nil outside the
+// running server (e.g. in unit tests that call handlers directly); all callers
+// must nil-check before arming/cancelling.
+var mailScheduler *scheduler.Scheduler
+
+// initMailScheduler starts the delivery-deadline engine. Called once from
+// listen() after the socket server is up. Overdue timers (deadlines that
+// elapsed while CCC was down) fire on start.
+func initMailScheduler() error {
+	home, _ := os.UserHomeDir()
+	s, err := scheduler.New(filepath.Join(home, ".ccc", "scheduler"), onMailTimer)
+	if err != nil {
+		return err
+	}
+	mailScheduler = s
+	go s.Run(context.Background())
+	return nil
+}
+
+// onMailTimer fires when a delivery deadline elapses: it journals a timeout
+// event and wakes the secretary with the fact. CCC does NOT decide the
+// response — escalation lives in the secretary's instruction.
+func onMailTimer(t scheduler.Timer) {
+	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{Ticket: t.Ticket, Event: "timeout", Stage: t.Stage})
+	cfg, err := loadConfig()
+	if err != nil {
+		return
+	}
+	wakeAgent(cfg, mail.SecretaryAgent, fmt.Sprintf(
+		"⏰ Timeout: ticket %s had no %s within the deadline. Escalate per your instructions.", t.Ticket, t.Stage))
+}
+
+// armDeliveryTimers arms the ack (always) and reply (only when a reply is
+// expected) deadlines for a delivered letter, keyed by ticket+stage so they can
+// be cancelled on ack/reply. No-op when the scheduler is not running.
+func armDeliveryTimers(ticket, replyTo string) {
+	if mailScheduler == nil {
+		return
+	}
+	now := time.Now().Unix()
+	mailScheduler.Schedule(scheduler.Timer{
+		ID: "ack:" + ticket, FireAt: now + ackTimeoutSecs,
+		Kind: "delivery_timeout", Stage: "ack", Ticket: ticket, Agent: mail.SecretaryAgent,
+	})
+	if replyTo != "" {
+		mailScheduler.Schedule(scheduler.Timer{
+			ID: "reply:" + ticket, FireAt: now + replyTimeoutSecs,
+			Kind: "delivery_timeout", Stage: "reply", Ticket: ticket, Agent: mail.SecretaryAgent,
+		})
+	}
+}
+
+func cancelTimer(id string) {
+	if mailScheduler != nil {
+		mailScheduler.Cancel(id)
+	}
+}
 
 // mcpProtocolVersion is the MCP version advertised if the client does not
 // request one. We otherwise echo the client's requested version.
@@ -279,12 +348,107 @@ func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	// on next start — so we still return success with the ticket.
 	notify := fmt.Sprintf("📨 New mail in your inbox — ticket %s, from %s, to %s, subject %q. Process it per your instructions.",
 		letter.Ticket, letter.From, letter.To, letter.Subject)
+	// A reply (in_reply_to set) also marks the original ticket as replied so the
+	// secretary can fold state and cancel that ticket's reply deadline.
+	if letter.InReplyTo != "" {
+		mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{
+			Ticket: letter.InReplyTo, Event: "replied", By: from, Detail: "via " + letter.Ticket,
+		})
+		cancelTimer("reply:" + letter.InReplyTo) // reply arrived in time
+	}
+
 	result := map[string]string{"ticket": letter.Ticket}
 	if err := wakeAgent(cfg, mail.SecretaryAgent, notify); err != nil {
 		result["warning"] = "letter stored but secretary not awakened: " + err.Error()
 	}
 	data, _ := json.Marshal(result)
 	encoder.Encode(APIResponse{OK: true, Result: data})
+}
+
+// ---------------------------------------------------------------------------
+// Mail: outbound path (secretary -> recipient) and acknowledgement
+// ---------------------------------------------------------------------------
+
+// renderRecipientLetter formats the full letter injected into an ordinary
+// recipient's prompt (ordinary agents have no inbox file — they get the whole
+// letter), including how to acknowledge and reply.
+func renderRecipientLetter(from, subject, body, replyTo, ticket string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "📨 Letter [ticket %s]\nFrom: %s\nSubject: %s\n", ticket, from, subject)
+	if replyTo != "" {
+		fmt.Fprintf(&b, "Reply requested → %s\n", replyTo)
+	}
+	fmt.Fprintf(&b, "---\n%s\n---\n", body)
+	fmt.Fprintf(&b, "Acknowledge receipt now: ack(ticket=%q).", ticket)
+	if replyTo != "" {
+		fmt.Fprintf(&b, " When done, reply: send(to=%q, in_reply_to=%q, subject=..., body=...).", replyTo, ticket)
+	}
+	return b.String()
+}
+
+// handleMailDeliverCmd handles "mail.deliver": the secretary forwards a
+// validated letter to its real recipient (privileged, secretary-only). The full
+// letter is injected into the recipient's prompt and a delivered/delivery_failed
+// event is journaled.
+func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	if resolveCaller(cfg, req.Cwd) != mail.SecretaryAgent {
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: secretary-only"})
+		return
+	}
+	var p struct {
+		To      string `json:"to"`
+		Ticket  string `json:"ticket"`
+		From    string `json:"from"`
+		Subject string `json:"subject"`
+		Body    string `json:"body"`
+		ReplyTo string `json:"reply_to"`
+	}
+	if err := json.Unmarshal(req.Payload, &p); err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: bad payload: " + err.Error()})
+		return
+	}
+	if p.To == "" || p.Ticket == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: 'to' and 'ticket' are required"})
+		return
+	}
+
+	text := renderRecipientLetter(p.From, p.Subject, p.Body, p.ReplyTo, p.Ticket)
+	err := wakeAgent(cfg, p.To, text)
+
+	event, detail := "delivered", ""
+	if err != nil {
+		event, detail = "delivery_failed", err.Error()
+	}
+	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{
+		Ticket: p.Ticket, Event: event, To: p.To, From: p.From, Subject: p.Subject, ReplyTo: p.ReplyTo, Detail: detail,
+	})
+	if err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: " + err.Error()})
+		return
+	}
+	// Delivery confirmed at the tmux level — arm the ack (and reply) deadlines.
+	armDeliveryTimers(p.Ticket, p.ReplyTo)
+	encoder.Encode(APIResponse{OK: true})
+}
+
+// handleMailAckCmd handles "mail.ack": a recipient confirms it saw a letter.
+// The acting agent is the trusted caller. Journals an "acked" event.
+func handleMailAckCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	by := resolveCaller(cfg, req.Cwd)
+	if by == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "ack: caller cwd does not match any agent (cwd=" + req.Cwd + ")"})
+		return
+	}
+	var p struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal(req.Payload, &p); err != nil || p.Ticket == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "ack: 'ticket' is required"})
+		return
+	}
+	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{Ticket: p.Ticket, Event: "acked", By: by})
+	cancelTimer("ack:" + p.Ticket) // acknowledged in time
+	encoder.Encode(APIResponse{OK: true})
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +598,18 @@ func secretaryTools() []map[string]interface{} {
 			}, "to", "subject"),
 		},
 		{
+			"name":        "ack",
+			"description": "Acknowledge that you have received and read a letter. Call this FIRST thing when a letter arrives, before doing the work. Confirms delivery to the secretary so it stops waiting.",
+			"inputSchema": obj(map[string]interface{}{"ticket": str}, "ticket"),
+		},
+		{
+			"name":        "deliver",
+			"description": "SECRETARY ONLY. Forward a validated letter to its real recipient: the full letter is injected into the recipient's prompt. Fields: to, ticket, from, subject, body, reply_to.",
+			"inputSchema": obj(map[string]interface{}{
+				"to": str, "ticket": str, "from": str, "subject": str, "body": str, "reply_to": str,
+			}, "to", "ticket"),
+		},
+		{
 			"name":        "list_agents",
 			"description": "List all agents known to CCC with their mechanical info (host, working dir, topic) and self-declared card (description, areas, contact_about). Use this to discover who to address a letter to.",
 			"inputSchema": obj(map[string]interface{}{}),
@@ -469,6 +645,12 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 	switch call.Name {
 	case "send":
 		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.send", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+	case "ack":
+		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.ack", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+	case "deliver":
+		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.deliver", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	case "list_agents":
 		resp, err := socketRoundtrip(APIRequest{Cmd: "agent.list"})
