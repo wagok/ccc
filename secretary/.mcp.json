@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "secretary": {
+      "command": "ccc",
+      "args": ["mcp-secretary"]
+    }
+  }
+}
