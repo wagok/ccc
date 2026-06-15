@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kidandcat/ccc/internal/mail"
 	"github.com/kidandcat/ccc/internal/registry"
 )
 
@@ -198,6 +199,95 @@ func handleAgentUpdateSelfCmd(encoder *json.Encoder, cfg *Config, req APIRequest
 }
 
 // ---------------------------------------------------------------------------
+// Mail: inbound path (agent -> secretary inbox -> wake secretary)
+// ---------------------------------------------------------------------------
+
+// wakeAgent posts text to an agent's Telegram topic and injects it into that
+// agent's Claude session (starting the session if needed), recording it in
+// history. This is the delivery primitive for inter-agent mail: a short inbox
+// notification for the secretary, or (later) a full letter for an ordinary
+// recipient.
+func wakeAgent(cfg *Config, agentName, text string) error {
+	info, exists := cfg.Sessions[agentName]
+	if !exists || info == nil || info.Deleted {
+		return fmt.Errorf("agent %q has no session", agentName)
+	}
+	if errMsg := ensureSessionRunning(cfg, agentName, info); errMsg != "" {
+		return fmt.Errorf("%s", errMsg)
+	}
+	_, projectName := parseSessionTarget(agentName)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
+
+	if info.TopicID > 0 {
+		sendMessage(cfg, cfg.GroupID, info.TopicID, text)
+	}
+	appendHistory(info.TopicID, HistoryMessage{
+		ID:        nextMessageID(),
+		Timestamp: time.Now().Unix(),
+		From:      "api",
+		Text:      text,
+		Agent:     "mail",
+	})
+	if info.TopicID > 0 {
+		markTelegramSent(info.TopicID)
+	}
+	if info.Host != "" {
+		return sshTmuxSendKeys(getHostAddress(cfg, info.Host), tmuxName, text)
+	}
+	return sendToTmux(tmuxName, text)
+}
+
+// handleMailSendCmd handles "mail.send": any agent's send lands in the
+// secretary's inbox (the recipient is an envelope field, not a delivery
+// address). The server stamps the trusted sender and a ticket, persists the
+// letter, then wakes the secretary with a short notification.
+func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	from := resolveCaller(cfg, req.Cwd)
+	if from == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "send: caller cwd does not match any agent (cwd=" + req.Cwd + ")"})
+		return
+	}
+	var p struct {
+		To                string `json:"to"`
+		Subject           string `json:"subject"`
+		Body              string `json:"body"`
+		ReplyTo           string `json:"reply_to"`
+		InReplyTo         string `json:"in_reply_to"`
+		NeedsConfirmation bool   `json:"needs_confirmation"`
+		Notes             string `json:"notes"`
+	}
+	if err := json.Unmarshal(req.Payload, &p); err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: "send: bad payload: " + err.Error()})
+		return
+	}
+	if p.To == "" || p.Subject == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "send: 'to' and 'subject' are required"})
+		return
+	}
+
+	letter := mail.Letter{
+		Ticket: mail.NewTicket(), From: from, To: p.To, Subject: p.Subject, Body: p.Body,
+		ReplyTo: p.ReplyTo, InReplyTo: p.InReplyTo, NeedsConfirmation: p.NeedsConfirmation, Notes: p.Notes,
+	}
+	if _, err := mail.Deliver(mail.SecretaryAgent, letter); err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: "send: persist to secretary inbox: " + err.Error()})
+		return
+	}
+
+	// The letter is durably stored; waking the secretary is best-effort. If the
+	// secretary session is not up yet, it will pick the letter up from its inbox
+	// on next start — so we still return success with the ticket.
+	notify := fmt.Sprintf("📨 New mail in your inbox — ticket %s, from %s, to %s, subject %q. Process it per your instructions.",
+		letter.Ticket, letter.From, letter.To, letter.Subject)
+	result := map[string]string{"ticket": letter.Ticket}
+	if err := wakeAgent(cfg, mail.SecretaryAgent, notify); err != nil {
+		result["warning"] = "letter stored but secretary not awakened: " + err.Error()
+	}
+	data, _ := json.Marshal(result)
+	encoder.Encode(APIResponse{OK: true, Result: data})
+}
+
+// ---------------------------------------------------------------------------
 // Unix-socket client (shim side)
 // ---------------------------------------------------------------------------
 
@@ -331,6 +421,19 @@ func secretaryTools() []map[string]interface{} {
 	str := map[string]interface{}{"type": "string"}
 	return []map[string]interface{}{
 		{
+			"name": "send",
+			"description": "Send a letter to another agent THROUGH the secretary. The letter is always submitted to the secretary first, who validates and routes it. Fields: to (intended recipient), subject (theme), body, reply_to (which agent should receive the reply — an agent name, or omit for a one-way informational message), in_reply_to (ticket you are answering), needs_confirmation (when the reply is routed to a third agent, get a short note that it was sent), notes (extra instructions for the secretary). Returns a ticket id.",
+			"inputSchema": obj(map[string]interface{}{
+				"to":                 str,
+				"subject":            str,
+				"body":               str,
+				"reply_to":           str,
+				"in_reply_to":        str,
+				"needs_confirmation": map[string]interface{}{"type": "boolean"},
+				"notes":              str,
+			}, "to", "subject"),
+		},
+		{
 			"name":        "list_agents",
 			"description": "List all agents known to CCC with their mechanical info (host, working dir, topic) and self-declared card (description, areas, contact_about). Use this to discover who to address a letter to.",
 			"inputSchema": obj(map[string]interface{}{}),
@@ -364,6 +467,9 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 	}
 
 	switch call.Name {
+	case "send":
+		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.send", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
 	case "list_agents":
 		resp, err := socketRoundtrip(APIRequest{Cmd: "agent.list"})
 		return resultText(resp, err)

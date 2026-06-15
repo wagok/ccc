@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/kidandcat/ccc/internal/mail"
 	"github.com/kidandcat/ccc/internal/registry"
 )
 
@@ -56,7 +58,7 @@ func TestHandleRPCToolsList(t *testing.T) {
 	for _, tdef := range tools {
 		got[tdef["name"].(string)] = true
 	}
-	for _, want := range []string{"list_agents", "get_agent", "update_self"} {
+	for _, want := range []string{"send", "list_agents", "get_agent", "update_self"} {
 		if !got[want] {
 			t.Fatalf("tools/list missing %q (got %v)", want, got)
 		}
@@ -208,5 +210,72 @@ func TestSocketAgentCommandsEndToEnd(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("backend (with card) not in directory: %+v", dir)
+	}
+}
+
+// TestMailSendStoresInSecretaryInbox covers the inbound mail path: any agent's
+// send lands in the secretary's inbox with a trusted sender + ticket. Without a
+// live secretary session the wake is best-effort, so the call still succeeds
+// (with a warning) and the letter is durably stored.
+func TestMailSendStoresInSecretaryInbox(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	backendCwd := filepath.Join(home, "proj", "backend")
+	cfg := &Config{Sessions: map[string]*SessionInfo{
+		"backend": {TopicID: 7, Path: backendCwd},
+	}}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	cli, srv := net.Pipe()
+	go handleSocketConnection(srv, cfg)
+	defer cli.Close()
+	enc := json.NewEncoder(cli)
+	dec := json.NewDecoder(cli)
+
+	// Missing subject is rejected.
+	enc.Encode(APIRequest{Cmd: "mail.send", Cwd: backendCwd, Payload: json.RawMessage(`{"to":"devops"}`)})
+	var rBad APIResponse
+	dec.Decode(&rBad)
+	if rBad.OK {
+		t.Fatal("send without subject must fail")
+	}
+
+	// Unknown caller is rejected (no spoofing the sender).
+	enc.Encode(APIRequest{Cmd: "mail.send", Cwd: "/nowhere", Payload: json.RawMessage(`{"to":"devops","subject":"x"}`)})
+	var rSpoof APIResponse
+	dec.Decode(&rSpoof)
+	if rSpoof.OK {
+		t.Fatal("send from unknown cwd must fail")
+	}
+
+	// Valid send: stored with trusted from + ticket.
+	enc.Encode(APIRequest{Cmd: "mail.send", Cwd: backendCwd,
+		Payload: json.RawMessage(`{"to":"devops","subject":"deploy v2","body":"please ship","reply_to":"backend","needs_confirmation":true}`)})
+	var r APIResponse
+	if err := dec.Decode(&r); err != nil {
+		t.Fatal(err)
+	}
+	if !r.OK {
+		t.Fatalf("send failed: %s", r.Error)
+	}
+	var res map[string]string
+	json.Unmarshal(r.Result, &res)
+	if res["ticket"] == "" {
+		t.Fatalf("no ticket returned: %v", res)
+	}
+
+	// Letter physically in the secretary's inbox with the trusted sender.
+	files, _ := os.ReadDir(mail.InboxDir(mail.SecretaryAgent))
+	if len(files) != 1 {
+		t.Fatalf("secretary inbox has %d files, want 1", len(files))
+	}
+	data, _ := os.ReadFile(filepath.Join(mail.InboxDir(mail.SecretaryAgent), files[0].Name()))
+	var letter mail.Letter
+	json.Unmarshal(data, &letter)
+	if letter.From != "backend" || letter.To != "devops" || letter.Subject != "deploy v2" ||
+		letter.ReplyTo != "backend" || !letter.NeedsConfirmation || letter.Ticket != res["ticket"] {
+		t.Fatalf("stored letter wrong: %+v", letter)
 	}
 }

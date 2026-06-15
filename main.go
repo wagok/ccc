@@ -612,6 +612,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleAgentGetCmd(encoder, cfg, req)
 		case "agent.update_self":
 			handleAgentUpdateSelfCmd(encoder, cfg, req)
+		case "mail.send":
+			handleMailSendCmd(encoder, cfg, req)
 		default:
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
