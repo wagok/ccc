@@ -118,20 +118,42 @@ func TestBuildDirectoryMergesCardsAndSessions(t *testing.T) {
 
 func TestResolveCaller(t *testing.T) {
 	cfg := &Config{Sessions: map[string]*SessionInfo{
-		"backend": {Path: "/home/x/proj/backend"},
-		"dead":    {Path: "/home/x/proj/dead", Deleted: true},
+		"backend":     {Path: "/home/x/proj/backend"},                   // local (host "")
+		"dead":        {Path: "/home/x/proj/dead", Deleted: true},       // local, deleted
+		"XPS:backend": {Path: "/home/x/proj/backend", Host: "XPS"},      // remote, SAME path
 	}}
-	if got := resolveCaller(cfg, "/home/x/proj/backend"); got != "backend" {
-		t.Fatalf("resolveCaller = %q, want backend", got)
+	// Local caller (host "") resolves to the local session, not the remote one
+	// sharing the same path.
+	if got := resolveCaller(cfg, "", "/home/x/proj/backend"); got != "backend" {
+		t.Fatalf("local resolveCaller = %q, want backend", got)
 	}
-	if got := resolveCaller(cfg, "/home/x/proj/backend/"); got != "backend" {
-		t.Fatalf("resolveCaller (trailing slash) = %q, want backend", got)
+	if got := resolveCaller(cfg, "", "/home/x/proj/backend/"); got != "backend" {
+		t.Fatalf("local trailing slash = %q, want backend", got)
 	}
-	if got := resolveCaller(cfg, "/home/x/proj/other"); got != "" {
-		t.Fatalf("resolveCaller unknown = %q, want empty", got)
+	// Remote caller with the same path resolves to the host-matched session.
+	if got := resolveCaller(cfg, "XPS", "/home/x/proj/backend"); got != "XPS:backend" {
+		t.Fatalf("remote resolveCaller = %q, want XPS:backend", got)
 	}
-	if got := resolveCaller(cfg, "/home/x/proj/dead"); got != "" {
-		t.Fatalf("resolveCaller deleted = %q, want empty", got)
+	// Unknown host for that path does not match.
+	if got := resolveCaller(cfg, "dell17", "/home/x/proj/backend"); got != "" {
+		t.Fatalf("unknown host = %q, want empty", got)
+	}
+	if got := resolveCaller(cfg, "", "/home/x/proj/other"); got != "" {
+		t.Fatalf("unknown path = %q, want empty", got)
+	}
+	if got := resolveCaller(cfg, "", "/home/x/proj/dead"); got != "" {
+		t.Fatalf("deleted = %q, want empty", got)
+	}
+}
+
+func TestRelayProcessBadRequest(t *testing.T) {
+	out := relayProcess([]byte("{not json"))
+	var resp APIResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("relay did not emit valid JSON: %v", err)
+	}
+	if resp.OK || !strings.Contains(resp.Error, "bad request") {
+		t.Fatalf("expected bad-request error response, got %+v", resp)
 	}
 }
 

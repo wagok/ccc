@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.14.1"
+const version = "1.15.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -140,6 +140,7 @@ type APIRequest struct {
 	QuestionIndex int      `json:"question_index,omitempty"` // for answer: which question (0-based)
 	OptionIndex   int      `json:"option_index,omitempty"`   // for answer: which option (0-based)
 	Cwd           string   `json:"cwd,omitempty"`            // caller working dir (mcp-secretary: trusted identity source)
+	Host          string   `json:"host,omitempty"`           // caller machine id ("" = server-local); disambiguates same path on different hosts
 	Payload       json.RawMessage `json:"payload,omitempty"`  // command-specific args (mail/agent commands)
 }
 
@@ -6227,6 +6228,16 @@ func main() {
 		// .mcp.json; translates tool calls into Unix-socket requests to the
 		// running CCC server. See mcp_secretary.go.
 		if err := mcpSecretary(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+
+	case "mcp-relay":
+		// Server-side relay for client-mode shims: read one APIRequest from
+		// stdin, run it against the local socket, write the APIResponse to
+		// stdout. Invoked over SSH by a remote agent's mcp-secretary shim.
+		if err := mcpRelay(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -192,16 +193,18 @@ func getAgentInfo(cfg *Config, name string, live bool) (AgentInfo, bool) {
 	return ai, true
 }
 
-// resolveCaller maps a working directory to the agent (session) that owns it.
-// Identity is derived server-side from the caller's real cwd, so an agent
-// cannot claim to be another.
-func resolveCaller(cfg *Config, cwd string) string {
+// resolveCaller maps a (host, working directory) to the agent (session) that
+// owns it. Identity is derived server-side from the caller's real cwd + machine,
+// so an agent cannot claim to be another. host is "" for server-local agents and
+// the client's HostName for remote ones — needed because two machines may share
+// the same path.
+func resolveCaller(cfg *Config, host, cwd string) string {
 	if cwd == "" {
 		return ""
 	}
 	want := filepath.Clean(cwd)
 	for name, info := range cfg.Sessions {
-		if info != nil && !info.Deleted && filepath.Clean(info.Path) == want {
+		if info != nil && !info.Deleted && info.Host == host && filepath.Clean(info.Path) == want {
 			return name
 		}
 	}
@@ -239,7 +242,7 @@ func handleAgentGetCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 }
 
 func handleAgentUpdateSelfCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	agent := resolveCaller(cfg, req.Cwd)
+	agent := resolveCaller(cfg, req.Host, req.Cwd)
 	if agent == "" {
 		encoder.Encode(APIResponse{OK: false, Error: "update_self: caller cwd does not match any agent (cwd=" + req.Cwd + ")"})
 		return
@@ -311,7 +314,7 @@ func wakeAgent(cfg *Config, agentName, text string) error {
 // address). The server stamps the trusted sender and a ticket, persists the
 // letter, then wakes the secretary with a short notification.
 func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	from := resolveCaller(cfg, req.Cwd)
+	from := resolveCaller(cfg, req.Host, req.Cwd)
 	if from == "" {
 		encoder.Encode(APIResponse{OK: false, Error: "send: caller cwd does not match any agent (cwd=" + req.Cwd + ")"})
 		return
@@ -391,7 +394,7 @@ func renderRecipientLetter(from, subject, body, replyTo, ticket string) string {
 // letter is injected into the recipient's prompt and a delivered/delivery_failed
 // event is journaled.
 func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	if resolveCaller(cfg, req.Cwd) != mail.SecretaryAgent {
+	if resolveCaller(cfg, req.Host, req.Cwd) != mail.SecretaryAgent {
 		encoder.Encode(APIResponse{OK: false, Error: "deliver: secretary-only"})
 		return
 	}
@@ -434,7 +437,7 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 // handleMailAckCmd handles "mail.ack": a recipient confirms it saw a letter.
 // The acting agent is the trusted caller. Journals an "acked" event.
 func handleMailAckCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	by := resolveCaller(cfg, req.Cwd)
+	by := resolveCaller(cfg, req.Host, req.Cwd)
 	if by == "" {
 		encoder.Encode(APIResponse{OK: false, Error: "ack: caller cwd does not match any agent (cwd=" + req.Cwd + ")"})
 		return
@@ -471,6 +474,85 @@ func socketRoundtrip(req APIRequest) (APIResponse, error) {
 	return resp, nil
 }
 
+// Shim transport config, loaded once at startup. On a client machine the local
+// CCC has no socket, so requests are relayed to the server over SSH.
+var (
+	shimClientMode bool
+	shimServer     string // SSH target of the server (client mode)
+	shimHostName   string // this machine's id, stamped as the trusted caller host
+)
+
+func loadShimConfig() {
+	cfg, err := loadConfig()
+	if err != nil {
+		return
+	}
+	if cfg.Mode == "client" && cfg.Server != "" && cfg.HostName != "" {
+		shimClientMode = true
+		shimServer = cfg.Server
+		shimHostName = cfg.HostName
+	}
+}
+
+// relayRequest stamps the trusted caller host and routes the request: directly
+// to the local socket on the server, or over SSH to `ccc mcp-relay` on the
+// server from a client machine.
+func relayRequest(req APIRequest) (APIResponse, error) {
+	req.Host = shimHostName // "" on the server
+	if shimClientMode {
+		return sshRelay(req)
+	}
+	return socketRoundtrip(req)
+}
+
+// sshRelay forwards a request to the server's `ccc mcp-relay` over SSH and reads
+// back the APIResponse (base64 over the shell, mirroring forwardToServer).
+func sshRelay(req APIRequest) (APIResponse, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return APIResponse{}, err
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | ccc mcp-relay", encoded)
+	out, err := runSSH(shimServer, cmd, 20*time.Second)
+	if err != nil {
+		return APIResponse{}, fmt.Errorf("relay to server: %w", err)
+	}
+	var resp APIResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+		return APIResponse{}, fmt.Errorf("relay decode: %w (server said: %q)", err, out)
+	}
+	return resp, nil
+}
+
+// mcpRelay is the server side of the client relay: read one APIRequest from
+// stdin, run it against the local socket, write the APIResponse to stdout.
+func mcpRelay() error {
+	in, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+	os.Stdout.Write(relayProcess(in))
+	return nil
+}
+
+// relayProcess turns a request payload into a response payload, always emitting
+// a well-formed APIResponse (errors become OK:false) so the client shim can
+// surface them as tool errors.
+func relayProcess(in []byte) []byte {
+	var req APIRequest
+	if err := json.Unmarshal(bytes.TrimSpace(in), &req); err != nil {
+		out, _ := json.Marshal(APIResponse{OK: false, Error: "mcp-relay: bad request: " + err.Error()})
+		return append(out, '\n')
+	}
+	resp, err := socketRoundtrip(req)
+	if err != nil {
+		resp = APIResponse{OK: false, Error: err.Error()}
+	}
+	out, _ := json.Marshal(resp)
+	return append(out, '\n')
+}
+
 // ---------------------------------------------------------------------------
 // MCP JSON-RPC 2.0 over stdio
 // ---------------------------------------------------------------------------
@@ -500,6 +582,7 @@ func isNotification(id json.RawMessage) bool {
 
 // mcpSecretary runs the stdio JSON-RPC loop until stdin closes.
 func mcpSecretary() error {
+	loadShimConfig() // decide local-socket vs SSH-relay transport once
 	cwd, _ := os.Getwd()
 	in := bufio.NewReader(os.Stdin)
 	out := json.NewEncoder(os.Stdout)
@@ -644,22 +727,22 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 
 	switch call.Name {
 	case "send":
-		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.send", Cwd: cwd, Payload: call.Arguments})
+		resp, err := relayRequest(APIRequest{Cmd: "mail.send", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	case "ack":
-		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.ack", Cwd: cwd, Payload: call.Arguments})
+		resp, err := relayRequest(APIRequest{Cmd: "mail.ack", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	case "deliver":
-		resp, err := socketRoundtrip(APIRequest{Cmd: "mail.deliver", Cwd: cwd, Payload: call.Arguments})
+		resp, err := relayRequest(APIRequest{Cmd: "mail.deliver", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	case "list_agents":
-		resp, err := socketRoundtrip(APIRequest{Cmd: "agent.list"})
+		resp, err := relayRequest(APIRequest{Cmd: "agent.list"})
 		return resultText(resp, err)
 	case "get_agent":
-		resp, err := socketRoundtrip(APIRequest{Cmd: "agent.get", Payload: call.Arguments})
+		resp, err := relayRequest(APIRequest{Cmd: "agent.get", Payload: call.Arguments})
 		return resultText(resp, err)
 	case "update_self":
-		resp, err := socketRoundtrip(APIRequest{Cmd: "agent.update_self", Cwd: cwd, Payload: call.Arguments})
+		resp, err := relayRequest(APIRequest{Cmd: "agent.update_self", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	default:
 		return toolErr("unknown tool: " + call.Name)
