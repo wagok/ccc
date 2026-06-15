@@ -15,9 +15,86 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kidandcat/ccc/internal/mail"
 )
+
+// Watchdog tuning. Variant 1 (skip-permissions autonomous secretary) means no
+// interactive prompts to answer, so the watchdog is a thin process-alive safety
+// net with flap protection.
+const (
+	secretaryWatchInterval = 30 * time.Second
+	maxSecretaryRestarts   = 5
+)
+
+var secretaryRestarts int
+
+// secretaryEnabledMarker is a file Vlad's `ccc secretary start` creates to opt
+// the secretary into supervision. The watchdog restarts the session only while
+// this marker exists, so a prepared-but-never-started secretary is left alone.
+func secretaryEnabledMarker() string {
+	return filepath.Join(mail.MailboxDir(mail.SecretaryAgent), ".enabled")
+}
+
+func secretaryEnabled() bool {
+	_, err := os.Stat(secretaryEnabledMarker())
+	return err == nil
+}
+
+func setSecretaryEnabled(on bool) error {
+	if on {
+		return os.WriteFile(secretaryEnabledMarker(), []byte("1\n"), 0644)
+	}
+	if err := os.Remove(secretaryEnabledMarker()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// watchSecretary keeps the secretary session alive once enabled. It restarts a
+// dead session (continuing its context with -c), with flap protection: after
+// maxSecretaryRestarts consecutive failures it pauses and asks Vlad to step in.
+// The counter resets whenever the session is found healthy. Runs in the server.
+func watchSecretary() {
+	for {
+		time.Sleep(secretaryWatchInterval)
+		if !secretaryEnabled() {
+			secretaryRestarts = 0
+			continue
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			continue
+		}
+		info := cfg.Sessions[mail.SecretaryAgent]
+		if info == nil {
+			continue
+		}
+		tmux := tmuxSessionName(mail.SecretaryAgent)
+		if isClaudeRunning(tmux, "") {
+			secretaryRestarts = 0
+			continue
+		}
+		if secretaryRestarts >= maxSecretaryRestarts {
+			continue // paused until the session comes back up or Vlad intervenes
+		}
+		secretaryRestarts++
+		fmt.Fprintf(os.Stderr, "watchdog: secretary down, restarting (attempt %d)\n", secretaryRestarts)
+		if err := createTmuxSession(tmux, info.Path, true); err != nil {
+			fmt.Fprintf(os.Stderr, "watchdog: restart failed: %v\n", err)
+			continue
+		}
+		if info.TopicID > 0 {
+			sendMessage(cfg, cfg.GroupID, info.TopicID,
+				fmt.Sprintf("🔁 Secretary was down; watchdog restarted it (attempt %d/%d).", secretaryRestarts, maxSecretaryRestarts))
+			if secretaryRestarts >= maxSecretaryRestarts {
+				sendMessage(cfg, cfg.GroupID, info.TopicID,
+					"⚠️ Secretary keeps crashing; auto-restart paused. Investigate, then run `ccc secretary start`.")
+			}
+		}
+	}
+}
 
 //go:embed all:secretary
 var secretaryTemplateFS embed.FS
@@ -101,10 +178,24 @@ func secretaryCommand(args []string) error {
 		if info == nil {
 			return fmt.Errorf("secretary not configured after bootstrap")
 		}
+		if err := setSecretaryEnabled(true); err != nil { // opt into watchdog supervision
+			return err
+		}
+		secretaryRestarts = 0
 		if msg := ensureSessionRunning(cfg, mail.SecretaryAgent, info); msg != "" {
 			return fmt.Errorf("start failed: %s", msg)
 		}
-		fmt.Printf("✅ Secretary started — topic %d, dir %s\n", info.TopicID, info.Path)
+		fmt.Printf("✅ Secretary started (supervised) — topic %d, dir %s\n", info.TopicID, info.Path)
+		return nil
+
+	case "stop":
+		if err := setSecretaryEnabled(false); err != nil { // disable watchdog first
+			return err
+		}
+		if err := killSession(cfg, mail.SecretaryAgent); err != nil {
+			return err
+		}
+		fmt.Println("⏹  Secretary stopped (watchdog disabled).")
 		return nil
 
 	case "status":
@@ -114,10 +205,11 @@ func secretaryCommand(args []string) error {
 			return nil
 		}
 		state := checkClaudeState(tmuxSessionName(mail.SecretaryAgent), "")
-		fmt.Printf("Secretary: topic %d, dir %s, state %s\n", info.TopicID, info.Path, state)
+		fmt.Printf("Secretary: topic %d, dir %s, state %s, supervised %t\n",
+			info.TopicID, info.Path, state, secretaryEnabled())
 		return nil
 
 	default:
-		return fmt.Errorf("usage: ccc secretary [start|status]")
+		return fmt.Errorf("usage: ccc secretary [start|stop|status]")
 	}
 }

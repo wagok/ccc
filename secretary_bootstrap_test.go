@@ -67,6 +67,36 @@ func TestInstallSecretaryTemplateNoClobber(t *testing.T) {
 	}
 }
 
+func TestSecretaryEnabledMarker(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := prepareSecretaryDir(); err != nil { // marker lives in the dir
+		t.Fatal(err)
+	}
+
+	if secretaryEnabled() {
+		t.Fatal("freshly prepared secretary must not be enabled")
+	}
+	if err := setSecretaryEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if !secretaryEnabled() {
+		t.Fatal("expected enabled after setSecretaryEnabled(true)")
+	}
+	if _, err := os.Stat(secretaryEnabledMarker()); err != nil {
+		t.Fatalf("marker file missing: %v", err)
+	}
+	if err := setSecretaryEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	if secretaryEnabled() {
+		t.Fatal("expected disabled after setSecretaryEnabled(false)")
+	}
+	// Disabling again is a no-op, not an error.
+	if err := setSecretaryEnabled(false); err != nil {
+		t.Fatalf("double-disable: %v", err)
+	}
+}
+
 func TestSecretaryMailboxPathMatches(t *testing.T) {
 	// Bootstrap and the mail subsystem must agree on the secretary's directory.
 	t.Setenv("HOME", t.TempDir())

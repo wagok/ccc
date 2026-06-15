@@ -5059,6 +5059,8 @@ func listen() error {
 	if err := bootstrapSecretary(config); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: secretary bootstrap: %v\n", err)
 	}
+	// Supervise the secretary once Vlad has enabled it (thin crash-restart net).
+	go watchSecretary()
 
 	setBotCommands(config.BotToken)
 
