@@ -535,8 +535,9 @@ func sshRelay(req APIRequest) (APIResponse, error) {
 		return APIResponse{}, err
 	}
 	encoded := base64.StdEncoding.EncodeToString(data)
-	cmd := fmt.Sprintf("echo %s | base64 -d | ccc mcp-relay", encoded)
-	out, err := runSSH(shimServer, cmd, 20*time.Second)
+	// Pipe the payload via stdin (not inline) so large letters from a client
+	// don't hit the shell/SSH command-length limit.
+	out, err := runSSHWithInput(shimServer, "base64 -d | ccc mcp-relay", encoded, 20*time.Second)
 	if err != nil {
 		return APIResponse{}, fmt.Errorf("relay to server: %w", err)
 	}
