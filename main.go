@@ -5054,6 +5054,12 @@ func listen() error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start mail scheduler: %v\n", err)
 	}
 
+	// Prepare the smart secretary (working dir + template + topic). Idempotent;
+	// does not launch the session (that is `ccc secretary start` / on-demand).
+	if err := bootstrapSecretary(config); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: secretary bootstrap: %v\n", err)
+	}
+
 	setBotCommands(config.BotToken)
 
 	sigChan := make(chan os.Signal, 1)
@@ -6219,6 +6225,14 @@ func main() {
 		// .mcp.json; translates tool calls into Unix-socket requests to the
 		// running CCC server. See mcp_secretary.go.
 		if err := mcpSecretary(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+
+	case "secretary":
+		// Manage the smart secretary agent: `ccc secretary [start|status]`.
+		if err := secretaryCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
