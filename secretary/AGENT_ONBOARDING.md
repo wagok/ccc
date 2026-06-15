@@ -69,7 +69,31 @@ Set `reply_to` to whoever should receive the answer (yourself, or a third
 agent); omit it for a one-way, informational message. Use `notes` for routing
 hints to the secretary. Address only agents that appear in `list_agents`.
 
-### 4. The human stays in control
+### 4. Do NOT create acknowledgment loops — silence is a valid, correct end
+
+`ack(ticket="...")` is the ONLY acknowledgment you owe for a received letter. It
+already confirms receipt to the secretary and to the human. It is a technical
+handshake — not a message. After you ack:
+
+- **Never send a letter whose content is just acknowledgment, status, or
+  courtesy.** No "received", "ok", "thanks", "got it", "ready", "standing by",
+  "waiting for your command", "let me know if you need anything". These carry no
+  information and cause endless confirmation loops.
+- **Send (or reply) ONLY when the message carries substantive new information:** a
+  real question, a task or hand-off, a result/answer, a decision, or a concrete
+  coordination point. If you have nothing of substance to add, send nothing.
+- **Reply only when a reply is actually warranted.** If the incoming letter did
+  not set `reply_to`, or you have no substantive answer, do NOT reply — just
+  `ack` and act. A message that merely confirms, thanks, or closes is not a
+  reply; end the thread in silence.
+- **Before every `send`, ask yourself:** "If the human read this line in the
+  topic, would it be useful new information, or noise?" If it's noise, don't send
+  it.
+
+A finished exchange ends quietly. The `ack` and the journal already record that
+it completed — you never need to announce that you are done or waiting.
+
+### 5. The human stays in control
 
 Mail is for coordination and information flow — not for making decisions that are
 the user's to make. If something architectural, consequential, or that forks the
@@ -80,3 +104,33 @@ use inter-agent mail to bypass the human.
 - `update_self` / `list_agents` / `get_agent` — the agent directory
 - `send` — send a letter (a reply is just `send` with `in_reply_to`)
 - `ack` — confirm you received a letter (always do this first)
+
+---
+
+## FIX MESSAGE (broadcast to already-onboarded agents)
+
+Paste this to agents that already have the secretary MCP, to stop confirmation
+loops. It also tells them to fold the rule into their `CLAUDE.md`.
+
+> Behavior fix for inter-agent mail. Agents have been sending each other empty
+> handshake messages ("received", "ok, ready", "waiting for your command") in
+> endless loops. Stop doing this:
+>
+> - `ack(ticket)` is the ONLY acknowledgment you owe for a received letter — it
+>   already confirms receipt to the secretary and to me. It is a technical
+>   handshake, not a message.
+> - After acking, do NOT send any letter whose content is just acknowledgment,
+>   status, or courtesy. Never send "received / ok / thanks / ready / standing by
+>   / waiting for your command / let me know if you need anything".
+> - `send` (and reply) ONLY when the message carries substantive new information:
+>   a real question, a task, a result/answer, a decision, or a concrete
+>   coordination point. Otherwise send nothing.
+> - Reply only when a reply is warranted. If the letter set no `reply_to`, or you
+>   have nothing substantive to answer, do NOT reply — just `ack` and act. A
+>   message that only confirms or closes is not a reply; end the thread in
+>   silence.
+> - Before every `send`, ask: "If the human read this in the topic, is it useful
+>   new information or noise?" If noise, don't send it. A finished exchange ends
+>   quietly.
+>
+> Add this rule to your `CLAUDE.md` (the "Inter-Agent Mail" section) so it sticks.
