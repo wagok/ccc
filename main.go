@@ -2484,6 +2484,90 @@ func deleteForumTopic(config *Config, chatID int64, topicID int64) error {
 	return nil
 }
 
+// closeForumTopic closes (archives) a topic without deleting its messages.
+func closeForumTopic(config *Config, chatID int64, topicID int64) error {
+	if chatID == 0 {
+		return fmt.Errorf("no group configured")
+	}
+	params := url.Values{
+		"chat_id":           {fmt.Sprintf("%d", chatID)},
+		"message_thread_id": {fmt.Sprintf("%d", topicID)},
+	}
+	result, err := telegramAPI(config, "closeForumTopic", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("failed to close topic: %s", result.Description)
+	}
+	return nil
+}
+
+// moveHistory moves a session's stored history from one topic id to another so
+// the project's history survives a /changegroup move (ccc-dcp.9).
+func moveHistory(oldTopic, newTopic int64) error {
+	oldDir := filepath.Dir(getHistoryDir(oldTopic)) // ~/.ccc/history/<oldTopic>
+	newDir := filepath.Dir(getHistoryDir(newTopic))
+	if _, err := os.Stat(oldDir); err != nil {
+		return nil // nothing to move
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return nil // target already exists, don't clobber
+	}
+	return os.Rename(oldDir, newDir)
+}
+
+// handleChangeGroup implements `/changegroup <alias>`: move the project owning
+// the current topic to another group. Creates a fresh topic in the target
+// group's chat, migrates history, updates the session, and closes the old topic.
+// Admin-only (slash commands are gated to the admin in listen()).
+func handleChangeGroup(config *Config, chatID, threadID int64, alias string) {
+	if alias == "" {
+		sendMessage(config, chatID, threadID, "Usage: /changegroup <group-alias>")
+		return
+	}
+	sessionName := getSessionByGroupTopic(config, chatID, threadID)
+	if sessionName == "" {
+		sendMessage(config, chatID, threadID, "❌ No project session is mapped to this topic")
+		return
+	}
+	info := config.Sessions[sessionName]
+	targetChat := groupChatID(config, alias)
+	if targetChat == 0 {
+		sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Unknown group %q. Add it to ~/.ccc.json (groups) first.", alias))
+		return
+	}
+	if sessionGroup(info) == alias {
+		sendMessage(config, chatID, threadID, fmt.Sprintf("ℹ️ '%s' is already in group %q", sessionName, alias))
+		return
+	}
+
+	newTopic, err := createForumTopic(config, targetChat, sessionName)
+	if err != nil {
+		sendMessage(config, chatID, threadID, "❌ Failed to create topic in target group: "+err.Error())
+		return
+	}
+
+	oldTopic := info.TopicID
+	if err := moveHistory(oldTopic, newTopic); err != nil {
+		fmt.Fprintf(os.Stderr, "changegroup: history move %d->%d: %v\n", oldTopic, newTopic, err)
+	}
+	groupField := alias
+	if alias == "default" {
+		groupField = ""
+	}
+	info.Group, info.TopicID = groupField, newTopic
+	saveConfig(config)
+
+	sendMessage(config, targetChat, newTopic,
+		fmt.Sprintf("📦 Project '%s' moved here. History preserved. Interact with the agent in this topic now.", sessionName))
+	sendMessage(config, chatID, oldTopic,
+		fmt.Sprintf("📦 Project '%s' moved to group %q. This topic is closed — use the new one.", sessionName, alias))
+	if err := closeForumTopic(config, chatID, oldTopic); err != nil {
+		fmt.Fprintf(os.Stderr, "changegroup: close old topic: %v\n", err)
+	}
+}
+
 // getOrCreateTopic finds existing topic or creates new one
 // Also syncs topic name and updates path if changed
 func getOrCreateTopic(config *Config, fullName string, path string, host string) (int64, error) {
@@ -5628,6 +5712,14 @@ func listen() error {
 			if strings.HasPrefix(text, "/host") {
 				handleHostCommand(config, chatID, threadID, text)
 				config, _ = loadConfig() // Reload after potential changes
+				continue
+			}
+
+			// /changegroup <alias> - move this topic's project to another group
+			if strings.HasPrefix(text, "/changegroup") && isGroup {
+				alias := strings.TrimSpace(strings.TrimPrefix(text, "/changegroup"))
+				handleChangeGroup(config, chatID, threadID, alias)
+				config, _ = loadConfig() // reload after the move
 				continue
 			}
 
