@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.4"
+const version = "1.16.5"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -5689,6 +5689,49 @@ func listen() error {
 					note = "already configured"
 				}
 				sendMessage(config, chatID, threadID, fmt.Sprintf("chat_id: %d\ntopic_id: %d\n(%s)", chatID, threadID, note))
+				continue
+			}
+
+			// /addthisgroup <alias> - register THIS Telegram group as a project
+			// group. Admin only; additive (only adds, never removes/moves).
+			if strings.HasPrefix(text, "/addthisgroup") {
+				if msg.From.ID != config.ChatID {
+					continue // admin only
+				}
+				alias := strings.TrimSpace(strings.TrimPrefix(text, "/addthisgroup"))
+				switch {
+				case alias == "":
+					sendMessage(config, chatID, threadID, "Usage: /addthisgroup <alias>")
+				case !isGroup:
+					sendMessage(config, chatID, threadID, "❌ Run this inside the Telegram group you want to register")
+				case alias == "default":
+					sendMessage(config, chatID, threadID, "❌ 'default' is reserved")
+				case chatID == config.GroupID:
+					sendMessage(config, chatID, threadID, "❌ This is the default group, already configured")
+				default:
+					already := ""
+					for a, g := range config.Groups {
+						if g != nil && g.ChatID == chatID {
+							already = a
+						}
+					}
+					if _, used := config.Groups[alias]; used {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Alias %q is already used", alias))
+					} else if already != "" {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ This group is already registered as %q", already))
+					} else {
+						if config.Groups == nil {
+							config.Groups = map[string]*GroupInfo{}
+						}
+						config.Groups[alias] = &GroupInfo{ChatID: chatID}
+						if err := saveConfig(config); err != nil {
+							sendMessage(config, chatID, threadID, "❌ save failed: "+err.Error())
+						} else {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Group %q registered (chat_id %d).\nNext on the server: `ccc secretary start %s` to launch its secretary, then `/changegroup %s` in a project's topic to move it here.", alias, chatID, alias, alias))
+						}
+					}
+				}
+				config, _ = loadConfig() // reload so routing picks up the new group
 				continue
 			}
 
