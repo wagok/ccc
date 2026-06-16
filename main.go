@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.3"
+const version = "1.16.4"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -5673,6 +5673,22 @@ func listen() error {
 
 			if text == "/ping" {
 				sendMessage(config, chatID, threadID, "pong!")
+				continue
+			}
+
+			// /groupid - report this chat's id (to register a new project group)
+			if text == "/groupid" {
+				configured := chatID == config.GroupID
+				for _, g := range config.Groups {
+					if g != nil && g.ChatID == chatID {
+						configured = true
+					}
+				}
+				note := "not yet in CCC — add it to ~/.ccc.json under \"groups\""
+				if configured {
+					note = "already configured"
+				}
+				sendMessage(config, chatID, threadID, fmt.Sprintf("chat_id: %d\ntopic_id: %d\n(%s)", chatID, threadID, note))
 				continue
 			}
 
