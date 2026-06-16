@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.5"
+const version = "1.16.6"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3145,12 +3145,9 @@ func getSessionByGroupTopic(cfg *Config, chatID, topicID int64) string {
 }
 
 // humanTag returns a sender prefix to prepend to a human message injected into
-// an agent, so multi-human groups stay attributable. The primary admin
-// (config.ChatID) is untagged (returns ""), preserving the single-user UX.
-func humanTag(cfg *Config, fromID int64, firstName, username string) string {
-	if fromID == cfg.ChatID {
-		return ""
-	}
+// an agent, so the agent can always tell which person is speaking — including
+// the owner and in multi-human groups. Every human message is tagged.
+func humanTag(fromID int64, firstName, username string) string {
 	name := firstName
 	if name == "" {
 		name = username
@@ -5429,7 +5426,7 @@ func listen() error {
 			isGroup := msg.Chat.Type == "supergroup"
 			// Tag injected human messages with the sender so multi-human groups
 			// stay attributable (empty for the primary admin — unchanged UX).
-			senderTag := humanTag(config, msg.From.ID, msg.From.FirstName, msg.From.Username)
+			senderTag := humanTag(msg.From.ID, msg.From.FirstName, msg.From.Username)
 
 			// Handle voice messages
 			if msg.Voice != nil && isGroup && threadID > 0 {
