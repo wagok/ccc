@@ -108,6 +108,22 @@ func GroupExists(config *Config, group string) bool {
 	return GroupChatID(config, group) != 0
 }
 
+// GetSessionByGroupTopic finds the session in a specific group's chat by topic.
+// chatID is the Telegram group chat id; topicID is the message_thread_id.
+// Matching on the (group, topic) pair disambiguates topic ids that can collide
+// across different groups.
+func GetSessionByGroupTopic(config *Config, chatID int64, topicID int64) string {
+	if config.Sessions == nil {
+		return ""
+	}
+	for name, info := range config.Sessions {
+		if info != nil && info.TopicID == topicID && GroupChatID(config, SessionGroup(info)) == chatID {
+			return name
+		}
+	}
+	return ""
+}
+
 // Path returns the config file path (~/.ccc.json)
 func Path() string {
 	home, _ := os.UserHomeDir()

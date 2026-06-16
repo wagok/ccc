@@ -800,7 +800,7 @@ func handleAskCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	// Send to Telegram topic
 	if info.TopicID > 0 {
 		telegramMsg := fmt.Sprintf("🤖 [%s] %s", agentLabel, req.Text)
-		sendMessage(cfg, cfg.GroupID, info.TopicID, telegramMsg)
+		sendMessage(cfg, groupChatID(cfg, sessionGroup(info)), info.TopicID, telegramMsg)
 	}
 
 	// Store in history
@@ -1036,7 +1036,7 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	// Send to Telegram topic
 	if info.TopicID > 0 {
 		telegramMsg := fmt.Sprintf("🤖 [%s] %s", agentLabel, req.Text)
-		sendMessage(cfg, cfg.GroupID, info.TopicID, telegramMsg)
+		sendMessage(cfg, groupChatID(cfg, sessionGroup(info)), info.TopicID, telegramMsg)
 	}
 
 	// Store in history
@@ -1161,7 +1161,7 @@ func handleContinueCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		if agentLabel == "" {
 			agentLabel = "api"
 		}
-		sendMessage(cfg, cfg.GroupID, info.TopicID, fmt.Sprintf("🔄 [%s] Session continued", agentLabel))
+		sendMessage(cfg, groupChatID(cfg, sessionGroup(info)), info.TopicID, fmt.Sprintf("🔄 [%s] Session continued", agentLabel))
 	}
 
 	encoder.Encode(APIResponse{OK: true})
@@ -2412,13 +2412,13 @@ func tmuxSessionName(name string) string {
 	return "claude-" + safeName
 }
 
-func createForumTopic(config *Config, name string) (int64, error) {
-	if config.GroupID == 0 {
+func createForumTopic(config *Config, chatID int64, name string) (int64, error) {
+	if chatID == 0 {
 		return 0, fmt.Errorf("no group configured. Add bot to a group with topics enabled and run: ccc setgroup")
 	}
 
 	params := url.Values{
-		"chat_id": {fmt.Sprintf("%d", config.GroupID)},
+		"chat_id": {fmt.Sprintf("%d", chatID)},
 		"name":    {name},
 	}
 
@@ -2439,13 +2439,13 @@ func createForumTopic(config *Config, name string) (int64, error) {
 }
 
 // editForumTopic renames a topic and verifies it exists
-func editForumTopic(config *Config, topicID int64, name string) error {
-	if config.GroupID == 0 {
+func editForumTopic(config *Config, chatID int64, topicID int64, name string) error {
+	if chatID == 0 {
 		return fmt.Errorf("no group configured")
 	}
 
 	params := url.Values{
-		"chat_id":           {fmt.Sprintf("%d", config.GroupID)},
+		"chat_id":           {fmt.Sprintf("%d", chatID)},
 		"message_thread_id": {fmt.Sprintf("%d", topicID)},
 		"name":              {name},
 	}
@@ -2462,13 +2462,13 @@ func editForumTopic(config *Config, topicID int64, name string) error {
 }
 
 // deleteForumTopic deletes a topic
-func deleteForumTopic(config *Config, topicID int64) error {
-	if config.GroupID == 0 {
+func deleteForumTopic(config *Config, chatID int64, topicID int64) error {
+	if chatID == 0 {
 		return fmt.Errorf("no group configured")
 	}
 
 	params := url.Values{
-		"chat_id":           {fmt.Sprintf("%d", config.GroupID)},
+		"chat_id":           {fmt.Sprintf("%d", chatID)},
 		"message_thread_id": {fmt.Sprintf("%d", topicID)},
 	}
 
@@ -2488,8 +2488,10 @@ func deleteForumTopic(config *Config, topicID int64) error {
 func getOrCreateTopic(config *Config, fullName string, path string, host string) (int64, error) {
 	// Check if session exists in config (including deleted)
 	if info, exists := config.Sessions[fullName]; exists {
+		// Operate within the session's own group (default group falls back to GroupID).
+		chatID := groupChatID(config, sessionGroup(info))
 		// Try to rename topic to verify it exists and sync name
-		err := editForumTopic(config, info.TopicID, fullName)
+		err := editForumTopic(config, chatID, info.TopicID, fullName)
 		if err != nil {
 			errStr := err.Error()
 			// Check if error indicates topic doesn't exist vs just "not modified"
@@ -2497,7 +2499,7 @@ func getOrCreateTopic(config *Config, fullName string, path string, host string)
 				strings.Contains(errStr, "TOPIC_DELETED") || strings.Contains(errStr, "invalid") {
 				// Topic was deleted by user, create new one
 				fmt.Fprintf(os.Stderr, "Topic %d gone, creating new: %v\n", info.TopicID, err)
-				topicID, err := createForumTopic(config, fullName)
+				topicID, err := createForumTopic(config, chatID, fullName)
 				if err != nil {
 					return 0, err
 				}
@@ -2512,8 +2514,8 @@ func getOrCreateTopic(config *Config, fullName string, path string, host string)
 		return info.TopicID, nil
 	}
 
-	// Create new topic
-	topicID, err := createForumTopic(config, fullName)
+	// Create new topic in the default group.
+	topicID, err := createForumTopic(config, config.GroupID, fullName)
 	if err != nil {
 		return 0, err
 	}
@@ -2766,7 +2768,7 @@ func startSession(continueSession bool) error {
 	// Create topic if it doesn't exist and we have a group configured
 	if config.GroupID != 0 {
 		if _, exists := config.Sessions[name]; !exists {
-			topicID, err := createForumTopic(config, name)
+			topicID, err := createForumTopic(config, config.GroupID, name)
 			if err == nil {
 				config.Sessions[name] = &SessionInfo{
 					TopicID: topicID,
@@ -2990,7 +2992,7 @@ func createSession(config *Config, name string) error {
 	}
 
 	// Create Telegram topic
-	topicID, err := createForumTopic(config, name)
+	topicID, err := createForumTopic(config, config.GroupID, name)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)
 	}
@@ -3052,6 +3054,9 @@ func sessionGroup(info *SessionInfo) string         { return config.SessionGroup
 func groupChatID(cfg *Config, group string) int64   { return config.GroupChatID(cfg, group) }
 func sessionGroupChatID(cfg *Config, name string) int64 {
 	return config.SessionGroupChatID(cfg, name)
+}
+func getSessionByGroupTopic(cfg *Config, chatID, topicID int64) string {
+	return config.GetSessionByGroupTopic(cfg, chatID, topicID)
 }
 
 // Client session management
@@ -3389,7 +3394,7 @@ func handleHook() error {
 		Text:      lastMessage,
 	})
 
-	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+	return sendMessage(config, sessionGroupChatID(config, sessionName), topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
 }
 
 func handlePermissionHook() error {
@@ -3541,7 +3546,7 @@ func handlePermissionHook() error {
 				}
 
 				if len(buttons) > 0 {
-					sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
+					sendMessageWithKeyboard(config, sessionGroupChatID(config, sessionName), topicID, msg, buttons)
 				}
 
 				// Store question in history
@@ -3562,7 +3567,7 @@ func handlePermissionHook() error {
 			defer func() { recover() }()
 			planText := readLatestPlanFile(hookData.Cwd)
 			if planText == "" {
-				sendMessage(config, config.GroupID, topicID, "📋 Plan mode completed (plan file not found)")
+				sendMessage(config, sessionGroupChatID(config, sessionName), topicID, "📋 Plan mode completed (plan file not found)")
 				return
 			}
 			// Truncate to Telegram's 4096 char limit (leave room for header)
@@ -3570,7 +3575,7 @@ func handlePermissionHook() error {
 				planText = planText[:3900] + "\n\n... (truncated)"
 			}
 			msg := fmt.Sprintf("📋 Plan ready:\n\n%s", planText)
-			sendMessage(config, config.GroupID, topicID, msg)
+			sendMessage(config, sessionGroupChatID(config, sessionName), topicID, msg)
 			// Store in history
 			appendHistory(topicID, HistoryMessage{
 				ID:        nextMessageID(),
@@ -3820,17 +3825,19 @@ func handlePromptHook() error {
 
 	// Find session by matching cwd suffix
 	var topicID int64
+	var matchedGroup int64
 	for name, info := range config.Sessions {
 		if info == nil {
 			continue
 		}
 		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			topicID = info.TopicID
+			matchedGroup = groupChatID(config, sessionGroup(info))
 			break
 		}
 	}
 
-	if topicID == 0 || config.GroupID == 0 {
+	if topicID == 0 || matchedGroup == 0 {
 		fmt.Fprintf(os.Stderr, "hook-prompt: no topic found for cwd=%s\n", hookData.Cwd)
 		return nil
 	}
@@ -3851,10 +3858,10 @@ func handlePromptHook() error {
 	})
 
 	// Send typing action
-	sendTypingAction(config, config.GroupID, topicID)
+	sendTypingAction(config, matchedGroup, topicID)
 
 	fmt.Fprintf(os.Stderr, "hook-prompt: sending local prompt to topic %d\n", topicID)
-	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", prompt))
+	return sendMessage(config, matchedGroup, topicID, fmt.Sprintf("💬 %s", prompt))
 }
 
 func handleOutputHook() error {
@@ -3927,7 +3934,7 @@ func handleOutputHook() error {
 	}
 	os.WriteFile(cacheFile, []byte(msg), 0600)
 
-	sendMessage(config, config.GroupID, topicID, msg)
+	sendMessage(config, sessionGroupChatID(config, sessionName), topicID, msg)
 	return nil
 }
 
@@ -4755,7 +4762,7 @@ func send(message string) error {
 				continue
 			}
 			if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
-				return sendMessage(config, config.GroupID, info.TopicID, message)
+				return sendMessage(config, groupChatID(config, sessionGroup(info)), info.TopicID, message)
 			}
 		}
 	}
@@ -4817,7 +4824,7 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
 			histFrom, histText := parseRemoteMessagePrefix(message)
 			appendHistoryDedup(info.TopicID, histFrom, histText)
-			return sendMessage(config, config.GroupID, info.TopicID, message)
+			return sendMessage(config, groupChatID(config, sessionGroup(info)), info.TopicID, message)
 		}
 		// Subdirectory match: projectPath is under this session's path
 		if strings.HasPrefix(projectPath, info.Path+"/") {
@@ -4839,7 +4846,7 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		fmt.Printf("[remote] from=%s session=%s (subdir match)\n", fromHost, subdirMatch)
 		histFrom, histText := parseRemoteMessagePrefix(message)
 		appendHistoryDedup(subdirInfo.TopicID, histFrom, histText)
-		return sendMessage(config, config.GroupID, subdirInfo.TopicID, message)
+		return sendMessage(config, groupChatID(config, sessionGroup(subdirInfo)), subdirInfo.TopicID, message)
 	}
 
 	// No matching session found - auto-create topic (fallback for client-initiated sessions)
@@ -4860,7 +4867,7 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 	// Store forwarded message in history (with dedup)
 	histFrom, histText := parseRemoteMessagePrefix(message)
 	appendHistoryDedup(topicID, histFrom, histText)
-	return sendMessage(config, config.GroupID, topicID, message)
+	return sendMessage(config, sessionGroupChatID(config, fullName), topicID, message)
 }
 
 // parseRemoteMessagePrefix determines the sender and clean text from a
@@ -5311,7 +5318,7 @@ func listen() error {
 			// Handle voice messages
 			if msg.Voice != nil && isGroup && threadID > 0 {
 				config, _ = loadConfig()
-				sessionName := getSessionByTopic(config, threadID)
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
 				if sessionName != "" {
 					// Get session info to check if remote
 					sessionInfo := config.Sessions[sessionName]
@@ -5393,7 +5400,7 @@ func listen() error {
 			// Handle photo messages
 			if len(msg.Photo) > 0 && isGroup && threadID > 0 {
 				config, _ = loadConfig()
-				sessionName := getSessionByTopic(config, threadID)
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
 				if sessionName != "" {
 					// Get session info to check if remote
 					sessionInfo := config.Sessions[sessionName]
@@ -5636,7 +5643,7 @@ func listen() error {
 
 			// /status - show detailed session info for current topic
 			if text == "/status" && isGroup {
-				sessionName := getSessionByTopic(config, threadID)
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
 				if sessionName == "" {
 					sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
 					continue
@@ -5692,7 +5699,7 @@ func listen() error {
 
 			// /screenshot - capture last 50 lines from tmux session
 			if text == "/screenshot" && isGroup {
-				sessionName := getSessionByTopic(config, threadID)
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
 				if sessionName == "" {
 					sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
 					continue
@@ -5806,7 +5813,7 @@ func listen() error {
 				}
 
 				// Rename current topic to session name
-				if err := editForumTopic(config, threadID, name); err != nil {
+				if err := editForumTopic(config, chatID, threadID, name); err != nil {
 					sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Could not rename topic: %v", err))
 				}
 
@@ -5819,7 +5826,7 @@ func listen() error {
 				}
 
 				// Try to delete the old topic
-				deleteErr := deleteForumTopic(config, oldTopicID)
+				deleteErr := deleteForumTopic(config, chatID, oldTopicID)
 				if deleteErr != nil {
 					sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Session '%s' moved here\n⚠️ Old topic %d not deleted: %v", name, oldTopicID, deleteErr))
 				} else {
@@ -5913,7 +5920,7 @@ func listen() error {
 					} else {
 						// Create new Telegram topic
 						var err error
-						topicID, err = createForumTopic(config, fullName)
+						topicID, err = createForumTopic(config, chatID, fullName)
 						if err != nil {
 							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
 							continue
@@ -5922,7 +5929,7 @@ func listen() error {
 						// Resolve work directory path
 						workDir, err = resolveSessionPath(config, hostName, projectName)
 						if err != nil {
-							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to resolve path: %v", err))
+							sendMessage(config, chatID, topicID, fmt.Sprintf("❌ Failed to resolve path: %v", err))
 							continue
 						}
 
@@ -5958,19 +5965,19 @@ func listen() error {
 
 						// Create directory on remote host
 						if err := sshMkdir(address, workDir); err != nil {
-							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to create directory: %v", err))
+							sendMessage(config, chatID, topicID, fmt.Sprintf("❌ Failed to create directory: %v", err))
 							continue
 						}
 
 						// Create tmux session on remote host
 						if err := sshTmuxNewSession(address, tmuxName, workDir, continueSession); err != nil {
-							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
+							sendMessage(config, chatID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
 						} else {
 							time.Sleep(500 * time.Millisecond)
 							if sshTmuxHasSession(address, tmuxName) {
-								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🚀 Session '%s' started on %s!\n\nSend messages here to interact with Claude.", fullName, hostName))
+								sendMessage(config, chatID, topicID, fmt.Sprintf("🚀 Session '%s' started on %s!\n\nSend messages here to interact with Claude.", fullName, hostName))
 							} else {
-								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if claude works on %s.", fullName, hostName))
+								sendMessage(config, chatID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if claude works on %s.", fullName, hostName))
 							}
 						}
 					} else {
@@ -5980,13 +5987,13 @@ func listen() error {
 						}
 
 						if err := createTmuxSession(tmuxName, workDir, continueSession); err != nil {
-							sendMessage(config, config.GroupID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
+							sendMessage(config, chatID, topicID, fmt.Sprintf("❌ Failed to start tmux: %v", err))
 						} else {
 							time.Sleep(500 * time.Millisecond)
 							if tmuxSessionExists(tmuxName) {
-								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🚀 Session '%s' started!\n\nSend messages here to interact with Claude.", fullName))
+								sendMessage(config, chatID, topicID, fmt.Sprintf("🚀 Session '%s' started!\n\nSend messages here to interact with Claude.", fullName))
 							} else {
-								sendMessage(config, config.GroupID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if ~/bin/ccc works.", fullName))
+								sendMessage(config, chatID, topicID, fmt.Sprintf("⚠️ Session '%s' created but died immediately. Check if ~/bin/ccc works.", fullName))
 							}
 						}
 					}
@@ -5995,7 +6002,7 @@ func listen() error {
 
 				// Without args - restart session in current topic
 				if threadID > 0 {
-					sessionName := getSessionByTopic(config, threadID)
+					sessionName := getSessionByGroupTopic(config, chatID, threadID)
 					if sessionName == "" {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ No session mapped to this topic. Use %s <name> to create one.", cmdName))
 						continue
@@ -6093,7 +6100,7 @@ func listen() error {
 			if isGroup && threadID > 0 {
 				// Reload config to get latest sessions
 				config, _ = loadConfig()
-				sessionName := getSessionByTopic(config, threadID)
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
 				fmt.Fprintf(os.Stderr, "[msg] threadID=%d sessionName=%q\n", threadID, sessionName)
 				if sessionName != "" {
 					// Get session info to check if remote

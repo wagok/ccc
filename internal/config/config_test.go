@@ -65,6 +65,27 @@ func TestSessionGroupChatID(t *testing.T) {
 	}
 }
 
+func TestGetSessionByGroupTopic(t *testing.T) {
+	cfg := &Config{
+		GroupID: 111,
+		Groups:  map[string]*GroupInfo{"research": {ChatID: 222}},
+		Sessions: map[string]*SessionInfo{
+			"alpha": {TopicID: 5},                    // default group (111), topic 5
+			"beta":  {TopicID: 5, Group: "research"}, // research group (222), SAME topic id 5
+		},
+	}
+	// Same topic id in two groups must be disambiguated by chat id.
+	if got := GetSessionByGroupTopic(cfg, 111, 5); got != "alpha" {
+		t.Fatalf("(111,5) = %q, want alpha", got)
+	}
+	if got := GetSessionByGroupTopic(cfg, 222, 5); got != "beta" {
+		t.Fatalf("(222,5) = %q, want beta", got)
+	}
+	if got := GetSessionByGroupTopic(cfg, 999, 5); got != "" {
+		t.Fatalf("(999,5) = %q, want empty", got)
+	}
+}
+
 func TestLoadSaveRoundtripWithGroups(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	in := &Config{
