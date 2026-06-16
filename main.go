@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.7"
+const version = "1.16.8"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -255,6 +255,27 @@ var (
 	webhookCfg *Config
 )
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
+
+// telegramHTTPClient is used for Telegram Bot API calls. It caps the dial time
+// (so a brief network blip fails in ~8s instead of hanging ~30s) and the overall
+// request, leaving room for telegramAPI to retry.
+var telegramHTTPClient = &http.Client{
+	Timeout: 20 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+const (
+	telegramMaxAttempts = 3
+	telegramRetryBase   = 1 * time.Second
+)
 
 func setWebhookConfig(cfg *Config) {
 	webhookMu.Lock()
@@ -1633,16 +1654,29 @@ func telegramClientGet(client *http.Client, token string, url string) (*http.Res
 
 func telegramAPI(config *Config, method string, params url.Values) (*TelegramResponse, error) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/%s", config.BotToken, method)
-	resp, err := http.PostForm(apiURL, params)
-	if err != nil {
-		return nil, redactTokenError(err, config.BotToken)
+	var lastErr error
+	for attempt := 0; attempt < telegramMaxAttempts; attempt++ {
+		if attempt > 0 {
+			// Linear backoff: 1s, 2s. Gives a brief network blip time to recover.
+			time.Sleep(time.Duration(attempt) * telegramRetryBase)
+		}
+		resp, err := telegramHTTPClient.PostForm(apiURL, params)
+		if err != nil {
+			lastErr = redactTokenError(err, config.BotToken) // transient network error — retry
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+		status := resp.StatusCode
+		resp.Body.Close()
+		if status >= 500 || status == 429 {
+			lastErr = fmt.Errorf("telegram %s: HTTP %d", method, status) // server-side transient — retry
+			continue
+		}
+		var result TelegramResponse
+		json.Unmarshal(body, &result)
+		return &result, nil
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	var result TelegramResponse
-	json.Unmarshal(body, &result)
-	return &result, nil
+	return nil, lastErr
 }
 
 func sendMessage(config *Config, chatID int64, threadID int64, text string) error {
