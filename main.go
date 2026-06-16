@@ -30,6 +30,7 @@ const version = "1.15.3"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
+type GroupInfo = config.GroupInfo
 type HostInfo = config.HostInfo
 type Config = config.Config
 
@@ -3045,6 +3046,13 @@ func killSession(config *Config, name string) error {
 }
 
 func getSessionByTopic(cfg *Config, topicID int64) string { return config.GetSessionByTopic(cfg, topicID) }
+
+// Project-group helpers (phase 1: data model). default group = original GroupID.
+func sessionGroup(info *SessionInfo) string         { return config.SessionGroup(info) }
+func groupChatID(cfg *Config, group string) int64   { return config.GroupChatID(cfg, group) }
+func sessionGroupChatID(cfg *Config, name string) int64 {
+	return config.SessionGroupChatID(cfg, name)
+}
 
 // Client session management
 

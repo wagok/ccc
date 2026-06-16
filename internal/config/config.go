@@ -14,6 +14,14 @@ type SessionInfo struct {
 	Path    string `json:"path"`
 	Host    string `json:"host,omitempty"`    // Remote host name or "" for local
 	Deleted bool   `json:"deleted,omitempty"` // Soft-deleted (killed but topic preserved)
+	Group   string `json:"group,omitempty"`   // Project-group alias; "" = the default group
+}
+
+// GroupInfo stores a project-group (a separate Telegram group/channel). Groups
+// are added manually to the config (alias -> chat_id).
+type GroupInfo struct {
+	ChatID int64  `json:"chat_id"`
+	Name   string `json:"name,omitempty"` // optional human-friendly label
 }
 
 // HostInfo stores information about a remote host
@@ -49,6 +57,55 @@ type Config struct {
 
 	// Outgoing webhooks
 	Webhooks []WebhookConfig `json:"webhooks,omitempty"`
+
+	// Project groups: alias -> group. Each project belongs to exactly one group
+	// (a separate Telegram group/channel). Added manually. The implicit
+	// "default" group is the original GroupID (see GroupChatID).
+	Groups map[string]*GroupInfo `json:"groups,omitempty"`
+}
+
+// DefaultGroup is the alias of the implicit group backed by the original
+// config.GroupID — where every pre-existing project lives.
+const DefaultGroup = "default"
+
+// SessionGroup returns the group alias a session belongs to ("" -> default).
+func SessionGroup(info *SessionInfo) string {
+	if info == nil || info.Group == "" {
+		return DefaultGroup
+	}
+	return info.Group
+}
+
+// GroupChatID resolves a group alias to its Telegram chat id. The default group
+// falls back to the original config.GroupID for backward compatibility. Returns
+// 0 for an unknown (unconfigured) group.
+func GroupChatID(config *Config, group string) int64 {
+	if group == "" {
+		group = DefaultGroup
+	}
+	if config.Groups != nil {
+		if g, ok := config.Groups[group]; ok && g != nil && g.ChatID != 0 {
+			return g.ChatID
+		}
+	}
+	if group == DefaultGroup {
+		return config.GroupID
+	}
+	return 0
+}
+
+// SessionGroupChatID returns the Telegram chat id of the group owning a session.
+func SessionGroupChatID(config *Config, sessionName string) int64 {
+	return GroupChatID(config, SessionGroup(config.Sessions[sessionName]))
+}
+
+// GroupExists reports whether a group alias is configured (default always is, as
+// long as a GroupID is set).
+func GroupExists(config *Config, group string) bool {
+	if group == "" || group == DefaultGroup {
+		return GroupChatID(config, DefaultGroup) != 0
+	}
+	return GroupChatID(config, group) != 0
 }
 
 // Path returns the config file path (~/.ccc.json)
