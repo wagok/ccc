@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.8"
+const version = "1.16.9"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -256,14 +256,51 @@ var (
 )
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
+// telegramFallbackIPs are Telegram HTTPS frontend IPs that serve the Bot API
+// (api.telegram.org) — verified to answer getMe end-to-end. We dial them by IP
+// when normal DNS resolution yields an address that is blackholed/blocked from
+// this host (observed: api.telegram.org resolved only to 149.154.166.110, which
+// timed out, while these frontends stayed reachable). TLS/SNI still uses
+// api.telegram.org, so the certificate validates regardless of which IP we
+// connect to. NOTE: only true HTTPS frontends belong here — MTProto DC IPs
+// (e.g. 149.154.175.x, 91.108.56.x) accept TCP:443 but do not serve the Bot
+// API, so dialing them would hang the HTTP request.
+var telegramFallbackIPs = []string{
+	"149.154.167.220:443",
+	"149.154.167.99:443",
+	"149.154.167.132:443",
+	"149.154.167.32:443",
+}
+
+// telegramDialContext dials api.telegram.org resiliently: it first tries normal
+// DNS resolution, then falls back to known-good Telegram DC IPs if that fails
+// (e.g. DNS returns a single blocked IP). For any other host it dials normally.
+func telegramDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+	conn, err := d.DialContext(ctx, network, addr)
+	if err == nil || !strings.Contains(addr, "api.telegram.org") {
+		return conn, err
+	}
+	// DNS-resolved address is unreachable; try the known DC frontends.
+	lastErr := err
+	for _, ip := range telegramFallbackIPs {
+		c, e := d.DialContext(ctx, network, ip)
+		if e == nil {
+			return c, nil
+		}
+		lastErr = e
+	}
+	return nil, lastErr
+}
+
 // telegramHTTPClient is used for Telegram Bot API calls. It caps the dial time
 // (so a brief network blip fails in ~8s instead of hanging ~30s) and the overall
 // request, leaving room for telegramAPI to retry.
 var telegramHTTPClient = &http.Client{
-	Timeout: 20 * time.Second,
+	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           telegramDialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
