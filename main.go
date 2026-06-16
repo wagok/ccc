@@ -43,8 +43,9 @@ type TelegramMessage struct {
 		Type string `json:"type"` // "private", "group", "supergroup"
 	} `json:"chat"`
 	From struct {
-		ID       int64  `json:"id"`
-		Username string `json:"username"`
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		FirstName string `json:"first_name"`
 	} `json:"from"`
 	Text           string           `json:"text"`
 	ReplyToMessage *TelegramMessage `json:"reply_to_message,omitempty"`
@@ -3059,6 +3060,26 @@ func getSessionByGroupTopic(cfg *Config, chatID, topicID int64) string {
 	return config.GetSessionByGroupTopic(cfg, chatID, topicID)
 }
 
+// humanTag returns a sender prefix to prepend to a human message injected into
+// an agent, so multi-human groups stay attributable. The primary admin
+// (config.ChatID) is untagged (returns ""), preserving the single-user UX.
+func humanTag(cfg *Config, fromID int64, firstName, username string) string {
+	if fromID == cfg.ChatID {
+		return ""
+	}
+	name := firstName
+	if name == "" {
+		name = username
+	}
+	if name == "" {
+		name = fmt.Sprintf("user%d", fromID)
+	}
+	if username != "" && username != name {
+		return fmt.Sprintf("[from %s (@%s)] ", name, username)
+	}
+	return fmt.Sprintf("[from %s] ", name)
+}
+
 // Client session management
 
 // startClientSession starts a claude session on the client
@@ -5300,9 +5321,17 @@ func listen() error {
 
 			msg := update.Message
 
-			// Only accept from authorized user
-			if msg.From.ID != config.ChatID {
-				continue
+			// Authorization: the admin (config.ChatID) may do anything, incl.
+			// slash commands. Other people in the (private) group may send plain
+			// messages to agents, but never commands and never outside a topic.
+			isAdmin := msg.From.ID == config.ChatID
+			if !isAdmin {
+				if strings.HasPrefix(strings.TrimSpace(msg.Text), "/") {
+					continue // slash commands are admin-only
+				}
+				if msg.Chat.Type != "supergroup" || msg.MessageThreadID == 0 {
+					continue // non-admins are only allowed inside group topics
+				}
 			}
 
 			// Deduplicate: Telegram forum groups can send two updates with
@@ -5314,6 +5343,9 @@ func listen() error {
 			chatID := msg.Chat.ID
 			threadID := msg.MessageThreadID
 			isGroup := msg.Chat.Type == "supergroup"
+			// Tag injected human messages with the sender so multi-human groups
+			// stay attributable (empty for the primary admin — unchanged UX).
+			senderTag := humanTag(config, msg.From.ID, msg.From.FirstName, msg.From.Username)
 
 			// Handle voice messages
 			if msg.Voice != nil && isGroup && threadID > 0 {
@@ -5386,9 +5418,9 @@ func listen() error {
 								// Start typing indicator and send to appropriate tmux
 								startContinuousTyping(config, chatID, threadID, sessionName)
 								if hostName != "" {
-									sshTmuxSendKeys(address, tmuxName, transcription)
+									sshTmuxSendKeys(address, tmuxName, senderTag+transcription)
 								} else {
-									sendToTmux(tmuxName, transcription)
+									sendToTmux(tmuxName, senderTag+transcription)
 								}
 							}
 						}
@@ -5466,7 +5498,7 @@ func listen() error {
 							Username:  msg.From.Username,
 						})
 						startContinuousTyping(config, chatID, threadID, sessionName)
-						sshTmuxSendKeys(hostInfo.Address, tmuxName, prompt)
+						sshTmuxSendKeys(hostInfo.Address, tmuxName, senderTag+prompt)
 						// Clean up local file
 						os.Remove(imgPath)
 						continue
@@ -6135,9 +6167,9 @@ func listen() error {
 					var sendErr error
 					if hostName != "" {
 						address := getHostAddress(config, hostName)
-						sendErr = sshTmuxSendKeys(address, tmuxName, text)
+						sendErr = sshTmuxSendKeys(address, tmuxName, senderTag+text)
 					} else {
-						sendErr = sendToTmux(tmuxName, text)
+						sendErr = sendToTmux(tmuxName, senderTag+text)
 					}
 					if sendErr != nil {
 						stopContinuousTyping(sessionName)

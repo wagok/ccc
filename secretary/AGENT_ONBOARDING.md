@@ -100,6 +100,15 @@ the user's to make. If something architectural, consequential, or that forks the
 future direction of the work comes up, **get the user's approval first**. Never
 use inter-agent mail to bypass the human.
 
+### 6. Multiple humans may be in your group — know who is speaking
+
+Your Telegram group can contain more than one person. A human message injected
+into you may be prefixed with the sender, e.g. `[from Alice (@alice)] ...`. An
+**untagged** message is from the primary admin (the owner). Treat the tag as
+authoritative for "who said this", and address people by name when it matters.
+Only the admin can issue slash commands; other people's messages are normal
+input.
+
 ### Tools recap
 - `update_self` / `list_agents` / `get_agent` — the agent directory
 - `send` — send a letter (a reply is just `send` with `in_reply_to`)
