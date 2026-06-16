@@ -30,70 +30,95 @@ const (
 	maxSecretaryRestarts   = 5
 )
 
-var secretaryRestarts int
+// secretaryRestarts tracks consecutive watchdog restarts per secretary identity.
+var secretaryRestarts = map[string]int{}
 
-// secretaryEnabledMarker is a file Vlad's `ccc secretary start` creates to opt
-// the secretary into supervision. The watchdog restarts the session only while
-// this marker exists, so a prepared-but-never-started secretary is left alone.
-func secretaryEnabledMarker() string {
-	return filepath.Join(mail.MailboxDir(mail.SecretaryAgent), ".enabled")
+// namedGroups returns the configured non-default group aliases.
+func namedGroups(cfg *Config) []string {
+	var gs []string
+	for alias := range cfg.Groups {
+		if alias != "default" {
+			gs = append(gs, alias)
+		}
+	}
+	return gs
 }
 
-func secretaryEnabled() bool {
-	_, err := os.Stat(secretaryEnabledMarker())
+// allSecretaries returns every secretary identity (default + one per named group).
+func allSecretaries(cfg *Config) []string {
+	secs := []string{mail.SecretaryAgent}
+	for _, g := range namedGroups(cfg) {
+		secs = append(secs, mail.SecretaryName(g))
+	}
+	return secs
+}
+
+// secretaryEnabledMarker is a file `ccc secretary start` creates to opt a
+// secretary into supervision. The watchdog acts only while it exists.
+func secretaryEnabledMarker(sec string) string {
+	return filepath.Join(mail.MailboxDir(sec), ".enabled")
+}
+
+func secretaryEnabled(sec string) bool {
+	_, err := os.Stat(secretaryEnabledMarker(sec))
 	return err == nil
 }
 
-func setSecretaryEnabled(on bool) error {
+func setSecretaryEnabled(sec string, on bool) error {
 	if on {
-		return os.WriteFile(secretaryEnabledMarker(), []byte("1\n"), 0644)
+		return os.WriteFile(secretaryEnabledMarker(sec), []byte("1\n"), 0644)
 	}
-	if err := os.Remove(secretaryEnabledMarker()); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(secretaryEnabledMarker(sec)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
 }
 
-// watchSecretary keeps the secretary session alive once enabled. It restarts a
-// dead session (continuing its context with -c), with flap protection: after
-// maxSecretaryRestarts consecutive failures it pauses and asks Vlad to step in.
-// The counter resets whenever the session is found healthy. Runs in the server.
+// watchSecretary keeps every enabled secretary (default + per-group) alive,
+// restarting a dead session with flap protection. Runs in the server.
 func watchSecretary() {
 	for {
 		time.Sleep(secretaryWatchInterval)
-		if !secretaryEnabled() {
-			secretaryRestarts = 0
-			continue
-		}
 		cfg, err := loadConfig()
 		if err != nil {
 			continue
 		}
-		info := cfg.Sessions[mail.SecretaryAgent]
-		if info == nil {
-			continue
+		for _, sec := range allSecretaries(cfg) {
+			superviseSecretary(cfg, sec)
 		}
-		tmux := tmuxSessionName(mail.SecretaryAgent)
-		if isClaudeRunning(tmux, "") {
-			secretaryRestarts = 0
-			continue
-		}
-		if secretaryRestarts >= maxSecretaryRestarts {
-			continue // paused until the session comes back up or Vlad intervenes
-		}
-		secretaryRestarts++
-		fmt.Fprintf(os.Stderr, "watchdog: secretary down, restarting (attempt %d)\n", secretaryRestarts)
-		if err := launchSecretary(cfg, info); err != nil {
-			fmt.Fprintf(os.Stderr, "watchdog: restart failed: %v\n", err)
-			continue
-		}
-		if info.TopicID > 0 {
-			sendMessage(cfg, cfg.GroupID, info.TopicID,
-				fmt.Sprintf("🔁 Secretary was down; watchdog restarted it (attempt %d/%d).", secretaryRestarts, maxSecretaryRestarts))
-			if secretaryRestarts >= maxSecretaryRestarts {
-				sendMessage(cfg, cfg.GroupID, info.TopicID,
-					"⚠️ Secretary keeps crashing; auto-restart paused. Investigate, then run `ccc secretary start`.")
-			}
+	}
+}
+
+func superviseSecretary(cfg *Config, sec string) {
+	if !secretaryEnabled(sec) {
+		secretaryRestarts[sec] = 0
+		return
+	}
+	info := cfg.Sessions[sec]
+	if info == nil {
+		return
+	}
+	tmux := tmuxSessionName(sec)
+	if isClaudeRunning(tmux, "") {
+		secretaryRestarts[sec] = 0
+		return
+	}
+	if secretaryRestarts[sec] >= maxSecretaryRestarts {
+		return // paused until it recovers or Vlad intervenes
+	}
+	secretaryRestarts[sec]++
+	fmt.Fprintf(os.Stderr, "watchdog: %s down, restarting (attempt %d)\n", sec, secretaryRestarts[sec])
+	if err := launchSecretary(cfg, sec, info); err != nil {
+		fmt.Fprintf(os.Stderr, "watchdog: restart failed: %v\n", err)
+		return
+	}
+	if info.TopicID > 0 {
+		chat := groupChatID(cfg, sessionGroup(info))
+		sendMessage(cfg, chat, info.TopicID,
+			fmt.Sprintf("🔁 Secretary was down; watchdog restarted it (attempt %d/%d).", secretaryRestarts[sec], maxSecretaryRestarts))
+		if secretaryRestarts[sec] >= maxSecretaryRestarts {
+			sendMessage(cfg, chat, info.TopicID,
+				"⚠️ Secretary keeps crashing; auto-restart paused. Investigate, then run `ccc secretary start`.")
 		}
 	}
 }
@@ -127,11 +152,11 @@ func installSecretaryTemplate(dir string) error {
 	})
 }
 
-// prepareSecretaryDir ensures the secretary's working directory, mailbox
-// subdirs, and template files exist. Returns the directory path. No Telegram or
-// tmux side effects (so it is unit-testable on its own).
-func prepareSecretaryDir() (string, error) {
-	dir := mail.MailboxDir(mail.SecretaryAgent) // ~/.ccc/secretary
+// prepareSecretaryDir ensures a secretary's working directory, mailbox subdirs,
+// and template files exist. sec is the secretary identity ("secretary" or
+// "secretary-<alias>"). No Telegram/tmux side effects (unit-testable).
+func prepareSecretaryDir(sec string) (string, error) {
+	dir := mail.MailboxDir(sec) // ~/.ccc/secretary or ~/.ccc/secretary-<alias>
 	for _, sub := range []string{"", "inbox", "archive"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
 			return "", err
@@ -143,21 +168,55 @@ func prepareSecretaryDir() (string, error) {
 	return dir, nil
 }
 
-// bootstrapSecretary prepares the working dir and ensures the dedicated topic +
-// protected session entry. Idempotent; safe to call on every server start.
+// bootstrapSecretary ensures a secretary for every group (default + named).
+// Idempotent; safe to call on every server start. The default group's secretary
+// stays at ~/.ccc/secretary with its existing topic.
 func bootstrapSecretary(cfg *Config) error {
-	dir, err := prepareSecretaryDir()
+	for _, group := range append([]string{"default"}, namedGroups(cfg)...) {
+		if err := bootstrapGroupSecretary(cfg, group); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: secretary bootstrap (group %q): %v\n", group, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapGroupSecretary ensures one group's secretary: working dir + template,
+// folder trust, a topic in THAT group's chat, and a protected session entry.
+func bootstrapGroupSecretary(cfg *Config, group string) error {
+	sec := mail.SecretaryName(group)
+	dir, err := prepareSecretaryDir(sec)
 	if err != nil {
 		return err
 	}
 	// Pre-accept the folder-trust dialog so the autonomous secretary never
 	// blocks on it (skip-permissions does NOT cover folder trust). Best-effort.
 	if err := ensureSecretaryTrusted(dir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not pre-accept secretary folder trust: %v\n", err)
+		fmt.Fprintf(os.Stderr, "warning: trust %s: %v\n", sec, err)
 	}
-	if _, err := getOrCreateTopic(cfg, mail.SecretaryAgent, dir, ""); err != nil {
+	groupField := group
+	if group == "default" {
+		groupField = "" // keep the default secretary's Group empty, as before
+	}
+	// Existing secretary: sync group/path, verify/repair its topic in its group.
+	if info, ok := cfg.Sessions[sec]; ok && info != nil {
+		info.Group, info.Path = groupField, dir
+		saveConfig(cfg)
+		if _, err := getOrCreateTopic(cfg, sec, dir, ""); err != nil {
+			return fmt.Errorf("secretary topic: %w", err)
+		}
+		return nil
+	}
+	// New secretary: create its topic in the group's chat.
+	chat := groupChatID(cfg, group)
+	if chat == 0 {
+		return fmt.Errorf("group %q has no chat_id configured", group)
+	}
+	topicID, err := createForumTopic(cfg, chat, sec)
+	if err != nil {
 		return fmt.Errorf("secretary topic: %w", err)
 	}
+	cfg.Sessions[sec] = &SessionInfo{TopicID: topicID, Path: dir, Group: groupField}
+	saveConfig(cfg)
 	return nil
 }
 
@@ -212,8 +271,8 @@ func ensureSecretaryTrusted(dir string) error {
 // needs no claude conversation continuity — which also avoids the "No
 // conversation found to continue" failure of a first launch. A stale/dead
 // session is killed first.
-func launchSecretary(cfg *Config, info *SessionInfo) error {
-	tmux := tmuxSessionName(mail.SecretaryAgent)
+func launchSecretary(cfg *Config, sec string, info *SessionInfo) error {
+	tmux := tmuxSessionName(sec)
 	if tmuxSessionExists(tmux) {
 		tmuxCmd("kill-session", "-t", tmux).Run()
 		time.Sleep(300 * time.Millisecond)
@@ -221,12 +280,18 @@ func launchSecretary(cfg *Config, info *SessionInfo) error {
 	return createTmuxSession(tmux, info.Path, false)
 }
 
-// secretaryCommand implements `ccc secretary [start|status]`.
+// secretaryCommand implements `ccc secretary [start|stop|status] [group-alias]`.
+// The group alias defaults to "default".
 func secretaryCommand(args []string) error {
 	sub := "status"
 	if len(args) > 0 {
 		sub = args[0]
 	}
+	group := "default"
+	if len(args) > 1 {
+		group = args[1]
+	}
+	sec := mail.SecretaryName(group)
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -234,54 +299,64 @@ func secretaryCommand(args []string) error {
 
 	switch sub {
 	case "start":
-		if err := bootstrapSecretary(cfg); err != nil {
+		if err := bootstrapGroupSecretary(cfg, group); err != nil {
 			return err
 		}
 		cfg, err = loadConfig() // reload to pick up the session entry bootstrap created
 		if err != nil {
 			return err
 		}
-		info := cfg.Sessions[mail.SecretaryAgent]
+		info := cfg.Sessions[sec]
 		if info == nil {
-			return fmt.Errorf("secretary not configured after bootstrap")
+			return fmt.Errorf("secretary for group %q not configured after bootstrap", group)
 		}
-		if err := setSecretaryEnabled(true); err != nil { // opt into watchdog supervision
+		if err := setSecretaryEnabled(sec, true); err != nil { // opt into supervision
 			return err
 		}
-		secretaryRestarts = 0
-		tmux := tmuxSessionName(mail.SecretaryAgent)
-		if isClaudeRunning(tmux, "") {
-			fmt.Printf("Secretary already running — topic %d.\n", info.TopicID)
+		secretaryRestarts[sec] = 0
+		if isClaudeRunning(tmuxSessionName(sec), "") {
+			fmt.Printf("Secretary [%s] already running — topic %d.\n", group, info.TopicID)
 			return nil
 		}
-		if err := launchSecretary(cfg, info); err != nil {
+		if err := launchSecretary(cfg, sec, info); err != nil {
 			return fmt.Errorf("start failed: %w", err)
 		}
-		fmt.Printf("✅ Secretary started (supervised) — topic %d, dir %s\n", info.TopicID, info.Path)
+		fmt.Printf("✅ Secretary [%s] started (supervised) — topic %d, dir %s\n", group, info.TopicID, info.Path)
 		return nil
 
 	case "stop":
-		if err := setSecretaryEnabled(false); err != nil { // disable watchdog first
+		if err := setSecretaryEnabled(sec, false); err != nil { // disable watchdog first
 			return err
 		}
-		if err := killSession(cfg, mail.SecretaryAgent); err != nil {
+		if err := killSession(cfg, sec); err != nil {
 			return err
 		}
-		fmt.Println("⏹  Secretary stopped (watchdog disabled).")
+		fmt.Printf("⏹  Secretary [%s] stopped (watchdog disabled).\n", group)
 		return nil
 
 	case "status":
-		info := cfg.Sessions[mail.SecretaryAgent]
-		if info == nil {
-			fmt.Println("Secretary: not bootstrapped (start the server or run `ccc secretary start`)")
+		if len(args) <= 1 { // no alias -> show all secretaries
+			for _, g := range append([]string{"default"}, namedGroups(cfg)...) {
+				printSecretaryStatus(cfg, g)
+			}
 			return nil
 		}
-		state := checkClaudeState(tmuxSessionName(mail.SecretaryAgent), "")
-		fmt.Printf("Secretary: topic %d, dir %s, state %s, supervised %t\n",
-			info.TopicID, info.Path, state, secretaryEnabled())
+		printSecretaryStatus(cfg, group)
 		return nil
 
 	default:
-		return fmt.Errorf("usage: ccc secretary [start|stop|status]")
+		return fmt.Errorf("usage: ccc secretary [start|stop|status] [group-alias]")
 	}
+}
+
+func printSecretaryStatus(cfg *Config, group string) {
+	sec := mail.SecretaryName(group)
+	info := cfg.Sessions[sec]
+	if info == nil {
+		fmt.Printf("Secretary [%s]: not bootstrapped\n", group)
+		return
+	}
+	state := checkClaudeState(tmuxSessionName(sec), "")
+	fmt.Printf("Secretary [%s]: topic %d, dir %s, state %s, supervised %t\n",
+		group, info.TopicID, info.Path, state, secretaryEnabled(sec))
 }

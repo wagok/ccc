@@ -104,3 +104,29 @@ func TestDeliverRejectsEmptyAgent(t *testing.T) {
 		t.Fatalf("expected empty-agent error, got %v", err)
 	}
 }
+
+func TestSecretaryNameAndMailbox(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Default group keeps the original identity + path.
+	if SecretaryName("") != "secretary" || SecretaryName("default") != "secretary" {
+		t.Fatal("default group must map to 'secretary'")
+	}
+	if SecretaryName("research") != "secretary-research" {
+		t.Fatalf("named group = %q", SecretaryName("research"))
+	}
+	// Mailbox paths: default unchanged, named alongside it.
+	if MailboxDir("secretary") != home+"/.ccc/secretary" {
+		t.Fatalf("default secretary dir = %s", MailboxDir("secretary"))
+	}
+	if MailboxDir("secretary-research") != home+"/.ccc/secretary-research" {
+		t.Fatalf("named secretary dir = %s", MailboxDir("secretary-research"))
+	}
+	// Ordinary agents still under ~/.ccc/mail.
+	if MailboxDir("backend") != home+"/.ccc/mail/backend" {
+		t.Fatalf("ordinary dir = %s", MailboxDir("backend"))
+	}
+	if !IsSecretary("secretary") || !IsSecretary("secretary-research") || IsSecretary("backend") {
+		t.Fatal("IsSecretary wrong")
+	}
+}

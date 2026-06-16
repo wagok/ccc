@@ -60,31 +60,35 @@ func initMailScheduler() error {
 // event and wakes the secretary with the fact. CCC does NOT decide the
 // response — escalation lives in the secretary's instruction.
 func onMailTimer(t scheduler.Timer) {
-	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{Ticket: t.Ticket, Event: "timeout", Stage: t.Stage})
+	sec := t.Agent // the group's secretary that armed this deadline
+	if sec == "" {
+		sec = mail.SecretaryAgent
+	}
+	mail.LogEvent(sec, mail.JournalEntry{Ticket: t.Ticket, Event: "timeout", Stage: t.Stage})
 	cfg, err := loadConfig()
 	if err != nil {
 		return
 	}
-	wakeAgent(cfg, mail.SecretaryAgent, fmt.Sprintf(
+	wakeAgent(cfg, sec, fmt.Sprintf(
 		"⏰ Timeout: ticket %s had no %s within the deadline. Escalate per your instructions.", t.Ticket, t.Stage))
 }
 
 // armDeliveryTimers arms the ack (always) and reply (only when a reply is
-// expected) deadlines for a delivered letter, keyed by ticket+stage so they can
-// be cancelled on ack/reply. No-op when the scheduler is not running.
-func armDeliveryTimers(ticket, replyTo string) {
+// expected) deadlines for a delivered letter. sec is the group's secretary that
+// owns the letter (woken on timeout). No-op when the scheduler is not running.
+func armDeliveryTimers(ticket, replyTo, sec string) {
 	if mailScheduler == nil {
 		return
 	}
 	now := time.Now().Unix()
 	mailScheduler.Schedule(scheduler.Timer{
 		ID: "ack:" + ticket, FireAt: now + ackTimeoutSecs,
-		Kind: "delivery_timeout", Stage: "ack", Ticket: ticket, Agent: mail.SecretaryAgent,
+		Kind: "delivery_timeout", Stage: "ack", Ticket: ticket, Agent: sec,
 	})
 	if replyTo != "" {
 		mailScheduler.Schedule(scheduler.Timer{
 			ID: "reply:" + ticket, FireAt: now + replyTimeoutSecs,
-			Kind: "delivery_timeout", Stage: "reply", Ticket: ticket, Agent: mail.SecretaryAgent,
+			Kind: "delivery_timeout", Stage: "reply", Ticket: ticket, Agent: sec,
 		})
 	}
 }
@@ -107,6 +111,7 @@ const mcpProtocolVersion = "2024-11-05"
 // mechanical fields (CCC-owned) plus the agent's self-declared card.
 type AgentInfo struct {
 	Name         string   `json:"name"`
+	Group        string   `json:"group,omitempty"`
 	Host         string   `json:"host,omitempty"`
 	WorkingDir   string   `json:"working_dir,omitempty"`
 	TopicID      int64    `json:"topic_id,omitempty"`
@@ -117,11 +122,14 @@ type AgentInfo struct {
 	CardUpdated  int64    `json:"card_updated,omitempty"`
 }
 
-// buildDirectory merges all non-deleted sessions with their self-declared cards.
-// Status is intentionally left empty here (cheap, no tmux/SSH); get_agent does
-// the live check. Agents that published a card but have no session row are
-// included too.
-func buildDirectory(cfg *Config) []AgentInfo {
+// buildDirectory merges non-deleted sessions in `group` with their self-declared
+// cards (group "" -> default). Group isolation: an agent only ever sees its own
+// group. Card-only agents (no session, hence no group) are surfaced only in the
+// default group. Status is left empty here (cheap); get_agent does the live check.
+func buildDirectory(cfg *Config, group string) []AgentInfo {
+	if group == "" {
+		group = "default"
+	}
 	cards, _ := registry.ListCards()
 	cardByAgent := make(map[string]registry.Card, len(cards))
 	for _, c := range cards {
@@ -131,25 +139,27 @@ func buildDirectory(cfg *Config) []AgentInfo {
 	var out []AgentInfo
 	seen := map[string]bool{}
 	for name, info := range cfg.Sessions {
-		if info == nil || info.Deleted {
+		if info == nil || info.Deleted || sessionGroup(info) != group {
 			continue
 		}
-		ai := AgentInfo{Name: name, Host: info.Host, WorkingDir: info.Path, TopicID: info.TopicID}
+		ai := AgentInfo{Name: name, Host: info.Host, WorkingDir: info.Path, TopicID: info.TopicID, Group: group}
 		if c, ok := cardByAgent[name]; ok {
 			ai.Description, ai.Areas, ai.ContactAbout, ai.CardUpdated = c.Description, c.Areas, c.ContactAbout, c.UpdatedAt
 		}
 		out = append(out, ai)
 		seen[name] = true
 	}
-	// Card-only agents (published before a session exists).
-	for _, c := range cards {
-		if seen[c.Agent] {
-			continue
+	// Card-only agents (published before a session exists) have no group.
+	if group == "default" {
+		for _, c := range cards {
+			if seen[c.Agent] {
+				continue
+			}
+			out = append(out, AgentInfo{
+				Name: c.Agent, Description: c.Description, Areas: c.Areas,
+				ContactAbout: c.ContactAbout, CardUpdated: c.UpdatedAt,
+			})
 		}
-		out = append(out, AgentInfo{
-			Name: c.Agent, Description: c.Description, Areas: c.Areas,
-			ContactAbout: c.ContactAbout, CardUpdated: c.UpdatedAt,
-		})
 	}
 	sortAgentInfo(out)
 	return out
@@ -182,7 +192,7 @@ func getAgentInfo(cfg *Config, name string, live bool) (AgentInfo, bool) {
 
 	ai := AgentInfo{Name: name}
 	if ok && info != nil && !info.Deleted {
-		ai.Host, ai.WorkingDir, ai.TopicID = info.Host, info.Path, info.TopicID
+		ai.Host, ai.WorkingDir, ai.TopicID, ai.Group = info.Host, info.Path, info.TopicID, sessionGroup(info)
 		if live {
 			ai.Status = checkClaudeState(tmuxSessionName(name), getHostAddress(cfg, info.Host))
 		}
@@ -215,8 +225,10 @@ func resolveCaller(cfg *Config, host, cwd string) string {
 // Server-side socket handlers (dispatched from handleSocketConnection)
 // ---------------------------------------------------------------------------
 
-func handleAgentListCmd(encoder *json.Encoder, cfg *Config) {
-	data, err := json.Marshal(buildDirectory(cfg))
+func handleAgentListCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	// Group isolation: a caller only sees agents in its own group.
+	group := sessionGroup(cfg.Sessions[resolveCaller(cfg, req.Host, req.Cwd)])
+	data, err := json.Marshal(buildDirectory(cfg, group))
 	if err != nil {
 		encoder.Encode(APIResponse{OK: false, Error: err.Error()})
 		return
@@ -230,6 +242,12 @@ func handleAgentGetCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	}
 	if err := json.Unmarshal(req.Payload, &p); err != nil || p.Name == "" {
 		encoder.Encode(APIResponse{OK: false, Error: "get_agent: missing 'name'"})
+		return
+	}
+	// Group isolation: only return agents in the caller's group.
+	callerGroup := sessionGroup(cfg.Sessions[resolveCaller(cfg, req.Host, req.Cwd)])
+	if sessionGroup(cfg.Sessions[p.Name]) != callerGroup {
+		encoder.Encode(APIResponse{OK: false, Error: "get_agent: " + p.Name + " is not in your group"})
 		return
 	}
 	info, ok := getAgentInfo(cfg, p.Name, true)
@@ -291,7 +309,7 @@ func wakeAgent(cfg *Config, agentName, text string) error {
 	tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 	if info.TopicID > 0 {
-		sendMessage(cfg, cfg.GroupID, info.TopicID, text)
+		sendMessage(cfg, groupChatID(cfg, sessionGroup(info)), info.TopicID, text)
 	}
 	appendHistory(info.TopicID, HistoryMessage{
 		ID:        nextMessageID(),
@@ -313,12 +331,19 @@ func wakeAgent(cfg *Config, agentName, text string) error {
 // secretary's inbox (the recipient is an envelope field, not a delivery
 // address). The server stamps the trusted sender and a ticket, persists the
 // letter, then wakes the secretary with a short notification.
+// groupSecretaryFor returns the secretary identity for a session's project group
+// (default group -> "secretary", named group -> "secretary-<alias>").
+func groupSecretaryFor(cfg *Config, sessionName string) string {
+	return mail.SecretaryName(sessionGroup(cfg.Sessions[sessionName]))
+}
+
 func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	from := resolveCaller(cfg, req.Host, req.Cwd)
 	if from == "" {
 		encoder.Encode(APIResponse{OK: false, Error: "send: caller cwd does not match any agent (cwd=" + req.Cwd + ")"})
 		return
 	}
+	sec := groupSecretaryFor(cfg, from) // the caller's own group secretary
 	var p struct {
 		To                string `json:"to"`
 		Subject           string `json:"subject"`
@@ -341,7 +366,7 @@ func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		Ticket: mail.NewTicket(), From: from, To: p.To, Subject: p.Subject, Body: p.Body,
 		ReplyTo: p.ReplyTo, InReplyTo: p.InReplyTo, NeedsConfirmation: p.NeedsConfirmation, Notes: p.Notes,
 	}
-	if _, err := mail.Deliver(mail.SecretaryAgent, letter); err != nil {
+	if _, err := mail.Deliver(sec, letter); err != nil {
 		encoder.Encode(APIResponse{OK: false, Error: "send: persist to secretary inbox: " + err.Error()})
 		return
 	}
@@ -354,14 +379,14 @@ func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	// A reply (in_reply_to set) also marks the original ticket as replied so the
 	// secretary can fold state and cancel that ticket's reply deadline.
 	if letter.InReplyTo != "" {
-		mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{
+		mail.LogEvent(sec, mail.JournalEntry{
 			Ticket: letter.InReplyTo, Event: "replied", By: from, Detail: "via " + letter.Ticket,
 		})
 		cancelTimer("reply:" + letter.InReplyTo) // reply arrived in time
 	}
 
 	result := map[string]string{"ticket": letter.Ticket}
-	if err := wakeAgent(cfg, mail.SecretaryAgent, notify); err != nil {
+	if err := wakeAgent(cfg, sec, notify); err != nil {
 		result["warning"] = "letter stored but secretary not awakened: " + err.Error()
 	}
 	data, _ := json.Marshal(result)
@@ -394,10 +419,12 @@ func renderRecipientLetter(from, subject, body, replyTo, ticket string) string {
 // letter is injected into the recipient's prompt and a delivered/delivery_failed
 // event is journaled.
 func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	if resolveCaller(cfg, req.Host, req.Cwd) != mail.SecretaryAgent {
+	sec := resolveCaller(cfg, req.Host, req.Cwd)
+	if !mail.IsSecretary(sec) {
 		encoder.Encode(APIResponse{OK: false, Error: "deliver: secretary-only"})
 		return
 	}
+	group := sessionGroup(cfg.Sessions[sec]) // the secretary's group
 	var p struct {
 		To      string `json:"to"`
 		Ticket  string `json:"ticket"`
@@ -414,11 +441,16 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: false, Error: "deliver: 'to' and 'ticket' are required"})
 		return
 	}
+	// Group isolation: a secretary may only deliver to agents in its own group.
+	if toInfo := cfg.Sessions[p.To]; toInfo != nil && sessionGroup(toInfo) != group {
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: recipient " + p.To + " is in another group — cross-group delivery is not allowed"})
+		return
+	}
 
 	// Load the stored original by ticket so CCC forwards the body byte-for-byte;
 	// the secretary need not reproduce it. Any payload field overrides the stored
 	// one (back-compat with the old contract, and lets the secretary annotate).
-	letter, found, _ := mail.ReadLetter(mail.SecretaryAgent, p.Ticket)
+	letter, found, _ := mail.ReadLetter(sec, p.Ticket)
 	from := pick(p.From, letter.From)
 	subject := pick(p.Subject, letter.Subject)
 	body := pick(p.Body, letter.Body)
@@ -435,7 +467,7 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	if err != nil {
 		event, detail = "delivery_failed", err.Error()
 	}
-	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{
+	mail.LogEvent(sec, mail.JournalEntry{
 		Ticket: p.Ticket, Event: event, To: p.To, From: from, Subject: subject, ReplyTo: replyTo, Detail: detail,
 	})
 	if err != nil {
@@ -443,7 +475,7 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 	// Delivery confirmed at the tmux level — arm the ack (and reply) deadlines.
-	armDeliveryTimers(p.Ticket, replyTo)
+	armDeliveryTimers(p.Ticket, replyTo, sec)
 	encoder.Encode(APIResponse{OK: true})
 }
 
@@ -471,7 +503,7 @@ func handleMailAckCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: false, Error: "ack: 'ticket' is required"})
 		return
 	}
-	mail.LogEvent(mail.SecretaryAgent, mail.JournalEntry{Ticket: p.Ticket, Event: "acked", By: by})
+	mail.LogEvent(groupSecretaryFor(cfg, by), mail.JournalEntry{Ticket: p.Ticket, Event: "acked", By: by})
 	cancelTimer("ack:" + p.Ticket) // acknowledged in time
 	encoder.Encode(APIResponse{OK: true})
 }
@@ -759,7 +791,7 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 		resp, err := relayRequest(APIRequest{Cmd: "mail.deliver", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	case "list_agents":
-		resp, err := relayRequest(APIRequest{Cmd: "agent.list"})
+		resp, err := relayRequest(APIRequest{Cmd: "agent.list", Cwd: cwd})
 		return resultText(resp, err)
 	case "get_agent":
 		resp, err := relayRequest(APIRequest{Cmd: "agent.get", Payload: call.Arguments})

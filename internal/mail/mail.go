@@ -11,14 +11,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
-// SecretaryAgent is the reserved agent identity for the smart secretary. Its
-// mailbox lives inside its hardcoded working directory (~/.ccc/secretary),
-// unlike ordinary agents whose mailboxes live under ~/.ccc/mail/<agent>.
+// SecretaryAgent is the reserved identity of the DEFAULT group's secretary. Its
+// mailbox lives in its hardcoded working directory (~/.ccc/secretary). Per-group
+// secretaries are "secretary-<alias>" with mailboxes at ~/.ccc/secretary-<alias>.
+// Ordinary agents' mailboxes live under ~/.ccc/mail/<agent>.
 const SecretaryAgent = "secretary"
+
+// SecretaryName returns the secretary identity for a project group. The default
+// group ("" or "default") keeps the original ~/.ccc/secretary identity.
+func SecretaryName(group string) string {
+	if group == "" || group == "default" {
+		return SecretaryAgent
+	}
+	return SecretaryAgent + "-" + group
+}
+
+// IsSecretary reports whether an agent identity is a secretary (default or
+// per-group).
+func IsSecretary(agent string) bool {
+	return agent == SecretaryAgent || strings.HasPrefix(agent, SecretaryAgent+"-")
+}
 
 // Letter is a single inter-agent message. The recipient is an envelope field
 // (To), not a delivery address: every send physically lands in the secretary's
@@ -74,8 +91,9 @@ func cccDir() string {
 // mailbox lives inside its fixed working directory; everyone else lives under
 // ~/.ccc/mail/<agent>.
 func MailboxDir(agent string) string {
-	if agent == SecretaryAgent {
-		return filepath.Join(cccDir(), "secretary")
+	if IsSecretary(agent) {
+		// ~/.ccc/secretary or ~/.ccc/secretary-<alias>
+		return filepath.Join(cccDir(), agent)
 	}
 	return filepath.Join(cccDir(), "mail", agent)
 }

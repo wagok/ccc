@@ -14,7 +14,7 @@ func TestPrepareSecretaryDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	dir, err := prepareSecretaryDir()
+	dir, err := prepareSecretaryDir("secretary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestPrepareSecretaryDir(t *testing.T) {
 func TestInstallSecretaryTemplateNoClobber(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dir, err := prepareSecretaryDir()
+	dir, err := prepareSecretaryDir("secretary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,30 +70,30 @@ func TestInstallSecretaryTemplateNoClobber(t *testing.T) {
 
 func TestSecretaryEnabledMarker(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	if _, err := prepareSecretaryDir(); err != nil { // marker lives in the dir
+	if _, err := prepareSecretaryDir("secretary"); err != nil { // marker lives in the dir
 		t.Fatal(err)
 	}
 
-	if secretaryEnabled() {
+	if secretaryEnabled("secretary") {
 		t.Fatal("freshly prepared secretary must not be enabled")
 	}
-	if err := setSecretaryEnabled(true); err != nil {
+	if err := setSecretaryEnabled("secretary", true); err != nil {
 		t.Fatal(err)
 	}
-	if !secretaryEnabled() {
-		t.Fatal("expected enabled after setSecretaryEnabled(true)")
+	if !secretaryEnabled("secretary") {
+		t.Fatal("expected enabled after enabling")
 	}
-	if _, err := os.Stat(secretaryEnabledMarker()); err != nil {
+	if _, err := os.Stat(secretaryEnabledMarker("secretary")); err != nil {
 		t.Fatalf("marker file missing: %v", err)
 	}
-	if err := setSecretaryEnabled(false); err != nil {
+	if err := setSecretaryEnabled("secretary", false); err != nil {
 		t.Fatal(err)
 	}
-	if secretaryEnabled() {
-		t.Fatal("expected disabled after setSecretaryEnabled(false)")
+	if secretaryEnabled("secretary") {
+		t.Fatal("expected disabled after disabling")
 	}
 	// Disabling again is a no-op, not an error.
-	if err := setSecretaryEnabled(false); err != nil {
+	if err := setSecretaryEnabled("secretary", false); err != nil {
 		t.Fatalf("double-disable: %v", err)
 	}
 }
@@ -141,7 +141,7 @@ func TestEnsureSecretaryTrusted(t *testing.T) {
 func TestSecretaryMailboxPathMatches(t *testing.T) {
 	// Bootstrap and the mail subsystem must agree on the secretary's directory.
 	t.Setenv("HOME", t.TempDir())
-	dir, _ := prepareSecretaryDir()
+	dir, _ := prepareSecretaryDir("secretary")
 	if dir != mail.MailboxDir(mail.SecretaryAgent) {
 		t.Fatalf("bootstrap dir %s != mailbox dir %s", dir, mail.MailboxDir(mail.SecretaryAgent))
 	}

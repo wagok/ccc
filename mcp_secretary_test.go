@@ -97,7 +97,7 @@ func TestBuildDirectoryMergesCardsAndSessions(t *testing.T) {
 		"old":      {TopicID: 12, Path: "/p/old", Deleted: true},
 	}}
 
-	dir := buildDirectory(cfg)
+	dir := buildDirectory(cfg, "default")
 	byName := map[string]AgentInfo{}
 	for _, a := range dir {
 		byName[a.Name] = a
@@ -480,7 +480,7 @@ func withMailScheduler(t *testing.T) *scheduler.Scheduler {
 
 func TestArmDeliveryTimers(t *testing.T) {
 	s := withMailScheduler(t)
-	armDeliveryTimers("T1", "backend") // reply expected -> both timers
+	armDeliveryTimers("T1", "backend", "secretary") // reply expected -> both timers
 	if _, ok := s.Get("ack:T1"); !ok {
 		t.Fatal("ack timer not armed")
 	}
@@ -488,7 +488,7 @@ func TestArmDeliveryTimers(t *testing.T) {
 		t.Fatal("reply timer not armed")
 	}
 
-	armDeliveryTimers("T2", "") // one-way -> ack only
+	armDeliveryTimers("T2", "", "secretary") // one-way -> ack only
 	if _, ok := s.Get("ack:T2"); !ok {
 		t.Fatal("ack timer not armed for T2")
 	}
@@ -501,7 +501,7 @@ func TestAckCancelsAckTimer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	s := withMailScheduler(t)
-	armDeliveryTimers("T7", "backend")
+	armDeliveryTimers("T7", "backend", "secretary")
 
 	enc, dec := mailTestServer(t, map[string]*SessionInfo{
 		"devops": {Path: filepath.Join(home, "devops")},
@@ -524,7 +524,7 @@ func TestReplyCancelsReplyTimer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	s := withMailScheduler(t)
-	armDeliveryTimers("T1", "backend")
+	armDeliveryTimers("T1", "backend", "secretary")
 
 	enc, dec := mailTestServer(t, map[string]*SessionInfo{
 		"devops": {Path: filepath.Join(home, "devops")},
@@ -547,5 +547,34 @@ func TestOnMailTimerJournalsTimeout(t *testing.T) {
 	e := journalHas(readSecretaryJournal(t), "T3", "timeout")
 	if e == nil || e.Stage != "ack" {
 		t.Fatalf("timeout event not journaled: %+v", readSecretaryJournal(t))
+	}
+}
+
+func TestBuildDirectoryGroupIsolation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg := &Config{
+		GroupID: 111,
+		Groups:  map[string]*GroupInfo{"research": {ChatID: 222}},
+		Sessions: map[string]*SessionInfo{
+			"backend":            {Path: "/b"},                    // default
+			"secretary":          {Path: "/s"},                    // default secretary
+			"paper":              {Path: "/p", Group: "research"}, // research
+			"secretary-research": {Path: "/sr", Group: "research"},
+		},
+	}
+	names := func(d []AgentInfo) map[string]bool {
+		m := map[string]bool{}
+		for _, a := range d {
+			m[a.Name] = true
+		}
+		return m
+	}
+	dn := names(buildDirectory(cfg, "default"))
+	if !dn["backend"] || !dn["secretary"] || dn["paper"] || dn["secretary-research"] {
+		t.Fatalf("default group isolation wrong: %v", dn)
+	}
+	rn := names(buildDirectory(cfg, "research"))
+	if !rn["paper"] || !rn["secretary-research"] || rn["backend"] || rn["secretary"] {
+		t.Fatalf("research group isolation wrong: %v", rn)
 	}
 }

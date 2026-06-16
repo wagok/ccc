@@ -610,7 +610,7 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleSubscribeCmd(conn, encoder, cfg, req)
 			return // Subscribe keeps connection open until done
 		case "agent.list":
-			handleAgentListCmd(encoder, cfg)
+			handleAgentListCmd(encoder, cfg, req)
 		case "agent.get":
 			handleAgentGetCmd(encoder, cfg, req)
 		case "agent.update_self":
