@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.6"
+const version = "1.16.7"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -49,14 +49,22 @@ type TelegramMessage struct {
 	} `json:"from"`
 	Text           string           `json:"text"`
 	ReplyToMessage *TelegramMessage `json:"reply_to_message,omitempty"`
-	Voice          *TelegramVoice   `json:"voice,omitempty"`
-	Photo          []TelegramPhoto  `json:"photo,omitempty"`
-	Caption        string           `json:"caption,omitempty"`
+	Voice          *TelegramVoice    `json:"voice,omitempty"`
+	Photo          []TelegramPhoto   `json:"photo,omitempty"`
+	Document       *TelegramDocument `json:"document,omitempty"`
+	Caption        string            `json:"caption,omitempty"`
 }
 
 type TelegramVoice struct {
 	FileID   string `json:"file_id"`
 	Duration int    `json:"duration"`
+}
+
+type TelegramDocument struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
 }
 
 type TelegramPhoto struct {
@@ -5611,7 +5619,86 @@ func listen() error {
 						sendMessage(config, chatID, threadID, "📷 Image saved, sending to Claude...")
 						startContinuousTyping(config, chatID, threadID, sessionName)
 						// Send text first, wait for image to load, then send Enter
-						sendToTmuxWithDelay(tmuxName, prompt, 2*time.Second)
+						sendToTmuxWithDelay(tmuxName, senderTag+prompt, 2*time.Second)
+					}
+				}
+				continue
+			}
+
+			// Document/file messages (a file with an optional caption)
+			if msg.Document != nil && isGroup && threadID > 0 {
+				config, _ = loadConfig()
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
+				if sessionName != "" {
+					sessionInfo := config.Sessions[sessionName]
+					hostName := ""
+					if sessionInfo != nil {
+						hostName = sessionInfo.Host
+					}
+					_, projectName := parseSessionTarget(sessionName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
+
+					fileName := msg.Document.FileName
+					if fileName == "" {
+						fileName = "file"
+					}
+					docPath := filepath.Join(os.TempDir(), fmt.Sprintf("telegram_%d_%s", time.Now().UnixNano(), filepath.Base(fileName)))
+					if err := downloadTelegramFile(config, msg.Document.FileID, docPath); err != nil {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
+						continue
+					}
+
+					caption := msg.Caption
+					if caption == "" {
+						caption = "Here is a file:"
+					}
+
+					if hostName != "" {
+						hostInfo := config.Hosts[hostName]
+						if hostInfo == nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Host %s not found in config", hostName))
+							continue
+						}
+						if !isClaudeRunning(tmuxName, hostInfo.Address) {
+							sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+							if !restartClaudeInSession(tmuxName, hostInfo.Address) {
+								sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+								continue
+							}
+							sendMessage(config, chatID, threadID, "✅ Session restarted")
+						}
+						sendMessage(config, chatID, threadID, "📎 Transferring file to remote host...")
+						if err := scpToHost(hostInfo.Address, docPath, docPath, 60*time.Second); err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ SCP failed: %v", err))
+							continue
+						}
+						appendHistory(threadID, HistoryMessage{
+							ID: nextMessageID(), Timestamp: time.Now().Unix(),
+							From: "human", Type: "document", Path: docPath, Caption: caption, Username: msg.From.Username,
+						})
+						startContinuousTyping(config, chatID, threadID, sessionName)
+						sshTmuxSendKeys(hostInfo.Address, tmuxName, fmt.Sprintf("%s%s %s", senderTag, caption, docPath))
+						os.Remove(docPath)
+						continue
+					}
+
+					// Local session
+					if tmuxSessionExists(tmuxName) {
+						if !isClaudeRunning(tmuxName, "") {
+							sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+							if !restartClaudeInSession(tmuxName, "") {
+								sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+								continue
+							}
+							sendMessage(config, chatID, threadID, "✅ Session restarted")
+						}
+						appendHistory(threadID, HistoryMessage{
+							ID: nextMessageID(), Timestamp: time.Now().Unix(),
+							From: "human", Type: "document", Path: docPath, Caption: caption, Username: msg.From.Username,
+						})
+						sendMessage(config, chatID, threadID, "📎 File saved, sending to Claude...")
+						startContinuousTyping(config, chatID, threadID, sessionName)
+						sendToTmuxWithDelay(tmuxName, fmt.Sprintf("%s%s %s", senderTag, caption, docPath), 2*time.Second)
 					}
 				}
 				continue
