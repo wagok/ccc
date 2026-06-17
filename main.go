@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.21.0"
+const version = "1.21.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -1988,7 +1988,7 @@ func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName, a
 // ---- Live streaming responses (editMessageText) -------------------------
 
 const (
-	streamEditInterval = 1100 * time.Millisecond // throttle: ~1 edit/sec
+	streamEditInterval = 3 * time.Second // throttle: ~1 edit / 3s
 	telegramTextLimit  = 4096
 )
 
