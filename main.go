@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,9 +26,10 @@ import (
 	"time"
 
 	"github.com/kidandcat/ccc/internal/config"
+	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.22.0"
+const version = "1.23.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2212,6 +2214,92 @@ func handleSendFileCmd() error {
 		Text:      note,
 	})
 	fmt.Printf("✅ Sent %s to topic %d\n", filepath.Base(path), topicID)
+	return nil
+}
+
+//go:embed briefing/agent_briefing.md
+var agentBriefingTemplate string
+
+// firstLine returns the first line of s, trimmed and capped to max runes.
+func firstLine(s string, max int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > max {
+		return strings.TrimSpace(string(r[:max])) + "…"
+	}
+	return s
+}
+
+// handleAgentBriefing prints the CCC environment + tools briefing for the session
+// that owns the current working directory. It is the SINGLE source of truth for
+// "what environment am I in and what can I do": wired as a SessionStart hook (its
+// stdout is injected into the agent's context) and reused on demand by the
+// ccc-agent skill. The static body lives in briefing/agent_briefing.md; identity
+// and the live agent directory are filled in here.
+func handleAgentBriefing() error {
+	config, err := loadConfig()
+	if err != nil {
+		return nil // never block a session start
+	}
+	cwd, _ := os.Getwd()
+	var sessionName string
+	var info *SessionInfo
+	for name, si := range config.Sessions {
+		if si == nil {
+			continue
+		}
+		if cwd == si.Path || strings.HasPrefix(cwd, si.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
+			sessionName, info = name, si
+			break
+		}
+	}
+	if sessionName == "" {
+		return nil // not a CCC session — inject nothing
+	}
+
+	// Secretaries follow their own operating manual; skip the ordinary brief.
+	if mail.IsSecretary(sessionName) {
+		fmt.Println("# CCC\n\nYou are the CCC secretary for this group — follow your own operating manual (CLAUDE.md). The ordinary-agent briefing below does not apply to you.")
+		return nil
+	}
+
+	group := sessionGroup(info)
+	var b strings.Builder
+	b.WriteString("# Your CCC environment\n\n")
+	fmt.Fprintf(&b, "You are agent `%s` — Telegram topic %d, group `%s`.\n\n", sessionName, info.TopicID, group)
+	b.WriteString(strings.TrimSpace(agentBriefingTemplate))
+	b.WriteString("\n")
+
+	// Live agent directory — only agents that published a card (real mail
+	// participants), excluding self and the secretary. Kept short: one line each,
+	// capped, with a pointer to list_agents. The "default" group is a catch-all
+	// of many cardless sessions, so dumping all of them every start would be huge.
+	const maxPeers = 15
+	var peers []AgentInfo
+	for _, a := range buildDirectory(config, group) {
+		if a.Name == sessionName || mail.IsSecretary(a.Name) || a.Description == "" {
+			continue
+		}
+		peers = append(peers, a)
+	}
+	if len(peers) > 0 {
+		b.WriteString("\n## Agents you can reach (via `secretary` mail)\n")
+		shown := peers
+		if len(shown) > maxPeers {
+			shown = shown[:maxPeers]
+		}
+		for _, a := range shown {
+			b.WriteString("- `" + a.Name + "` — " + firstLine(a.Description, 100) + "\n")
+		}
+		if len(peers) > maxPeers {
+			fmt.Fprintf(&b, "- …and %d more — use `list_agents` for the full directory.\n", len(peers)-maxPeers)
+		}
+		b.WriteString("Use `get_agent(name)` for a full card before writing.\n")
+	}
+
+	fmt.Print(b.String())
 	return nil
 }
 
@@ -4865,6 +4953,9 @@ func installHook() error {
 	// no-ops unless the session is in "live" integration mode).
 	displayAdded := addHookToEvent(hooks, "MessageDisplay", cccPath+" hook-display")
 
+	// Add SessionStart hook that injects the CCC environment+tools briefing.
+	briefingAdded := addHookToEvent(hooks, "SessionStart", cccPath+" agent-briefing")
+
 	settings["hooks"] = hooks
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
@@ -4876,7 +4967,7 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded || preToolAdded || displayAdded {
+	if stopAdded || preToolAdded || displayAdded || briefingAdded {
 		fmt.Println("✅ Claude hooks installed!")
 		if stopAdded {
 			fmt.Println("  + Stop hook (response capture)")
@@ -4886,6 +4977,9 @@ func installHook() error {
 		}
 		if displayAdded {
 			fmt.Println("  + MessageDisplay hook (live streaming)")
+		}
+		if briefingAdded {
+			fmt.Println("  + SessionStart hook (agent briefing)")
 		}
 	} else {
 		fmt.Println("✅ Claude hooks already installed")
@@ -7611,6 +7705,13 @@ func main() {
 	case "send-file":
 		// Agent attaches a file to its Telegram topic: ccc send-file <path> [caption]
 		if err := handleSendFileCmd(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "agent-briefing":
+		// SessionStart: inject the CCC environment+tools briefing into context.
+		if err := handleAgentBriefing(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
