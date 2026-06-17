@@ -21,6 +21,11 @@ type SessionInfo struct {
 	// resistant) or "live" (richer hook-driven streaming/buttons/typing).
 	// "" means inherit the global default (see SessionIntegrationMode).
 	IntegrationMode string `json:"integration_mode,omitempty"`
+
+	// StreamOff disables live response streaming for this session even when it
+	// is in "live" mode (typing/buttons stay on). Default (false) = streaming on
+	// in live mode. Toggled on the fly with /stream on|off.
+	StreamOff bool `json:"stream_off,omitempty"`
 }
 
 // GroupInfo stores a project-group (a separate Telegram group/channel). Groups

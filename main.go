@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.23.0"
+const version = "1.24.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -4270,8 +4270,9 @@ func handleDisplayHook() error {
 			break
 		}
 	}
-	if sessionName == "" || !isSessionLive(config, config.Sessions[sessionName]) {
-		return nil
+	info := config.Sessions[sessionName]
+	if sessionName == "" || !isSessionLive(config, info) || (info != nil && info.StreamOff) {
+		return nil // not live, or streaming explicitly disabled for this session
 	}
 	callSocket(APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "delta", Text: hd.Delta})
 	return nil
@@ -5239,6 +5240,7 @@ func setBotCommands(botToken string) {
 			{"command": "list", "description": "List sessions with status"},
 			{"command": "status", "description": "Show current session details"},
 			{"command": "mode", "description": "Integration mode: /mode legacy|live"},
+			{"command": "stream", "description": "Toggle live streaming: /stream on|off"},
 			{"command": "host", "description": "Manage hosts: /host add|del|list|check"},
 			{"command": "rc", "description": "Remote command: /rc <host> <cmd>"},
 			{"command": "setdir", "description": "Set projects dir: /setdir [host:]<path>"},
@@ -6681,6 +6683,10 @@ func listen() error {
 • /host check <name> — Check connectivity
 • /rc <host> <cmd> — Run command on host
 
+*Integration (per topic):*
+• /mode \[legacy|live\] — Show/set integration mode
+• /stream \[on|off\] — Toggle live response streaming (live mode)
+
 *Settings:*
 • /setdir \[host:\]<path> — Set projects directory
 • /away — Toggle notifications
@@ -6839,6 +6845,56 @@ func listen() error {
 					continue
 				}
 				sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Integration mode for *%s* set to `%s`.", sessionName, arg))
+				continue
+			}
+
+			// /stream [on|off] - toggle live response streaming for this topic's
+			// session (only meaningful in live mode). Admin-only; on the fly.
+			if strings.HasPrefix(text, "/stream") && isGroup {
+				if msg.From.ID != config.ChatID {
+					continue // admin only
+				}
+				arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/stream")))
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
+				if sessionName == "" {
+					sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
+					continue
+				}
+				info := config.Sessions[sessionName]
+				if info == nil {
+					sendMessage(config, chatID, threadID, "❌ Session info not found")
+					continue
+				}
+				if arg == "" {
+					state := "on"
+					if info.StreamOff {
+						state = "off"
+					}
+					note := ""
+					if !isSessionLive(config, info) {
+						note = " (note: only active in `live` mode — see /mode)"
+					}
+					sendMessage(config, chatID, threadID, fmt.Sprintf("📡 Streaming for *%s*: `%s`%s\nUsage: /stream on|off", sessionName, state, note))
+					continue
+				}
+				switch arg {
+				case "on":
+					info.StreamOff = false
+				case "off":
+					info.StreamOff = true
+				default:
+					sendMessage(config, chatID, threadID, "❌ Usage: /stream on|off")
+					continue
+				}
+				if err := saveConfig(config); err != nil {
+					sendMessage(config, chatID, threadID, "❌ save failed: "+err.Error())
+					continue
+				}
+				note := ""
+				if arg == "on" && !isSessionLive(config, info) {
+					note = "\n⚠️ Streaming is only active in `live` mode — run /mode live."
+				}
+				sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Streaming for *%s* set to `%s`.%s", sessionName, arg, note))
 				continue
 			}
 
