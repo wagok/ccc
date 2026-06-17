@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.20.1"
+const version = "1.20.2"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -53,6 +53,9 @@ type TelegramMessage struct {
 	Photo          []TelegramPhoto   `json:"photo,omitempty"`
 	Document       *TelegramDocument `json:"document,omitempty"`
 	Caption        string            `json:"caption,omitempty"`
+	ReplyMarkup    *struct {
+		InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+	} `json:"reply_markup,omitempty"`
 }
 
 type TelegramVoice struct {
@@ -1889,55 +1892,93 @@ func injectTmuxKeys(config *Config, sessionName string, keys ...string) bool {
 	return true
 }
 
-// handleMultiSelectCallback handles a button press for a multiSelect question:
-// "m" toggles one option (state kept in pendingQuestions, keyboard re-rendered);
-// "x" submits the toggled set by injecting the TUI key sequence (Enter toggles
-// each selected option, Down walks the list, Right -> Submit tab, Enter).
-func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName string, qIdx, total, optIdx int, action string) {
-	val, ok := pendingQuestions.Load(sessionName)
-	if !ok {
+const (
+	markOn  = "☑️"
+	markOff = "▫️"
+)
+
+// toggleCheckmark flips a multiSelect button label's leading checkbox prefix.
+func toggleCheckmark(text string) string {
+	switch {
+	case strings.HasPrefix(text, markOn+" "):
+		return markOff + " " + strings.TrimPrefix(text, markOn+" ")
+	case strings.HasPrefix(text, markOff+" "):
+		return markOn + " " + strings.TrimPrefix(text, markOff+" ")
+	}
+	return text
+}
+
+// cleanOptionLabel strips the checkbox prefix and trailing description from a
+// multiSelect button label, leaving just the option label for summaries.
+func cleanOptionLabel(text string) string {
+	text = strings.TrimPrefix(strings.TrimPrefix(text, markOn+" "), markOff+" ")
+	if i := strings.Index(text, " — "); i >= 0 {
+		text = text[:i]
+	}
+	return text
+}
+
+// handleMultiSelectCallback handles a button press for a multiSelect question.
+// State lives in the Telegram message's own inline keyboard (the ☑️/▫️ prefixes),
+// NOT in process memory — the question is registered by a separate hook process,
+// so the bot has no shared state. "m" toggles the pressed option's checkbox and
+// re-renders; "x" reads the checked set from the keyboard and submits by
+// injecting the TUI key sequence (Enter toggles each selected, Down walks the
+// list, Right -> Submit tab, Enter).
+func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName, action string) {
+	if cb.Message == nil || cb.Message.ReplyMarkup == nil {
 		return
 	}
-	pqs := val.(*PendingQuestionSet)
-	if qIdx < 0 || qIdx >= len(pqs.Questions) {
-		return
-	}
-	pq := &pqs.Questions[qIdx]
-	if len(pq.Selected) < len(pq.Options) {
-		s := make([]bool, len(pq.Options))
-		copy(s, pq.Selected)
-		pq.Selected = s
-	}
+	kb := cb.Message.ReplyMarkup.InlineKeyboard
 
 	switch action {
-	case "m": // toggle one option, re-render the keyboard with checkmarks
-		if optIdx >= 0 && optIdx < len(pq.Selected) {
-			pq.Selected[optIdx] = !pq.Selected[optIdx]
-		}
-		if cb.Message != nil {
-			editMessageKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
-				buildMultiSelectKeyboard(sessionName, qIdx, total, *pq))
-		}
-	case "x": // submit the toggled set
-		var chosen []string
-		for i := range pq.Options {
-			if i < len(pq.Selected) && pq.Selected[i] {
-				chosen = append(chosen, pq.Options[i].Label)
+	case "m": // toggle the pressed option, re-render the keyboard
+		for r := range kb {
+			for c := range kb[r] {
+				if kb[r][c].CallbackData == cb.Data {
+					kb[r][c].Text = toggleCheckmark(kb[r][c].Text)
+				}
 			}
 		}
-		injectTmuxKeys(config, sessionName, multiSelectSubmitKeys(pq.Selected, len(pq.Options))...)
+		editMessageKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID, kb)
+
+	case "x": // submit: derive the checked set from the keyboard, inject keys
+		selByIdx := map[int]bool{}
+		labelByIdx := map[int]string{}
+		maxIdx := -1
+		for r := range kb {
+			for c := range kb[r] {
+				b := kb[r][c]
+				if !strings.HasSuffix(b.CallbackData, ":m") {
+					continue // skip the Submit button
+				}
+				p := strings.Split(b.CallbackData, ":")
+				idx, _ := strconv.Atoi(p[len(p)-2])
+				selByIdx[idx] = strings.HasPrefix(b.Text, markOn)
+				labelByIdx[idx] = cleanOptionLabel(b.Text)
+				if idx > maxIdx {
+					maxIdx = idx
+				}
+			}
+		}
+		n := maxIdx + 1
+		selected := make([]bool, n)
+		var chosen []string
+		for i := 0; i < n; i++ {
+			selected[i] = selByIdx[i]
+			if selected[i] {
+				chosen = append(chosen, labelByIdx[i])
+			}
+		}
+		injectTmuxKeys(config, sessionName, multiSelectSubmitKeys(selected, n)...)
 
 		summary := "(nothing)"
 		if len(chosen) > 0 {
 			summary = strings.Join(chosen, ", ")
 		}
-		if cb.Message != nil {
-			editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
-				cb.Message.Text+"\n\n☑️ Submitted: "+summary)
-			appendHistoryDedup(cb.Message.MessageThreadID, "human", "Selected: "+summary)
-		}
-		pq.Answered = true
-		pendingQuestions.Delete(sessionName)
+		editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
+			cb.Message.Text+"\n\n☑️ Submitted: "+summary)
+		appendHistoryDedup(cb.Message.MessageThreadID, "human", "Selected: "+summary)
 	}
 }
 
@@ -5839,10 +5880,7 @@ func listen() error {
 				// Parse right-anchored so session names containing ':' (host:project)
 				// still resolve correctly.
 				if n := len(parts); n >= 5 && (parts[n-1] == "m" || parts[n-1] == "x") {
-					optIdx, _ := strconv.Atoi(parts[n-2])
-					total, _ := strconv.Atoi(parts[n-3])
-					qIdx, _ := strconv.Atoi(parts[n-4])
-					handleMultiSelectCallback(config, cb, strings.Join(parts[:n-4], ":"), qIdx, total, optIdx, parts[n-1])
+					handleMultiSelectCallback(config, cb, strings.Join(parts[:n-4], ":"), parts[n-1])
 					continue
 				}
 
