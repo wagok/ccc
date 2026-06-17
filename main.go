@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.19.0"
+const version = "1.20.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -417,6 +417,7 @@ type PendingQuestion struct {
 	MultiSelect bool                    `json:"multi_select,omitempty"`
 	Answered    bool                    `json:"answered"`
 	AnswerIndex int                     `json:"answer_index,omitempty"`
+	Selected    []bool                  `json:"selected,omitempty"` // multiSelect: toggled options
 }
 
 // PendingQuestionSet represents all questions from one AskUserQuestion call
@@ -1794,6 +1795,152 @@ func editMessageRemoveKeyboard(config *Config, chatID int64, messageID int, newT
 		"text":       {newText},
 	}
 	telegramAPI(config, "editMessageText", params)
+}
+
+// editMessageKeyboard replaces only the inline keyboard of a message (used to
+// reflect multiSelect toggles without touching the message text).
+func editMessageKeyboard(config *Config, chatID int64, messageID int, buttons [][]InlineKeyboardButton) {
+	keyboardJSON, _ := json.Marshal(map[string]interface{}{"inline_keyboard": buttons})
+	params := url.Values{
+		"chat_id":      {fmt.Sprintf("%d", chatID)},
+		"message_id":   {fmt.Sprintf("%d", messageID)},
+		"reply_markup": {string(keyboardJSON)},
+	}
+	telegramAPI(config, "editMessageReplyMarkup", params)
+}
+
+// truncButtonLabel caps an inline-button label to Telegram's practical limit.
+func truncButtonLabel(s string) string {
+	if len(s) > 120 {
+		return s[:117] + "..."
+	}
+	return s
+}
+
+// buildMultiSelectKeyboard renders a multiSelect question's toggle buttons
+// (checkbox-prefixed, reflecting q.Selected) plus a Submit row. callback_data:
+// toggle = "session:qIdx:total:optIdx:m", submit = "session:qIdx:total:0:x".
+func buildMultiSelectKeyboard(sessionName string, qIdx, total int, q PendingQuestion) [][]InlineKeyboardButton {
+	var buttons [][]InlineKeyboardButton
+	for i, opt := range q.Options {
+		if opt.Label == "" {
+			continue
+		}
+		mark := "▫️"
+		if i < len(q.Selected) && q.Selected[i] {
+			mark = "☑️"
+		}
+		label := opt.Label
+		if opt.Description != "" {
+			label += " — " + opt.Description
+		}
+		buttons = append(buttons, []InlineKeyboardButton{{
+			Text:         truncButtonLabel(mark + " " + label),
+			CallbackData: fmt.Sprintf("%s:%d:%d:%d:m", sessionName, qIdx, total, i),
+		}})
+	}
+	buttons = append(buttons, []InlineKeyboardButton{{
+		Text:         "✅ Submit",
+		CallbackData: fmt.Sprintf("%s:%d:%d:0:x", sessionName, qIdx, total),
+	}})
+	return buttons
+}
+
+// multiSelectSubmitKeys returns the TUI key sequence that, from the initial
+// AskUserQuestion multiSelect state (cursor on the first option, nothing
+// checked), toggles exactly the selected options and submits: Enter toggles the
+// current option, Down advances, then Right opens the Submit tab and Enter
+// confirms "Submit answers".
+func multiSelectSubmitKeys(selected []bool, n int) []string {
+	var keys []string
+	for i := 0; i < n; i++ {
+		if i < len(selected) && selected[i] {
+			keys = append(keys, "Enter")
+		}
+		if i < n-1 {
+			keys = append(keys, "Down")
+		}
+	}
+	return append(keys, "Right", "Enter")
+}
+
+// injectTmuxKeys sends raw key names (e.g. "Down", "Enter", "Right") to a
+// session's Claude TUI, local or remote, with a short gap so the TUI registers
+// each one. Returns false if the tmux session isn't running.
+func injectTmuxKeys(config *Config, sessionName string, keys ...string) bool {
+	info, exists := config.Sessions[sessionName]
+	tmuxName := tmuxSessionName(sessionName)
+	remote := exists && info.Host != ""
+	var address string
+	if remote {
+		address = getHostAddress(config, info.Host)
+		if address == "" || !sshTmuxHasSession(address, tmuxName) {
+			return false
+		}
+	} else if !tmuxSessionExists(tmuxName) {
+		return false
+	}
+	for _, k := range keys {
+		if remote {
+			runSSH(address, fmt.Sprintf("tmux send-keys -t %s %s", shellQuote(tmuxName), k), 5*time.Second)
+		} else {
+			tmuxCmd("send-keys", "-t", tmuxName, k).Run()
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+	return true
+}
+
+// handleMultiSelectCallback handles a button press for a multiSelect question:
+// "m" toggles one option (state kept in pendingQuestions, keyboard re-rendered);
+// "x" submits the toggled set by injecting the TUI key sequence (Enter toggles
+// each selected option, Down walks the list, Right -> Submit tab, Enter).
+func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName string, qIdx, total, optIdx int, action string) {
+	val, ok := pendingQuestions.Load(sessionName)
+	if !ok {
+		return
+	}
+	pqs := val.(*PendingQuestionSet)
+	if qIdx < 0 || qIdx >= len(pqs.Questions) {
+		return
+	}
+	pq := &pqs.Questions[qIdx]
+	if len(pq.Selected) < len(pq.Options) {
+		s := make([]bool, len(pq.Options))
+		copy(s, pq.Selected)
+		pq.Selected = s
+	}
+
+	switch action {
+	case "m": // toggle one option, re-render the keyboard with checkmarks
+		if optIdx >= 0 && optIdx < len(pq.Selected) {
+			pq.Selected[optIdx] = !pq.Selected[optIdx]
+		}
+		if cb.Message != nil {
+			editMessageKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
+				buildMultiSelectKeyboard(sessionName, qIdx, total, *pq))
+		}
+	case "x": // submit the toggled set
+		var chosen []string
+		for i := range pq.Options {
+			if i < len(pq.Selected) && pq.Selected[i] {
+				chosen = append(chosen, pq.Options[i].Label)
+			}
+		}
+		injectTmuxKeys(config, sessionName, multiSelectSubmitKeys(pq.Selected, len(pq.Options))...)
+
+		summary := "(nothing)"
+		if len(chosen) > 0 {
+			summary = strings.Join(chosen, ", ")
+		}
+		if cb.Message != nil {
+			editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
+				cb.Message.Text+"\n\n☑️ Submitted: "+summary)
+			appendHistoryDedup(cb.Message.MessageThreadID, "human", "Selected: "+summary)
+		}
+		pq.Answered = true
+		pendingQuestions.Delete(sessionName)
+	}
 }
 
 func sendTypingAction(config *Config, chatID int64, threadID int64) {
@@ -3831,6 +3978,9 @@ func handlePermissionHook() error {
 					Description: opt.Description,
 				})
 			}
+			if pq.MultiSelect {
+				pq.Selected = make([]bool, len(pq.Options))
+			}
 			pqs.Questions = append(pqs.Questions, pq)
 		}
 		pendingQuestions.Store(sessionName, pqs)
@@ -3844,29 +3994,30 @@ func handlePermissionHook() error {
 				// Build message with option descriptions
 				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
 
-				// Build inline keyboard buttons
+				// Build inline keyboard buttons. multiSelect uses toggle buttons
+				// + a Submit row; single-select uses one button per option.
 				var buttons [][]InlineKeyboardButton
-				for i, opt := range q.Options {
-					if opt.Label == "" {
-						continue
+				if q.MultiSelect {
+					buttons = buildMultiSelectKeyboard(sessionName, qIdx, totalQuestions, pqs.Questions[qIdx])
+				} else {
+					for i, opt := range q.Options {
+						if opt.Label == "" {
+							continue
+						}
+						// Callback data format: session:questionIndex:totalQuestions:optionIndex
+						// Telegram limits callback_data to 64 bytes
+						callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
+						if len(callbackData) > 64 {
+							callbackData = callbackData[:64]
+						}
+						label := opt.Label
+						if opt.Description != "" {
+							label += " — " + opt.Description
+						}
+						buttons = append(buttons, []InlineKeyboardButton{
+							{Text: truncButtonLabel(label), CallbackData: callbackData},
+						})
 					}
-					// Callback data format: session:questionIndex:totalQuestions:optionIndex
-					// Telegram limits callback_data to 64 bytes
-					callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
-					if len(callbackData) > 64 {
-						callbackData = callbackData[:64]
-					}
-					label := opt.Label
-					if opt.Description != "" {
-						label += " — " + opt.Description
-					}
-					// Telegram button label max ~200 chars
-					if len(label) > 120 {
-						label = label[:117] + "..."
-					}
-					buttons = append(buttons, []InlineKeyboardButton{
-						{Text: label, CallbackData: callbackData},
-					})
 				}
 
 				if len(buttons) > 0 {
@@ -5682,6 +5833,18 @@ func listen() error {
 				// Parse callback data: session:questionIndex:totalQuestions:optionIndex
 				// Legacy format (3 parts): session:questionIndex:optionIndex
 				parts := strings.Split(cb.Data, ":")
+
+				// multiSelect callbacks: <session...>:<qIdx>:<total>:<optIdx>:<m|x>.
+				// Parse right-anchored so session names containing ':' (host:project)
+				// still resolve correctly.
+				if n := len(parts); n >= 5 && (parts[n-1] == "m" || parts[n-1] == "x") {
+					optIdx, _ := strconv.Atoi(parts[n-2])
+					total, _ := strconv.Atoi(parts[n-3])
+					qIdx, _ := strconv.Atoi(parts[n-4])
+					handleMultiSelectCallback(config, cb, strings.Join(parts[:n-4], ":"), qIdx, total, optIdx, parts[n-1])
+					continue
+				}
+
 				if len(parts) >= 3 {
 					sessionName := parts[0]
 					questionIndex, _ := strconv.Atoi(parts[1])
