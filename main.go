@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.16.9"
+const version = "1.17.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3444,6 +3444,71 @@ func logHook(hookType string, format string, args ...interface{}) {
 	fmt.Fprintf(f, "[%s] [%s] %s\n", timestamp, hookType, message)
 }
 
+// hookTracePath is the chronological JSONL file collecting EVERY hook event
+// while trace mode is enabled for a test agent. One JSON object per line.
+func hookTracePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".ccc", "hook-trace.jsonl")
+}
+
+// handleHookTrace is a passive, non-blocking logger wired onto ALL Claude hook
+// events for a single test agent. It records the complete raw hook payload (so
+// we can later discover which fields each event carries) and exits 0 with no
+// stdout, so it never alters Claude's behavior on any event. This is the
+// discovery tool for deciding which hooks are worth integrating.
+func handleHookTrace() error {
+	raw, _ := io.ReadAll(os.Stdin)
+
+	// Pull a few fields for quick scanning without losing the full payload.
+	var meta struct {
+		HookEventName string `json:"hook_event_name"`
+		ToolName      string `json:"tool_name"`
+		SessionID     string `json:"session_id"`
+		Cwd           string `json:"cwd"`
+	}
+	_ = json.Unmarshal(raw, &meta)
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".ccc"), 0755); err != nil {
+		return nil
+	}
+
+	// payload is the verbatim hook JSON; if it is not valid JSON, store it as a
+	// quoted string so the trace line itself stays valid JSON.
+	payload := json.RawMessage(raw)
+	if !json.Valid(raw) {
+		if b, e := json.Marshal(string(raw)); e == nil {
+			payload = b
+		} else {
+			payload = json.RawMessage(`null`)
+		}
+	}
+
+	entry := map[string]interface{}{
+		"ts":      time.Now().Format(time.RFC3339Nano),
+		"event":   meta.HookEventName,
+		"tool":    meta.ToolName,
+		"session": meta.SessionID,
+		"cwd":     meta.Cwd,
+		"payload": payload,
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return nil
+	}
+
+	f, err := os.OpenFile(hookTracePath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	f.Write(append(line, '\n'))
+	return nil
+}
+
 // forwardToServer forwards a message to the server in client mode
 // Returns true if forwarded (client mode), false otherwise
 func forwardToServer(config *Config, cwd string, transcriptPath string, message string) bool {
@@ -4259,6 +4324,127 @@ func installHook() error {
 		}
 	} else {
 		fmt.Println("✅ Claude hooks already installed")
+	}
+	return nil
+}
+
+// allHookEvents lists every Claude Code hook event. Trace mode registers the
+// passive logger on all of them for one test agent.
+var allHookEvents = []string{
+	"PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification",
+	"Stop", "SubagentStop", "PreCompact", "SessionStart", "SessionEnd",
+}
+
+// removeHookFromEvent removes a hook command from an event. Returns true if it
+// removed anything. Empties are pruned so the settings stay clean.
+func removeHookFromEvent(hooks map[string]interface{}, eventName, command string) bool {
+	entries, ok := hooks[eventName].([]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	var keptEntries []interface{}
+	for _, entry := range entries {
+		entryMap, ok := entry.(map[string]interface{})
+		if !ok {
+			keptEntries = append(keptEntries, entry)
+			continue
+		}
+		hooksList, _ := entryMap["hooks"].([]interface{})
+		var kept []interface{}
+		for _, h := range hooksList {
+			if hm, ok := h.(map[string]interface{}); ok && hm["command"] == command {
+				changed = true
+				continue
+			}
+			kept = append(kept, h)
+		}
+		if len(kept) == 0 {
+			continue // drop now-empty matcher entry
+		}
+		entryMap["hooks"] = kept
+		keptEntries = append(keptEntries, entryMap)
+	}
+	if len(keptEntries) == 0 {
+		delete(hooks, eventName)
+	} else {
+		hooks[eventName] = keptEntries
+	}
+	return changed
+}
+
+// installHookTrace adds (enable) or removes (disable) the passive `ccc
+// hook-trace` logger on ALL hook events in a project's .claude/settings.json,
+// scoping trace mode to that single agent. The user-global settings.json (the
+// real Stop/PreToolUse hooks) is left untouched.
+func installHookTrace(projectDir string, enable bool) error {
+	abs, err := filepath.Abs(projectDir)
+	if err != nil {
+		return err
+	}
+	if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+		return fmt.Errorf("not a directory: %s", abs)
+	}
+	home, _ := os.UserHomeDir()
+	cccPath := filepath.Join(home, "bin", "ccc")
+	command := cccPath + " hook-trace"
+
+	claudeDir := filepath.Join(abs, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		return err
+	}
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+
+	settings := map[string]interface{}{}
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("parse %s: %w", settingsPath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	hooks, ok := settings["hooks"].(map[string]interface{})
+	if !ok {
+		hooks = map[string]interface{}{}
+	}
+
+	changed := false
+	for _, ev := range allHookEvents {
+		if enable {
+			if addHookToEvent(hooks, ev, command) {
+				changed = true
+			}
+		} else {
+			if removeHookFromEvent(hooks, ev, command) {
+				changed = true
+			}
+		}
+	}
+	settings["hooks"] = hooks
+
+	newData, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(settingsPath, newData, 0644); err != nil {
+		return err
+	}
+
+	state := "enabled"
+	if !enable {
+		state = "disabled"
+	}
+	if !changed {
+		fmt.Printf("✅ Hook trace already %s for %s\n", state, abs)
+		return nil
+	}
+	fmt.Printf("✅ Hook trace %s for %s\n", state, abs)
+	fmt.Printf("   settings: %s\n", settingsPath)
+	if enable {
+		fmt.Printf("   trace log: %s\n", hookTracePath())
+		fmt.Printf("   events:    %s\n", strings.Join(allHookEvents, ", "))
+		fmt.Printf("   NOTE: restart the agent's Claude session so it reloads settings.\n")
 	}
 	return nil
 }
@@ -6793,6 +6979,23 @@ func main() {
 
 	case "hook-output":
 		if err := handleOutputHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-trace":
+		// Passive logger wired onto every hook event for a test agent.
+		if err := handleHookTrace(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-trace-on", "hook-trace-off":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: ccc %s <project-dir>\n", os.Args[1])
+			os.Exit(1)
+		}
+		if err := installHookTrace(os.Args[2], os.Args[1] == "hook-trace-on"); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
