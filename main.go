@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.17.0"
+const version = "1.17.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -4328,11 +4328,22 @@ func installHook() error {
 	return nil
 }
 
-// allHookEvents lists every Claude Code hook event. Trace mode registers the
-// passive logger on all of them for one test agent.
+// allHookEvents lists the Claude Code hook events trace mode registers the
+// passive logger on for one test agent. It covers the classic stable set plus
+// the newer high-value events for our goals: interactive prompts
+// (PermissionRequest/Elicitation/Notification), progress streaming
+// (PostToolUse*/MessageDisplay) and reliability (StopFailure). Unknown event
+// names on older Claude Code versions are simply never fired, not an error.
 var allHookEvents = []string{
-	"PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification",
-	"Stop", "SubagentStop", "PreCompact", "SessionStart", "SessionEnd",
+	"SessionStart", "SessionEnd",
+	"UserPromptSubmit",
+	"PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch",
+	"PermissionRequest", "PermissionDenied",
+	"Elicitation", "ElicitationResult",
+	"Notification", "MessageDisplay",
+	"SubagentStart", "SubagentStop",
+	"Stop", "StopFailure",
+	"PreCompact", "PostCompact",
 }
 
 // removeHookFromEvent removes a hook command from an event. Returns true if it
