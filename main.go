@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.24.0"
+const version = "1.25.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2065,14 +2065,25 @@ func finalizeStream(cfg *Config, st *streamState, final string) {
 // the complete text and clears state. On "final" with no active stream it
 // returns Response="nostream" so the Stop hook can send the message normally.
 func handleStreamSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	info := cfg.Sessions[req.Session]
+	session := req.Session
+	if session == "" {
+		session = resolveSessionByHostCwd(cfg, req.Host, req.Cwd)
+	}
+	info := cfg.Sessions[session]
 	if info == nil {
 		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
 		return
 	}
+	// Stream only in live mode with streaming enabled; otherwise tell the caller
+	// "nostream" so its Stop hook sends the message normally.
+	if !isSessionLive(cfg, info) || info.StreamOff {
+		encoder.Encode(APIResponse{OK: true, Response: "nostream"})
+		return
+	}
+
 	streamMu.Lock()
 	defer streamMu.Unlock()
-	st := streamStates[req.Session]
+	st := streamStates[session]
 
 	switch req.StreamAction {
 	case "delta":
@@ -2081,8 +2092,8 @@ func handleStreamSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 			return
 		}
 		if st == nil {
-			st = &streamState{chatID: sessionGroupChatID(cfg, req.Session), threadID: info.TopicID}
-			streamStates[req.Session] = st
+			st = &streamState{chatID: sessionGroupChatID(cfg, session), threadID: info.TopicID}
+			streamStates[session] = st
 		}
 		st.text += req.Text
 		if st.msgID == 0 {
@@ -2095,12 +2106,12 @@ func handleStreamSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: true})
 	case "final":
 		if st == nil || st.msgID == 0 {
-			delete(streamStates, req.Session)
+			delete(streamStates, session)
 			encoder.Encode(APIResponse{OK: true, Response: "nostream"})
 			return
 		}
 		finalizeStream(cfg, st, req.Text)
-		delete(streamStates, req.Session)
+		delete(streamStates, session)
 		encoder.Encode(APIResponse{OK: true})
 	default:
 		encoder.Encode(APIResponse{OK: false, Error: "stream_action must be delta|final"})
@@ -2564,21 +2575,35 @@ func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName stri
 // handleTypingSocketCmd lets a hook process drive the typing indicator inside
 // the bot process (live integration mode). req.Text is "start" or "stop".
 func handleTypingSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
-	info := cfg.Sessions[req.Session]
+	// Hooks may identify the session directly (server-local) or by host+cwd
+	// (relayed from a client). The live-mode gate lives here so clients — which
+	// don't have the session in their config — don't need to know the mode.
+	session := req.Session
+	if session == "" {
+		session = resolveSessionByHostCwd(cfg, req.Host, req.Cwd)
+	}
+	info := cfg.Sessions[session]
 	if info == nil {
 		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
 		return
 	}
+	live := isSessionLive(cfg, info)
 	switch req.Text {
 	case "start":
-		startContinuousTyping(cfg, sessionGroupChatID(cfg, req.Session), info.TopicID, req.Session)
+		if live {
+			startContinuousTyping(cfg, sessionGroupChatID(cfg, session), info.TopicID, session)
+		}
 	case "stop":
-		stopContinuousTyping(req.Session)
+		stopContinuousTyping(session)
 	default:
 		encoder.Encode(APIResponse{OK: false, Error: "state must be start|stop"})
 		return
 	}
-	encoder.Encode(APIResponse{OK: true})
+	resp := APIResponse{OK: true}
+	if live {
+		resp.Response = "live" // lets a client cache the mode for the turn
+	}
+	encoder.Encode(resp)
 }
 
 // stopContinuousTyping stops the typing indicator for a session
@@ -2732,6 +2757,9 @@ func runSSH(address string, command string, timeout time.Duration) (string, erro
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/ccc-ssh-%C",
+		"-o", "ControlPersist=30s",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
 		address,
 		wrappedCmd,
@@ -2768,6 +2796,9 @@ func runSSHWithInput(address string, command string, input string, timeout time.
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/ccc-ssh-%C",
+		"-o", "ControlPersist=30s",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
 		address,
 		wrappedCmd,
@@ -3780,12 +3811,32 @@ func isSessionLive(cfg *Config, info *SessionInfo) bool {
 	return config.SessionIntegrationMode(cfg, info) == config.IntegrationLive
 }
 
-// callSocket sends one APIRequest to the local CCC Unix socket and returns the
-// response. Short-lived hook processes use it to signal the long-running bot
-// process, which holds in-memory state (e.g. typing indicators) that a separate
-// process cannot touch directly. Best-effort: returns an error if the bot isn't
-// listening (e.g. on a client machine), callers should ignore it gracefully.
-func callSocket(req APIRequest) (*APIResponse, error) {
+// callSocket delivers one APIRequest to the CCC bot and returns the response.
+// Short-lived hook processes use it to signal the long-running bot, which holds
+// in-memory state (typing indicators, live stream messages) a separate process
+// cannot touch. On the server it dials the local Unix socket; on a CLIENT
+// machine (no local bot) it relays over SSH to the server's `ccc mcp-relay`
+// (stamping the caller host), so live signals from remote agents reach the bot.
+// Best-effort: callers should ignore errors gracefully.
+func callSocket(cfg *Config, req APIRequest) (*APIResponse, error) {
+	if cfg != nil && cfg.Mode == "client" && cfg.Server != "" && cfg.HostName != "" {
+		req.Host = cfg.HostName
+		data, err := json.Marshal(req)
+		if err != nil {
+			return nil, err
+		}
+		out, err := runSSHWithInput(cfg.Server, "base64 -d | ccc mcp-relay",
+			base64.StdEncoding.EncodeToString(data), 15*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		var resp APIResponse
+		if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+			return nil, err
+		}
+		return &resp, nil
+	}
+
 	conn, err := net.DialTimeout("unix", socketPath(), 2*time.Second)
 	if err != nil {
 		return nil, err
@@ -3804,6 +3855,44 @@ func callSocket(req APIRequest) (*APIResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// liveCachePath is a per-cwd temp marker letting client hooks remember, for the
+// turn, whether the session is live (learned from the typing-start response).
+// This avoids relaying every stream delta over SSH for legacy remote agents.
+func liveCachePath(cwd string) string {
+	return filepath.Join(os.TempDir(), "ccc-live"+strings.ReplaceAll(cwd, "/", "_"))
+}
+func writeLiveCache(cwd string, live bool) {
+	v := "legacy"
+	if live {
+		v = "live"
+	}
+	os.WriteFile(liveCachePath(cwd), []byte(v), 0600)
+}
+func liveCacheSaysLive(cwd string) bool {
+	b, _ := os.ReadFile(liveCachePath(cwd))
+	return string(b) == "live"
+}
+
+// resolveSessionByHostCwd finds the session on `host` ("" = server-local) whose
+// path matches `cwd`. Used server-side to map a relayed live signal (which knows
+// only the caller's host + cwd, not the server's "host:project" session name)
+// back to a session.
+func resolveSessionByHostCwd(cfg *Config, host, cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+	for name, info := range cfg.Sessions {
+		if info == nil || info.Deleted || info.Host != host {
+			continue
+		}
+		_, proj := parseSessionTarget(name)
+		if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+proj) {
+			return name
+		}
+	}
+	return ""
 }
 
 // humanTag returns a sender prefix to prepend to a human message injected into
@@ -4167,6 +4256,22 @@ func handleHook() error {
 	}
 	logHook("Stop", "message=%s", logMsg)
 
+	// Stop the live typing indicator — the turn ended. Works for local and
+	// remote agents (relayed to the server in client mode, which resolves the
+	// session by host+cwd).
+	callSocket(config, APIRequest{Cmd: "typing", Cwd: hookData.Cwd, Text: "stop"})
+
+	// Remote live agent: if a stream was active, finalize it on the server with
+	// the complete text instead of forwarding a duplicate message. Gated by the
+	// per-turn live cache so legacy remote agents skip this entirely.
+	if config.Mode == "client" && liveCacheSaysLive(hookData.Cwd) {
+		resp, err := callSocket(config, APIRequest{Cmd: "stream", Cwd: hookData.Cwd, StreamAction: "final", Text: lastMessage})
+		if err == nil && resp != nil && resp.OK && resp.Response != "nostream" {
+			os.Remove(liveCachePath(hookData.Cwd))
+			return nil
+		}
+	}
+
 	// In client mode, forward to server
 	if forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, lastMessage) {
 		logHook("Stop", "forwarded to server %s", config.Server)
@@ -4212,14 +4317,7 @@ func handleHook() error {
 	fmt.Fprintf(os.Stderr, "hook: session=%s topic=%d\n", sessionName, topicID)
 	fmt.Fprintf(os.Stderr, "hook: sending message to telegram\n")
 
-	// Stop typing indicator for this session. The in-process call is a no-op
-	// across processes (the bot owns the map), so in live mode signal the bot
-	// over the socket to stop deterministically (instead of its capture-pane
-	// heuristic). Best-effort: ignore errors (e.g. client machines).
-	stopContinuousTyping(sessionName)
-	if isSessionLive(config, config.Sessions[sessionName]) {
-		callSocket(APIRequest{Cmd: "typing", Session: sessionName, Text: "stop"})
-	}
+	// (typing already stopped above via the host-agnostic signal)
 
 	// Store Claude's response in history
 	appendHistory(topicID, HistoryMessage{
@@ -4235,7 +4333,7 @@ func handleHook() error {
 	// finalize it (one edit) instead of posting a duplicate. If there is no
 	// stream (e.g. no deltas arrived), fall through and send normally.
 	if isSessionLive(config, config.Sessions[sessionName]) {
-		if resp, err := callSocket(APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "final", Text: final}); err == nil && resp != nil && resp.OK && resp.Response != "nostream" {
+		if resp, err := callSocket(config, APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "final", Text: final}); err == nil && resp != nil && resp.OK && resp.Response != "nostream" {
 			return nil
 		}
 	}
@@ -4243,9 +4341,11 @@ func handleHook() error {
 	return sendMessage(config, sessionGroupChatID(config, sessionName), topicID, final)
 }
 
-// handleDisplayHook handles the MessageDisplay hook: in live integration mode it
-// forwards each incremental assistant-text delta to the bot, which streams it
-// into one Telegram message via editMessageText. No-op in legacy mode.
+// handleDisplayHook handles the MessageDisplay hook: in live mode it forwards
+// each incremental assistant-text delta to the bot, which streams it into one
+// Telegram message via editMessageText. No-op in legacy mode. Works for remote
+// agents too: in client mode it relays over SSH, gated by the per-turn live
+// cache so legacy remote agents don't relay anything.
 func handleDisplayHook() error {
 	defer func() { recover() }()
 	raw, _ := io.ReadAll(os.Stdin)
@@ -4257,9 +4357,21 @@ func handleDisplayHook() error {
 		return nil
 	}
 	config, err := loadConfig()
-	if err != nil || config == nil || config.Mode == "client" {
-		return nil // streaming is server-local for now
+	if err != nil || config == nil {
+		return nil
 	}
+
+	if config.Mode == "client" {
+		// Remote agent: only relay if this turn was marked live (set by the
+		// typing-start hook), so legacy remote agents incur zero relay cost.
+		if !liveCacheSaysLive(hd.Cwd) {
+			return nil
+		}
+		callSocket(config, APIRequest{Cmd: "stream", Cwd: hd.Cwd, StreamAction: "delta", Text: hd.Delta})
+		return nil
+	}
+
+	// Server-local: resolve the session and gate on live + streaming.
 	var sessionName string
 	for name, info := range config.Sessions {
 		if info == nil {
@@ -4272,9 +4384,9 @@ func handleDisplayHook() error {
 	}
 	info := config.Sessions[sessionName]
 	if sessionName == "" || !isSessionLive(config, info) || (info != nil && info.StreamOff) {
-		return nil // not live, or streaming explicitly disabled for this session
+		return nil
 	}
-	callSocket(APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "delta", Text: hd.Delta})
+	callSocket(config, APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "delta", Text: hd.Delta})
 	return nil
 }
 
@@ -4702,6 +4814,16 @@ func handlePromptHook() error {
 		prompt = prompt[:500] + "..."
 	}
 
+	// Start the live typing indicator as soon as a turn begins (the Stop hook
+	// ends it). Works for local AND remote agents: callSocket relays to the
+	// server in client mode; the server resolves the session by host+cwd and
+	// gates on live mode. The response tells us whether the session is live —
+	// cache it for the turn so the stream-delta hook can skip relaying on legacy
+	// remote agents (zero overhead). Idempotent (cancel+restart).
+	if resp, err := callSocket(config, APIRequest{Cmd: "typing", Cwd: hookData.Cwd, Text: "start"}); err == nil {
+		writeLiveCache(hookData.Cwd, resp != nil && resp.Response == "live")
+	}
+
 	// In client mode, forward to server
 	if forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, fmt.Sprintf("💬 %s", prompt)) {
 		return nil
@@ -4728,12 +4850,7 @@ func handlePromptHook() error {
 		return nil
 	}
 
-	// Live mode: start the deterministic typing indicator as soon as a turn
-	// begins (the Stop hook ends it). Covers terminal- and Telegram-driven
-	// prompts alike; startContinuousTyping cancels+restarts, so it's idempotent.
-	if isSessionLive(config, config.Sessions[sessionName]) {
-		callSocket(APIRequest{Cmd: "typing", Session: sessionName, Text: "start"})
-	}
+	_ = sessionName // typing-start now happens earlier (host-agnostic)
 
 	// Check if this prompt was just sent from Telegram (cooldown 10s)
 	if wasTelegramSent(topicID) {
