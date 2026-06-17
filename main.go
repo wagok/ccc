@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.17.1"
+const version = "1.18.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3222,6 +3222,10 @@ func sessionGroupChatID(cfg *Config, name string) int64 {
 func getSessionByGroupTopic(cfg *Config, chatID, topicID int64) string {
 	return config.GetSessionByGroupTopic(cfg, chatID, topicID)
 }
+func sessionIntegrationMode(cfg *Config, info *SessionInfo) string {
+	return config.SessionIntegrationMode(cfg, info)
+}
+func validIntegrationMode(s string) bool { return config.ValidIntegrationMode(s) }
 
 // humanTag returns a sender prefix to prepend to a human message injected into
 // an agent, so the agent can always tell which person is speaking — including
@@ -4579,6 +4583,7 @@ func setBotCommands(botToken string) {
 			{"command": "kill", "description": "Kill session: /kill <name>"},
 			{"command": "list", "description": "List sessions with status"},
 			{"command": "status", "description": "Show current session details"},
+			{"command": "mode", "description": "Integration mode: /mode legacy|live"},
 			{"command": "host", "description": "Manage hosts: /host add|del|list|check"},
 			{"command": "rc", "description": "Remote command: /rc <host> <cmd>"},
 			{"command": "setdir", "description": "Set projects dir: /setdir [host:]<path>"},
@@ -6131,6 +6136,45 @@ func listen() error {
 				alias := strings.TrimSpace(strings.TrimPrefix(text, "/changegroup"))
 				handleChangeGroup(config, chatID, threadID, alias)
 				config, _ = loadConfig() // reload after the move
+				continue
+			}
+
+			// /mode [legacy|live] - show or set this topic's Claude-Code
+			// integration mode (live = streaming/buttons/typing; legacy = robust
+			// Stop-only). Admin-only; takes effect on the fly (hooks read config).
+			if strings.HasPrefix(text, "/mode") && isGroup {
+				if msg.From.ID != config.ChatID {
+					continue // admin only
+				}
+				arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/mode")))
+				sessionName := getSessionByGroupTopic(config, chatID, threadID)
+				if sessionName == "" {
+					sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
+					continue
+				}
+				info := config.Sessions[sessionName]
+				if info == nil {
+					sendMessage(config, chatID, threadID, "❌ Session info not found")
+					continue
+				}
+				if arg == "" {
+					src := "global default"
+					if info.IntegrationMode != "" {
+						src = "session override"
+					}
+					sendMessage(config, chatID, threadID, fmt.Sprintf("⚙️ Integration mode for *%s*: `%s` (%s)\nUsage: /mode legacy|live", sessionName, sessionIntegrationMode(config, info), src))
+					continue
+				}
+				if !validIntegrationMode(arg) {
+					sendMessage(config, chatID, threadID, "❌ Unknown mode. Use: /mode legacy|live")
+					continue
+				}
+				info.IntegrationMode = arg
+				if err := saveConfig(config); err != nil {
+					sendMessage(config, chatID, threadID, "❌ save failed: "+err.Error())
+					continue
+				}
+				sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Integration mode for *%s* set to `%s`.", sessionName, arg))
 				continue
 			}
 

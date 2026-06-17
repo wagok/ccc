@@ -15,6 +15,12 @@ type SessionInfo struct {
 	Host    string `json:"host,omitempty"`    // Remote host name or "" for local
 	Deleted bool   `json:"deleted,omitempty"` // Soft-deleted (killed but topic preserved)
 	Group   string `json:"group,omitempty"`   // Project-group alias; "" = the default group
+
+	// IntegrationMode selects the Claude-Code integration behavior for this
+	// session: "legacy" (Stop-only, transcript-JSONL capture — robust, change-
+	// resistant) or "live" (richer hook-driven streaming/buttons/typing).
+	// "" means inherit the global default (see SessionIntegrationMode).
+	IntegrationMode string `json:"integration_mode,omitempty"`
 }
 
 // GroupInfo stores a project-group (a separate Telegram group/channel). Groups
@@ -62,6 +68,34 @@ type Config struct {
 	// (a separate Telegram group/channel). Added manually. The implicit
 	// "default" group is the original GroupID (see GroupChatID).
 	Groups map[string]*GroupInfo `json:"groups,omitempty"`
+
+	// DefaultIntegrationMode is the fleet-wide default Claude-Code integration
+	// mode for sessions that don't override it. "" -> IntegrationLegacy.
+	DefaultIntegrationMode string `json:"default_integration_mode,omitempty"`
+}
+
+// Claude-Code integration modes. legacy = current robust behavior (Stop hook +
+// transcript JSONL). live = richer hook-driven UX (streaming, buttons, typing).
+const (
+	IntegrationLegacy = "legacy"
+	IntegrationLive   = "live"
+)
+
+// ValidIntegrationMode reports whether s is a known integration mode.
+func ValidIntegrationMode(s string) bool {
+	return s == IntegrationLegacy || s == IntegrationLive
+}
+
+// SessionIntegrationMode returns the effective integration mode for a session:
+// its own override, else the global default, else legacy.
+func SessionIntegrationMode(config *Config, info *SessionInfo) string {
+	if info != nil && info.IntegrationMode != "" {
+		return info.IntegrationMode
+	}
+	if config != nil && config.DefaultIntegrationMode != "" {
+		return config.DefaultIntegrationMode
+	}
+	return IntegrationLegacy
 }
 
 // DefaultGroup is the alias of the implicit group backed by the original

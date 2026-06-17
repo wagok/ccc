@@ -130,3 +130,36 @@ func TestLoadBackCompatNoGroups(t *testing.T) {
 		t.Fatal("back-compat: existing session must resolve to default group 111")
 	}
 }
+
+func TestSessionIntegrationMode(t *testing.T) {
+	cfg := &Config{}
+	none := &SessionInfo{}                            // no override
+	live := &SessionInfo{IntegrationMode: "live"}     // override
+	legacy := &SessionInfo{IntegrationMode: "legacy"} // override
+
+	// Default with no global default = legacy.
+	if got := SessionIntegrationMode(cfg, none); got != IntegrationLegacy {
+		t.Fatalf("default = %q, want legacy", got)
+	}
+	// Session override wins.
+	if got := SessionIntegrationMode(cfg, live); got != IntegrationLive {
+		t.Fatalf("override = %q, want live", got)
+	}
+	// Global default applies when no session override.
+	cfg.DefaultIntegrationMode = IntegrationLive
+	if got := SessionIntegrationMode(cfg, none); got != IntegrationLive {
+		t.Fatalf("global default = %q, want live", got)
+	}
+	// Session override still beats global default.
+	if got := SessionIntegrationMode(cfg, legacy); got != IntegrationLegacy {
+		t.Fatalf("override over global = %q, want legacy", got)
+	}
+	// nil session falls back to global default.
+	if got := SessionIntegrationMode(cfg, nil); got != IntegrationLive {
+		t.Fatalf("nil session = %q, want live (global)", got)
+	}
+	// Validation.
+	if !ValidIntegrationMode("legacy") || !ValidIntegrationMode("live") || ValidIntegrationMode("bogus") {
+		t.Fatal("ValidIntegrationMode wrong")
+	}
+}
