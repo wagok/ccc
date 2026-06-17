@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,7 +27,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.21.1"
+const version = "1.22.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2102,6 +2103,116 @@ func handleStreamSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	default:
 		encoder.Encode(APIResponse{OK: false, Error: "stream_action must be delta|final"})
 	}
+}
+
+// sendDocument uploads a file to a chat/topic via Telegram's sendDocument
+// (multipart). Uses the resilient telegram HTTP client (DC fallback).
+func sendDocument(cfg *Config, chatID, threadID int64, filePath, caption string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	w.WriteField("chat_id", fmt.Sprintf("%d", chatID))
+	if threadID > 0 {
+		w.WriteField("message_thread_id", fmt.Sprintf("%d", threadID))
+	}
+	if caption != "" {
+		w.WriteField("caption", caption)
+	}
+	part, err := w.CreateFormFile("document", filepath.Base(filePath))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return err
+	}
+	w.Close()
+
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", cfg.BotToken)
+	req, err := http.NewRequest("POST", apiURL, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp, err := telegramHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	var r struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	json.Unmarshal(body, &r)
+	if !r.OK {
+		return fmt.Errorf("telegram: %s", r.Description)
+	}
+	return nil
+}
+
+// handleSendFileCmd implements `ccc send-file <path> [caption]`: an agent
+// attaches a file to its own Telegram topic. Runs from the agent's cwd, which
+// it uses to resolve both the (possibly relative) path and the owning session.
+func handleSendFileCmd() error {
+	args := os.Args[2:]
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: ccc send-file <path> [caption]")
+		os.Exit(1)
+	}
+	path := args[0]
+	caption := strings.Join(args[1:], " ")
+
+	config, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("no config: %w", err)
+	}
+	if config.Mode == "client" {
+		return fmt.Errorf("send-file is not yet supported on client machines")
+	}
+
+	cwd, _ := os.Getwd()
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cwd, path)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.IsDir() {
+		return fmt.Errorf("file not found: %s", path)
+	}
+
+	var sessionName string
+	var topicID int64
+	for name, info := range config.Sessions {
+		if info == nil {
+			continue
+		}
+		if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
+			sessionName, topicID = name, info.TopicID
+			break
+		}
+	}
+	if sessionName == "" || topicID == 0 {
+		return fmt.Errorf("no CCC session for cwd=%s", cwd)
+	}
+
+	if err := sendDocument(config, sessionGroupChatID(config, sessionName), topicID, path, caption); err != nil {
+		return err
+	}
+	note := "📎 " + filepath.Base(path)
+	if caption != "" {
+		note += " — " + caption
+	}
+	appendHistory(topicID, HistoryMessage{
+		ID:        nextMessageID(),
+		Timestamp: time.Now().Unix(),
+		From:      "claude",
+		Text:      note,
+	})
+	fmt.Printf("✅ Sent %s to topic %d\n", filepath.Base(path), topicID)
+	return nil
 }
 
 func sendTypingAction(config *Config, chatID int64, threadID int64) {
@@ -7493,6 +7604,13 @@ func main() {
 
 	case "hook-output":
 		if err := handleOutputHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "send-file":
+		// Agent attaches a file to its Telegram topic: ccc send-file <path> [caption]
+		if err := handleSendFileCmd(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
