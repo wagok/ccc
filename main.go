@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.20.2"
+const version = "1.21.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -155,6 +155,7 @@ type APIRequest struct {
 	Cwd           string          `json:"cwd,omitempty"`            // caller working dir (mcp-secretary: trusted identity source)
 	Host          string          `json:"host,omitempty"`           // caller machine id ("" = server-local); disambiguates same path on different hosts
 	Payload       json.RawMessage `json:"payload,omitempty"`        // command-specific args (mail/agent commands)
+	StreamAction  string          `json:"stream_action,omitempty"`  // for "stream": "delta" or "final"
 }
 
 // APIResponse represents a response on the Unix socket
@@ -669,6 +670,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleActivityCmd(encoder, cfg)
 		case "typing":
 			handleTypingSocketCmd(encoder, cfg, req)
+		case "stream":
+			handleStreamSocketCmd(encoder, cfg, req)
 		case "screenshot":
 			handleScreenshotCmd(encoder, cfg, req)
 		case "questions":
@@ -1979,6 +1982,125 @@ func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName, a
 		editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
 			cb.Message.Text+"\n\n☑️ Submitted: "+summary)
 		appendHistoryDedup(cb.Message.MessageThreadID, "human", "Selected: "+summary)
+	}
+}
+
+// ---- Live streaming responses (editMessageText) -------------------------
+
+const (
+	streamEditInterval = 1100 * time.Millisecond // throttle: ~1 edit/sec
+	telegramTextLimit  = 4096
+)
+
+type streamState struct {
+	msgID    int
+	chatID   int64
+	threadID int64
+	text     string
+	lastEdit time.Time
+}
+
+var (
+	streamStates = map[string]*streamState{} // session name -> live stream
+	streamMu     sync.Mutex
+)
+
+// streamDisplayText caps the in-progress text to Telegram's single-message limit.
+func streamDisplayText(s string) string {
+	if s == "" {
+		return "…"
+	}
+	if len(s) > telegramTextLimit-8 {
+		return s[:telegramTextLimit-8] + "\n…"
+	}
+	return s
+}
+
+// sendStreamMessage posts the initial streaming message and returns its id (0 on failure).
+func sendStreamMessage(cfg *Config, chatID, threadID int64, text string) int {
+	params := url.Values{"chat_id": {fmt.Sprintf("%d", chatID)}, "text": {text}}
+	if threadID > 0 {
+		params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
+	}
+	res, err := telegramAPI(cfg, "sendMessage", params)
+	if err != nil || res == nil || !res.OK {
+		return 0
+	}
+	var m struct {
+		MessageID int `json:"message_id"`
+	}
+	json.Unmarshal(res.Result, &m)
+	return m.MessageID
+}
+
+func editStreamMessage(cfg *Config, chatID int64, msgID int, text string) {
+	telegramAPI(cfg, "editMessageText", url.Values{
+		"chat_id":    {fmt.Sprintf("%d", chatID)},
+		"message_id": {fmt.Sprintf("%d", msgID)},
+		"text":       {text},
+	})
+}
+
+// finalizeStream replaces the streaming message with the complete text (the
+// first chunk by edit; any overflow chunks as new messages).
+func finalizeStream(cfg *Config, st *streamState, final string) {
+	if final == "" {
+		final = st.text
+	}
+	chunks := splitMessage(final, telegramTextLimit)
+	if len(chunks) == 0 {
+		return
+	}
+	editStreamMessage(cfg, st.chatID, st.msgID, chunks[0])
+	for _, c := range chunks[1:] {
+		sendMessage(cfg, st.chatID, st.threadID, c)
+	}
+}
+
+// handleStreamSocketCmd drives a live streaming response from hook processes.
+// StreamAction "delta" appends text and throttle-edits; "final" replaces with
+// the complete text and clears state. On "final" with no active stream it
+// returns Response="nostream" so the Stop hook can send the message normally.
+func handleStreamSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	info := cfg.Sessions[req.Session]
+	if info == nil {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	st := streamStates[req.Session]
+
+	switch req.StreamAction {
+	case "delta":
+		if req.Text == "" {
+			encoder.Encode(APIResponse{OK: true})
+			return
+		}
+		if st == nil {
+			st = &streamState{chatID: sessionGroupChatID(cfg, req.Session), threadID: info.TopicID}
+			streamStates[req.Session] = st
+		}
+		st.text += req.Text
+		if st.msgID == 0 {
+			st.msgID = sendStreamMessage(cfg, st.chatID, st.threadID, streamDisplayText(st.text))
+			st.lastEdit = time.Now()
+		} else if time.Since(st.lastEdit) >= streamEditInterval {
+			editStreamMessage(cfg, st.chatID, st.msgID, streamDisplayText(st.text))
+			st.lastEdit = time.Now()
+		}
+		encoder.Encode(APIResponse{OK: true})
+	case "final":
+		if st == nil || st.msgID == 0 {
+			delete(streamStates, req.Session)
+			encoder.Encode(APIResponse{OK: true, Response: "nostream"})
+			return
+		}
+		finalizeStream(cfg, st, req.Text)
+		delete(streamStates, req.Session)
+		encoder.Encode(APIResponse{OK: true})
+	default:
+		encoder.Encode(APIResponse{OK: false, Error: "stream_action must be delta|final"})
 	}
 }
 
@@ -3908,7 +4030,52 @@ func handleHook() error {
 		Text:      lastMessage,
 	})
 
-	return sendMessage(config, sessionGroupChatID(config, sessionName), topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+	final := fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage)
+
+	// In live mode, an active stream message is already showing this response —
+	// finalize it (one edit) instead of posting a duplicate. If there is no
+	// stream (e.g. no deltas arrived), fall through and send normally.
+	if isSessionLive(config, config.Sessions[sessionName]) {
+		if resp, err := callSocket(APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "final", Text: final}); err == nil && resp != nil && resp.OK && resp.Response != "nostream" {
+			return nil
+		}
+	}
+
+	return sendMessage(config, sessionGroupChatID(config, sessionName), topicID, final)
+}
+
+// handleDisplayHook handles the MessageDisplay hook: in live integration mode it
+// forwards each incremental assistant-text delta to the bot, which streams it
+// into one Telegram message via editMessageText. No-op in legacy mode.
+func handleDisplayHook() error {
+	defer func() { recover() }()
+	raw, _ := io.ReadAll(os.Stdin)
+	var hd struct {
+		Cwd   string `json:"cwd"`
+		Delta string `json:"delta"`
+	}
+	if json.Unmarshal(raw, &hd) != nil || hd.Delta == "" {
+		return nil
+	}
+	config, err := loadConfig()
+	if err != nil || config == nil || config.Mode == "client" {
+		return nil // streaming is server-local for now
+	}
+	var sessionName string
+	for name, info := range config.Sessions {
+		if info == nil {
+			continue
+		}
+		if hd.Cwd == info.Path || strings.HasPrefix(hd.Cwd, info.Path+"/") || strings.HasSuffix(hd.Cwd, "/"+name) {
+			sessionName = name
+			break
+		}
+	}
+	if sessionName == "" || !isSessionLive(config, config.Sessions[sessionName]) {
+		return nil
+	}
+	callSocket(APIRequest{Cmd: "stream", Session: sessionName, StreamAction: "delta", Text: hd.Delta})
+	return nil
 }
 
 func handlePermissionHook() error {
@@ -4583,6 +4750,10 @@ func installHook() error {
 	// Use timeout 300000ms (5min) to allow time for user to answer via Telegram
 	preToolAdded := addHookToEvent(hooks, "PreToolUse", cccPath+" hook-permission")
 
+	// Add MessageDisplay hook for live-mode response streaming (self-gates: it
+	// no-ops unless the session is in "live" integration mode).
+	displayAdded := addHookToEvent(hooks, "MessageDisplay", cccPath+" hook-display")
+
 	settings["hooks"] = hooks
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
@@ -4594,13 +4765,16 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded || preToolAdded {
+	if stopAdded || preToolAdded || displayAdded {
 		fmt.Println("✅ Claude hooks installed!")
 		if stopAdded {
 			fmt.Println("  + Stop hook (response capture)")
 		}
 		if preToolAdded {
 			fmt.Println("  + PreToolUse hook (AskUserQuestion forwarding)")
+		}
+		if displayAdded {
+			fmt.Println("  + MessageDisplay hook (live streaming)")
 		}
 	} else {
 		fmt.Println("✅ Claude hooks already installed")
@@ -7319,6 +7493,13 @@ func main() {
 
 	case "hook-output":
 		if err := handleOutputHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-display":
+		// MessageDisplay: stream assistant deltas to Telegram (live mode).
+		if err := handleDisplayHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
