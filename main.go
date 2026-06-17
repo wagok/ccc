@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.18.0"
+const version = "1.19.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -664,6 +664,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleHistoryCmd(encoder, cfg, req)
 		case "activity":
 			handleActivityCmd(encoder, cfg)
+		case "typing":
+			handleTypingSocketCmd(encoder, cfg, req)
 		case "screenshot":
 			handleScreenshotCmd(encoder, cfg, req)
 		case "questions":
@@ -1997,14 +1999,31 @@ func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName stri
 		sshAddress = ""
 	}
 
+	// In live integration mode, the turn boundary is known deterministically
+	// from the Stop hook (which signals stop via the socket), so we skip the
+	// fragile capture-pane "idle" heuristic and just refresh until stopped.
+	live := isSessionLive(cfg, cfg.Sessions[sessionName])
+
 	go func() {
 		typingTicker := time.NewTicker(4 * time.Second)
-		stateTicker := time.NewTicker(2 * time.Second)
 		defer typingTicker.Stop()
-		defer stateTicker.Stop()
 
 		// Send initial typing
 		sendTypingAction(cfg, chatID, threadID)
+
+		if live {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-typingTicker.C:
+					sendTypingAction(cfg, chatID, threadID)
+				}
+			}
+		}
+
+		stateTicker := time.NewTicker(2 * time.Second)
+		defer stateTicker.Stop()
 
 		// Track consecutive idle checks to avoid false positives
 		idleCount := 0
@@ -2033,6 +2052,26 @@ func startContinuousTyping(cfg *Config, chatID, threadID int64, sessionName stri
 			}
 		}
 	}()
+}
+
+// handleTypingSocketCmd lets a hook process drive the typing indicator inside
+// the bot process (live integration mode). req.Text is "start" or "stop".
+func handleTypingSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	info := cfg.Sessions[req.Session]
+	if info == nil {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+	switch req.Text {
+	case "start":
+		startContinuousTyping(cfg, sessionGroupChatID(cfg, req.Session), info.TopicID, req.Session)
+	case "stop":
+		stopContinuousTyping(req.Session)
+	default:
+		encoder.Encode(APIResponse{OK: false, Error: "state must be start|stop"})
+		return
+	}
+	encoder.Encode(APIResponse{OK: true})
 }
 
 // stopContinuousTyping stops the typing indicator for a session
@@ -3226,6 +3265,35 @@ func sessionIntegrationMode(cfg *Config, info *SessionInfo) string {
 	return config.SessionIntegrationMode(cfg, info)
 }
 func validIntegrationMode(s string) bool { return config.ValidIntegrationMode(s) }
+func isSessionLive(cfg *Config, info *SessionInfo) bool {
+	return config.SessionIntegrationMode(cfg, info) == config.IntegrationLive
+}
+
+// callSocket sends one APIRequest to the local CCC Unix socket and returns the
+// response. Short-lived hook processes use it to signal the long-running bot
+// process, which holds in-memory state (e.g. typing indicators) that a separate
+// process cannot touch directly. Best-effort: returns an error if the bot isn't
+// listening (e.g. on a client machine), callers should ignore it gracefully.
+func callSocket(req APIRequest) (*APIResponse, error) {
+	conn, err := net.DialTimeout("unix", socketPath(), 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(append(data, '\n')); err != nil {
+		return nil, err
+	}
+	var resp APIResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
 
 // humanTag returns a sender prefix to prepend to a human message injected into
 // an agent, so the agent can always tell which person is speaking — including
@@ -3633,8 +3701,14 @@ func handleHook() error {
 	fmt.Fprintf(os.Stderr, "hook: session=%s topic=%d\n", sessionName, topicID)
 	fmt.Fprintf(os.Stderr, "hook: sending message to telegram\n")
 
-	// Stop typing indicator for this session
+	// Stop typing indicator for this session. The in-process call is a no-op
+	// across processes (the bot owns the map), so in live mode signal the bot
+	// over the socket to stop deterministically (instead of its capture-pane
+	// heuristic). Best-effort: ignore errors (e.g. client machines).
 	stopContinuousTyping(sessionName)
+	if isSessionLive(config, config.Sessions[sessionName]) {
+		callSocket(APIRequest{Cmd: "typing", Session: sessionName, Text: "stop"})
+	}
 
 	// Store Claude's response in history
 	appendHistory(topicID, HistoryMessage{
@@ -4076,6 +4150,7 @@ func handlePromptHook() error {
 	// Find session by matching cwd suffix
 	var topicID int64
 	var matchedGroup int64
+	var sessionName string
 	for name, info := range config.Sessions {
 		if info == nil {
 			continue
@@ -4083,6 +4158,7 @@ func handlePromptHook() error {
 		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
 			topicID = info.TopicID
 			matchedGroup = groupChatID(config, sessionGroup(info))
+			sessionName = name
 			break
 		}
 	}
@@ -4090,6 +4166,13 @@ func handlePromptHook() error {
 	if topicID == 0 || matchedGroup == 0 {
 		fmt.Fprintf(os.Stderr, "hook-prompt: no topic found for cwd=%s\n", hookData.Cwd)
 		return nil
+	}
+
+	// Live mode: start the deterministic typing indicator as soon as a turn
+	// begins (the Stop hook ends it). Covers terminal- and Telegram-driven
+	// prompts alike; startContinuousTyping cancels+restarts, so it's idempotent.
+	if isSessionLive(config, config.Sessions[sessionName]) {
+		callSocket(APIRequest{Cmd: "typing", Session: sessionName, Text: "start"})
 	}
 
 	// Check if this prompt was just sent from Telegram (cooldown 10s)
