@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.25.0"
+const version = "1.26.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -123,20 +123,26 @@ type HookData struct {
 	ToolName       string `json:"tool_name"`
 	Prompt         string `json:"prompt"` // For UserPromptSubmit hook
 	ToolInput      struct {
-		Questions []struct {
-			Question    string `json:"question"`
-			Header      string `json:"header"`
-			MultiSelect bool   `json:"multiSelect"`
-			Options     []struct {
-				Label       string `json:"label"`
-				Description string `json:"description"`
-			} `json:"options"`
-		} `json:"questions"`
+		Questions      []auqQuestion `json:"questions"`
 		AllowedPrompts []struct {
 			Tool   string `json:"tool"`
 			Prompt string `json:"prompt"`
 		} `json:"allowedPrompts,omitempty"`
 	} `json:"tool_input"`
+}
+
+// auqOption / auqQuestion mirror the AskUserQuestion tool_input. Named (not
+// anonymous) so the question set can be passed to postAskUserQuestion and
+// relayed from a client to the server.
+type auqOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+type auqQuestion struct {
+	Question    string      `json:"question"`
+	Header      string      `json:"header"`
+	MultiSelect bool        `json:"multiSelect"`
+	Options     []auqOption `json:"options"`
 }
 
 // ============================================================================
@@ -675,6 +681,10 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleTypingSocketCmd(encoder, cfg, req)
 		case "stream":
 			handleStreamSocketCmd(encoder, cfg, req)
+		case "question":
+			handleQuestionSocketCmd(encoder, cfg, req)
+		case "sendfile":
+			handleSendFileSocketCmd(encoder, cfg, req)
 		case "screenshot":
 			handleScreenshotCmd(encoder, cfg, req)
 		case "questions":
@@ -1876,7 +1886,10 @@ func multiSelectSubmitKeys(selected []bool, n int) []string {
 // each one. Returns false if the tmux session isn't running.
 func injectTmuxKeys(config *Config, sessionName string, keys ...string) bool {
 	info, exists := config.Sessions[sessionName]
-	tmuxName := tmuxSessionName(sessionName)
+	// On a remote host the tmux session is named after the project only
+	// (claude-<project>), not "claude-host:project".
+	_, projectName := parseSessionTarget(sessionName)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
 	remote := exists && info.Host != ""
 	var address string
 	if remote {
@@ -2120,12 +2133,17 @@ func handleStreamSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 
 // sendDocument uploads a file to a chat/topic via Telegram's sendDocument
 // (multipart). Uses the resilient telegram HTTP client (DC fallback).
-func sendDocument(cfg *Config, chatID, threadID int64, filePath, caption string) error {
+func sendDocument(cfg *Config, chatID, threadID int64, filePath, caption, nameOverride string) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+
+	name := filepath.Base(filePath)
+	if nameOverride != "" {
+		name = nameOverride
+	}
 
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -2136,7 +2154,7 @@ func sendDocument(cfg *Config, chatID, threadID int64, filePath, caption string)
 	if caption != "" {
 		w.WriteField("caption", caption)
 	}
-	part, err := w.CreateFormFile("document", filepath.Base(filePath))
+	part, err := w.CreateFormFile("document", name)
 	if err != nil {
 		return err
 	}
@@ -2184,9 +2202,6 @@ func handleSendFileCmd() error {
 	if err != nil {
 		return fmt.Errorf("no config: %w", err)
 	}
-	if config.Mode == "client" {
-		return fmt.Errorf("send-file is not yet supported on client machines")
-	}
 
 	cwd, _ := os.Getwd()
 	if !filepath.IsAbs(path) {
@@ -2195,15 +2210,41 @@ func handleSendFileCmd() error {
 	if fi, err := os.Stat(path); err != nil || fi.IsDir() {
 		return fmt.Errorf("file not found: %s", path)
 	}
+	name := filepath.Base(path)
+
+	// Remote agent: upload the file to the server, then have the bot send it.
+	if config.Mode == "client" {
+		if config.Server == "" || config.HostName == "" {
+			return fmt.Errorf("client not configured for relay")
+		}
+		remote := fmt.Sprintf("/tmp/ccc-upload-%d-%s", os.Getpid(), name)
+		if err := scpToHost(config.Server, path, remote, 120*time.Second); err != nil {
+			return fmt.Errorf("upload to server: %w", err)
+		}
+		payload, _ := json.Marshal(map[string]string{"path": remote, "caption": caption, "name": name})
+		resp, err := callSocket(config, APIRequest{Cmd: "sendfile", Cwd: cwd, Payload: payload})
+		if err != nil {
+			return err
+		}
+		if resp == nil || !resp.OK {
+			msg := "unknown error"
+			if resp != nil && resp.Error != "" {
+				msg = resp.Error
+			}
+			return fmt.Errorf("server: %s", msg)
+		}
+		fmt.Printf("✅ Sent %s to your topic\n", name)
+		return nil
+	}
 
 	var sessionName string
 	var topicID int64
-	for name, info := range config.Sessions {
+	for sname, info := range config.Sessions {
 		if info == nil {
 			continue
 		}
-		if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
-			sessionName, topicID = name, info.TopicID
+		if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+sname) {
+			sessionName, topicID = sname, info.TopicID
 			break
 		}
 	}
@@ -2211,10 +2252,10 @@ func handleSendFileCmd() error {
 		return fmt.Errorf("no CCC session for cwd=%s", cwd)
 	}
 
-	if err := sendDocument(config, sessionGroupChatID(config, sessionName), topicID, path, caption); err != nil {
+	if err := sendDocument(config, sessionGroupChatID(config, sessionName), topicID, path, caption, ""); err != nil {
 		return err
 	}
-	note := "📎 " + filepath.Base(path)
+	note := "📎 " + name
 	if caption != "" {
 		note += " — " + caption
 	}
@@ -2224,8 +2265,38 @@ func handleSendFileCmd() error {
 		From:      "claude",
 		Text:      note,
 	})
-	fmt.Printf("✅ Sent %s to topic %d\n", filepath.Base(path), topicID)
+	fmt.Printf("✅ Sent %s to topic %d\n", name, topicID)
 	return nil
+}
+
+// handleSendFileSocketCmd sends a file a remote agent uploaded to the server's
+// /tmp, then removes the temp copy. req.Payload = {path, caption, name}.
+func handleSendFileSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	session := req.Session
+	if session == "" {
+		session = resolveSessionByHostCwd(cfg, req.Host, req.Cwd)
+	}
+	info := cfg.Sessions[session]
+	if info == nil {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+	var p struct{ Path, Caption, Name string }
+	if json.Unmarshal(req.Payload, &p) != nil || p.Path == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "bad sendfile payload"})
+		return
+	}
+	defer os.Remove(p.Path) // clean the uploaded temp file
+	if err := sendDocument(cfg, sessionGroupChatID(cfg, session), info.TopicID, p.Path, p.Caption, p.Name); err != nil {
+		encoder.Encode(APIResponse{OK: false, Error: err.Error()})
+		return
+	}
+	note := "📎 " + p.Name
+	if p.Caption != "" {
+		note += " — " + p.Caption
+	}
+	appendHistory(info.TopicID, HistoryMessage{ID: nextMessageID(), Timestamp: time.Now().Unix(), From: "claude", Text: note})
+	encoder.Encode(APIResponse{OK: true})
 }
 
 //go:embed briefing/agent_briefing.md
@@ -4390,6 +4461,82 @@ func handleDisplayHook() error {
 	return nil
 }
 
+// postAskUserQuestion stores the pending question set and posts inline-keyboard
+// messages (single-select buttons or multiSelect toggle+Submit) to the session's
+// Telegram topic. Used for local agents (PreToolUse hook) and remote agents
+// (relayed via the "question" socket command). Synchronous: the caller is a
+// short-lived hook process, so a goroutine would die before the send completes.
+func postAskUserQuestion(cfg *Config, sessionName string, topicID int64, questions []auqQuestion) {
+	totalQuestions := len(questions)
+	pqs := &PendingQuestionSet{Session: sessionName, Timestamp: time.Now().Unix(), TopicID: topicID}
+	for _, q := range questions {
+		pq := PendingQuestion{Question: q.Question, Header: q.Header, MultiSelect: q.MultiSelect}
+		for _, opt := range q.Options {
+			pq.Options = append(pq.Options, PendingQuestionOption{Label: opt.Label, Description: opt.Description})
+		}
+		if pq.MultiSelect {
+			pq.Selected = make([]bool, len(pq.Options))
+		}
+		pqs.Questions = append(pqs.Questions, pq)
+	}
+	pendingQuestions.Store(sessionName, pqs)
+
+	chatID := sessionGroupChatID(cfg, sessionName)
+	for qIdx, q := range questions {
+		if q.Question == "" {
+			continue
+		}
+		msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+		var buttons [][]InlineKeyboardButton
+		if q.MultiSelect {
+			buttons = buildMultiSelectKeyboard(sessionName, qIdx, totalQuestions, pqs.Questions[qIdx])
+		} else {
+			for i, opt := range q.Options {
+				if opt.Label == "" {
+					continue
+				}
+				cd := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
+				if len(cd) > 64 {
+					cd = cd[:64]
+				}
+				label := opt.Label
+				if opt.Description != "" {
+					label += " — " + opt.Description
+				}
+				buttons = append(buttons, []InlineKeyboardButton{{Text: truncButtonLabel(label), CallbackData: cd}})
+			}
+		}
+		if len(buttons) > 0 {
+			sendMessageWithKeyboard(cfg, chatID, topicID, msg, buttons)
+		}
+		appendHistory(topicID, HistoryMessage{ID: nextMessageID(), Timestamp: time.Now().Unix(), From: "claude", Text: msg})
+	}
+}
+
+// handleQuestionSocketCmd posts AskUserQuestion buttons for a remote agent: the
+// client relays the questions (req.Payload) with its host+cwd; the server
+// resolves the session and posts. callback_data uses the server-side session
+// name, so the existing callback handler injects keystrokes into the remote
+// agent's tmux over SSH.
+func handleQuestionSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	session := req.Session
+	if session == "" {
+		session = resolveSessionByHostCwd(cfg, req.Host, req.Cwd)
+	}
+	info := cfg.Sessions[session]
+	if info == nil {
+		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
+		return
+	}
+	var questions []auqQuestion
+	if err := json.Unmarshal(req.Payload, &questions); err != nil || len(questions) == 0 {
+		encoder.Encode(APIResponse{OK: false, Error: "no questions"})
+		return
+	}
+	postAskUserQuestion(cfg, session, info.TopicID, questions)
+	encoder.Encode(APIResponse{OK: true})
+}
+
 func handlePermissionHook() error {
 	// Recover from any panic - hooks must never crash
 	defer func() {
@@ -4430,18 +4577,26 @@ func handlePermissionHook() error {
 	// In client mode, forward to server
 	if config.Mode == "client" && config.Server != "" && config.HostName != "" {
 		if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
-			for _, q := range hookData.ToolInput.Questions {
-				if q.Question == "" {
-					continue
-				}
-				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
-				for i, opt := range q.Options {
-					msg += fmt.Sprintf("\n%d. %s", i+1, opt.Label)
-					if opt.Description != "" {
-						msg += fmt.Sprintf(" — %s", opt.Description)
+			// Relay the question structure so the server posts real inline
+			// buttons (callback_data uses the server-side session name, so the
+			// callback handler injects keystrokes back into this agent's tmux
+			// over SSH). Falls back to a plain text question if the relay fails.
+			payload, _ := json.Marshal(hookData.ToolInput.Questions)
+			resp, err := callSocket(config, APIRequest{Cmd: "question", Cwd: hookData.Cwd, Payload: payload})
+			if err != nil || resp == nil || !resp.OK {
+				for _, q := range hookData.ToolInput.Questions {
+					if q.Question == "" {
+						continue
 					}
+					msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+					for i, opt := range q.Options {
+						msg += fmt.Sprintf("\n%d. %s", i+1, opt.Label)
+						if opt.Description != "" {
+							msg += fmt.Sprintf(" — %s", opt.Description)
+						}
+					}
+					forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, msg)
 				}
-				forwardToServer(config, hookData.Cwd, hookData.TranscriptPath, msg)
 			}
 			return nil
 		}
@@ -4480,82 +4635,7 @@ func handlePermissionHook() error {
 	// Handle AskUserQuestion — send inline keyboard buttons to Telegram
 	logHook("Permission", "tool=%s session=%s questions=%d", hookData.ToolName, sessionName, len(hookData.ToolInput.Questions))
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
-		totalQuestions := len(hookData.ToolInput.Questions)
-
-		// Store in pending questions for API access
-		pqs := &PendingQuestionSet{
-			Session:   sessionName,
-			Timestamp: time.Now().Unix(),
-			TopicID:   topicID,
-		}
-		for _, q := range hookData.ToolInput.Questions {
-			pq := PendingQuestion{
-				Question:    q.Question,
-				Header:      q.Header,
-				MultiSelect: q.MultiSelect,
-			}
-			for _, opt := range q.Options {
-				pq.Options = append(pq.Options, PendingQuestionOption{
-					Label:       opt.Label,
-					Description: opt.Description,
-				})
-			}
-			if pq.MultiSelect {
-				pq.Selected = make([]bool, len(pq.Options))
-			}
-			pqs.Questions = append(pqs.Questions, pq)
-		}
-		pendingQuestions.Store(sessionName, pqs)
-
-		// Send synchronously: this hook process is short-lived, so a goroutine
-		// would be killed on return before the Telegram send completes (the
-		// buttons would never arrive). A ~1s blocking send in a PreToolUse hook
-		// is fine.
-		for qIdx, q := range hookData.ToolInput.Questions {
-			if q.Question == "" {
-				continue
-			}
-			// Build message with option descriptions
-			msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
-
-			// Build inline keyboard buttons. multiSelect uses toggle buttons
-			// + a Submit row; single-select uses one button per option.
-			var buttons [][]InlineKeyboardButton
-			if q.MultiSelect {
-				buttons = buildMultiSelectKeyboard(sessionName, qIdx, totalQuestions, pqs.Questions[qIdx])
-			} else {
-				for i, opt := range q.Options {
-					if opt.Label == "" {
-						continue
-					}
-					// Callback data format: session:questionIndex:totalQuestions:optionIndex
-					// Telegram limits callback_data to 64 bytes
-					callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
-					if len(callbackData) > 64 {
-						callbackData = callbackData[:64]
-					}
-					label := opt.Label
-					if opt.Description != "" {
-						label += " — " + opt.Description
-					}
-					buttons = append(buttons, []InlineKeyboardButton{
-						{Text: truncButtonLabel(label), CallbackData: callbackData},
-					})
-				}
-			}
-
-			if len(buttons) > 0 {
-				sendMessageWithKeyboard(config, sessionGroupChatID(config, sessionName), topicID, msg, buttons)
-			}
-
-			// Store question in history
-			appendHistory(topicID, HistoryMessage{
-				ID:        nextMessageID(),
-				Timestamp: time.Now().Unix(),
-				From:      "claude",
-				Text:      msg,
-			})
-		}
+		postAskUserQuestion(config, sessionName, topicID, hookData.ToolInput.Questions)
 		return nil
 	}
 
@@ -6405,9 +6485,12 @@ func listen() error {
 						appendHistoryDedup(cb.Message.MessageThreadID, "human", fmt.Sprintf("Selected option %d", optionIndex+1))
 					}
 
-					// Resolve tmux session name and check local/remote
+					// Resolve tmux session name and check local/remote. On a
+					// remote host the tmux session is named after the project
+					// only (claude-<project>), not "claude-host:project".
 					info, exists := config.Sessions[sessionName]
-					tmuxName := tmuxSessionName(sessionName)
+					_, projectName := parseSessionTarget(sessionName)
+					tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 					sendTmuxKeys := func(keys ...string) {
 						if exists && info.Host != "" {
