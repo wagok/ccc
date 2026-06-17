@@ -26,7 +26,7 @@ import (
 	"github.com/kidandcat/ccc/internal/config"
 )
 
-const version = "1.20.0"
+const version = "1.20.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -36,8 +36,8 @@ type Config = config.Config
 
 // TelegramMessage represents a Telegram message
 type TelegramMessage struct {
-	MessageID       int    `json:"message_id"`
-	MessageThreadID int64  `json:"message_thread_id,omitempty"` // Topic ID
+	MessageID       int   `json:"message_id"`
+	MessageThreadID int64 `json:"message_thread_id,omitempty"` // Topic ID
 	Chat            struct {
 		ID   int64  `json:"id"`
 		Type string `json:"type"` // "private", "group", "supergroup"
@@ -47,8 +47,8 @@ type TelegramMessage struct {
 		Username  string `json:"username"`
 		FirstName string `json:"first_name"`
 	} `json:"from"`
-	Text           string           `json:"text"`
-	ReplyToMessage *TelegramMessage `json:"reply_to_message,omitempty"`
+	Text           string            `json:"text"`
+	ReplyToMessage *TelegramMessage  `json:"reply_to_message,omitempty"`
 	Voice          *TelegramVoice    `json:"voice,omitempty"`
 	Photo          []TelegramPhoto   `json:"photo,omitempty"`
 	Document       *TelegramDocument `json:"document,omitempty"`
@@ -139,19 +139,19 @@ type HookData struct {
 
 // APIRequest represents an incoming request on the Unix socket
 type APIRequest struct {
-	Cmd           string   `json:"cmd"`                      // ping, sessions, ask, send, history, screenshot, subscribe, questions, answer
-	Session       string   `json:"session,omitempty"`        // session name
-	Text          string   `json:"text,omitempty"`           // message text
-	From          string   `json:"from,omitempty"`           // agent identifier
-	After         int64    `json:"after,omitempty"`          // for history: after message_id
-	Limit         int      `json:"limit,omitempty"`          // for history: max messages
-	FromFilter    string   `json:"from_filter,omitempty"`    // for history: filter by sender (human, claude, api)
-	Sessions      []string `json:"sessions,omitempty"`       // for subscribe: session list
-	QuestionIndex int      `json:"question_index,omitempty"` // for answer: which question (0-based)
-	OptionIndex   int      `json:"option_index,omitempty"`   // for answer: which option (0-based)
-	Cwd           string   `json:"cwd,omitempty"`            // caller working dir (mcp-secretary: trusted identity source)
-	Host          string   `json:"host,omitempty"`           // caller machine id ("" = server-local); disambiguates same path on different hosts
-	Payload       json.RawMessage `json:"payload,omitempty"`  // command-specific args (mail/agent commands)
+	Cmd           string          `json:"cmd"`                      // ping, sessions, ask, send, history, screenshot, subscribe, questions, answer
+	Session       string          `json:"session,omitempty"`        // session name
+	Text          string          `json:"text,omitempty"`           // message text
+	From          string          `json:"from,omitempty"`           // agent identifier
+	After         int64           `json:"after,omitempty"`          // for history: after message_id
+	Limit         int             `json:"limit,omitempty"`          // for history: max messages
+	FromFilter    string          `json:"from_filter,omitempty"`    // for history: filter by sender (human, claude, api)
+	Sessions      []string        `json:"sessions,omitempty"`       // for subscribe: session list
+	QuestionIndex int             `json:"question_index,omitempty"` // for answer: which question (0-based)
+	OptionIndex   int             `json:"option_index,omitempty"`   // for answer: which option (0-based)
+	Cwd           string          `json:"cwd,omitempty"`            // caller working dir (mcp-secretary: trusted identity source)
+	Host          string          `json:"host,omitempty"`           // caller machine id ("" = server-local); disambiguates same path on different hosts
+	Payload       json.RawMessage `json:"payload,omitempty"`        // command-specific args (mail/agent commands)
 }
 
 // APIResponse represents a response on the Unix socket
@@ -182,11 +182,11 @@ type ActivityInfo struct {
 
 // APIEvent represents a streaming event for subscribe
 type APIEvent struct {
-	Event   string `json:"event"`             // subscribed, message, status
+	Event   string `json:"event"` // subscribed, message, status
 	Session string `json:"session,omitempty"`
-	From    string `json:"from,omitempty"`    // human, claude, api
+	From    string `json:"from,omitempty"` // human, claude, api
 	Text    string `json:"text,omitempty"`
-	Status  string `json:"status,omitempty"`  // active, idle
+	Status  string `json:"status,omitempty"` // active, idle
 }
 
 // APISessionInfo represents session info in API response
@@ -202,7 +202,7 @@ type APISessionInfo struct {
 type HistoryMessage struct {
 	ID            int64  `json:"id"`
 	Timestamp     int64  `json:"ts"`
-	From          string `json:"from"`                    // human, claude, api
+	From          string `json:"from"` // human, claude, api
 	Text          string `json:"text,omitempty"`
 	Type          string `json:"type,omitempty"`          // text, voice, photo, document
 	Path          string `json:"path,omitempty"`          // artifact path
@@ -214,7 +214,7 @@ type HistoryMessage struct {
 
 // Server start time for uptime calculation
 var serverStartTime time.Time
-var lockFile *os.File    // kept open to hold flock
+var lockFile *os.File       // kept open to hold flock
 var activeCaptures sync.Map // key: session name, prevents concurrent response captures
 var updateInProgress int32  // atomic flag to prevent concurrent /update
 
@@ -427,7 +427,6 @@ type PendingQuestionSet struct {
 	Timestamp int64             `json:"timestamp"`
 	TopicID   int64             `json:"-"`
 }
-
 
 func nextMessageID() int64 {
 	messageIDMutex.Lock()
@@ -1144,7 +1143,6 @@ func handleSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	captureResponseAsync(cfg, req.Session, info)
 }
 
-
 // handleContinueCmd handles the "continue" command - restarts Claude in a session with -c flag
 func handleContinueCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	if req.Session == "" {
@@ -1655,11 +1653,11 @@ func truncateRepeatingCharsInLines(s string) string {
 }
 
 // Config function wrappers - delegate to config package
-func getConfigPath() string                           { return config.Path() }
-func loadOrCreateConfig() (*Config, error)            { return config.LoadOrCreate() }
-func loadConfig() (*Config, error)                    { return config.Load() }
-func saveConfig(cfg *Config) error                    { return config.Save(cfg) }
-func getProjectsDir(cfg *Config) string               { return config.GetProjectsDir(cfg) }
+func getConfigPath() string                              { return config.Path() }
+func loadOrCreateConfig() (*Config, error)               { return config.LoadOrCreate() }
+func loadConfig() (*Config, error)                       { return config.Load() }
+func saveConfig(cfg *Config) error                       { return config.Save(cfg) }
+func getProjectsDir(cfg *Config) string                  { return config.GetProjectsDir(cfg) }
 func resolveProjectPath(cfg *Config, name string) string { return config.ResolveProjectPath(cfg, name) }
 
 // Telegram API helpers
@@ -2070,14 +2068,14 @@ func isClaudeRunning(tmuxName string, sshAddress string) bool {
 	// If none of these are present, Claude is probably not running
 
 	claudeIndicators := []string{
-		"❯",                    // Input prompt
-		"bypass permissions",   // Status bar
-		"shift+tab to cycle",   // Status bar variant
-		"ctrl+c to interrupt",  // Activity indicator
-		"●",                    // Tool marker
-		"✽",                    // Spinner
-		"✻",                    // Spinner variant
-		"⎿",                    // Tool output
+		"❯",                   // Input prompt
+		"bypass permissions",  // Status bar
+		"shift+tab to cycle",  // Status bar variant
+		"ctrl+c to interrupt", // Activity indicator
+		"●",                   // Tool marker
+		"✽",                   // Spinner
+		"✻",                   // Spinner variant
+		"⎿",                   // Tool output
 	}
 
 	for _, indicator := range claudeIndicators {
@@ -2629,7 +2627,9 @@ func fullSessionName(host string, name string) string {
 func getHostAddress(cfg *Config, hostName string) string { return config.GetHostAddress(cfg, hostName) }
 
 // getHostProjectsDir returns projects dir for a host
-func getHostProjectsDir(cfg *Config, hostName string) string { return config.GetHostProjectsDir(cfg, hostName) }
+func getHostProjectsDir(cfg *Config, hostName string) string {
+	return config.GetHostProjectsDir(cfg, hostName)
+}
 
 // resolveSessionPath resolves project path for a session
 // For local: uses config.ProjectsDir
@@ -3074,7 +3074,7 @@ func createTmuxSession(name string, workDir string, continueSession bool) error 
 
 	// Send the command to the session via send-keys (preserves TTY properly)
 	time.Sleep(200 * time.Millisecond)
-	tmuxCmd( "send-keys", "-t", name, cccCmd, "C-m").Run()
+	tmuxCmd("send-keys", "-t", name, cccCmd, "C-m").Run()
 
 	return nil
 }
@@ -3135,14 +3135,14 @@ func startSession(continueSession bool) error {
 		// Check if we're already inside tmux
 		if os.Getenv("TMUX") != "" {
 			// Inside tmux: switch to the session
-			cmd := tmuxCmd( "switch-client", "-t", tmuxName)
+			cmd := tmuxCmd("switch-client", "-t", tmuxName)
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			return cmd.Run()
 		}
 		// Outside tmux: attach to existing session
-		cmd := tmuxCmd( "attach-session", "-t", tmuxName)
+		cmd := tmuxCmd("attach-session", "-t", tmuxName)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -3156,13 +3156,13 @@ func startSession(continueSession bool) error {
 
 	// Check if we're already inside tmux
 	if os.Getenv("TMUX") != "" {
-		cmd := tmuxCmd( "switch-client", "-t", tmuxName)
+		cmd := tmuxCmd("switch-client", "-t", tmuxName)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return cmd.Run()
 	}
-	cmd := tmuxCmd( "attach-session", "-t", tmuxName)
+	cmd := tmuxCmd("attach-session", "-t", tmuxName)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -3222,12 +3222,12 @@ func sendToTmuxWithDelay(session string, text string, delay time.Duration) error
 }
 
 func killTmuxSession(name string) error {
-	cmd := tmuxCmd( "kill-session", "-t", name)
+	cmd := tmuxCmd("kill-session", "-t", name)
 	return cmd.Run()
 }
 
 func listTmuxSessions() ([]string, error) {
-	cmd := tmuxCmd( "list-sessions", "-F", "#{session_name}")
+	cmd := tmuxCmd("list-sessions", "-F", "#{session_name}")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -3253,7 +3253,7 @@ type TmuxSessionInfo struct {
 
 // getTmuxSessionInfo returns detailed info about a tmux session
 func getTmuxSessionInfo(name string) (*TmuxSessionInfo, error) {
-	cmd := tmuxCmd( "list-sessions", "-F",
+	cmd := tmuxCmd("list-sessions", "-F",
 		"#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_path}",
 		"-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	out, err := cmd.Output()
@@ -3397,11 +3397,13 @@ func killSession(config *Config, name string) error {
 	return nil
 }
 
-func getSessionByTopic(cfg *Config, topicID int64) string { return config.GetSessionByTopic(cfg, topicID) }
+func getSessionByTopic(cfg *Config, topicID int64) string {
+	return config.GetSessionByTopic(cfg, topicID)
+}
 
 // Project-group helpers (phase 1: data model). default group = original GroupID.
-func sessionGroup(info *SessionInfo) string         { return config.SessionGroup(info) }
-func groupChatID(cfg *Config, group string) int64   { return config.GroupChatID(cfg, group) }
+func sessionGroup(info *SessionInfo) string       { return config.SessionGroup(info) }
+func groupChatID(cfg *Config, group string) int64 { return config.GroupChatID(cfg, group) }
 func sessionGroupChatID(cfg *Config, name string) int64 {
 	return config.SessionGroupChatID(cfg, name)
 }
@@ -3542,14 +3544,14 @@ func startClientSession(config *Config, args []string) error {
 		fmt.Printf("Attaching to existing session: %s\n", tmuxName)
 		if os.Getenv("TMUX") != "" {
 			// Inside tmux: switch to the session
-			switchCmd := tmuxCmd( "switch-client", "-t", tmuxName)
+			switchCmd := tmuxCmd("switch-client", "-t", tmuxName)
 			switchCmd.Stdin = os.Stdin
 			switchCmd.Stdout = os.Stdout
 			switchCmd.Stderr = os.Stderr
 			return switchCmd.Run()
 		}
 		// Outside tmux: attach to existing session
-		attachCmd := tmuxCmd( "attach-session", "-t", tmuxName)
+		attachCmd := tmuxCmd("attach-session", "-t", tmuxName)
 		attachCmd.Stdin = os.Stdin
 		attachCmd.Stdout = os.Stdout
 		attachCmd.Stderr = os.Stderr
@@ -3564,13 +3566,13 @@ func startClientSession(config *Config, args []string) error {
 
 	// Attach to the session
 	if os.Getenv("TMUX") != "" {
-		attachCmd := tmuxCmd( "switch-client", "-t", tmuxName)
+		attachCmd := tmuxCmd("switch-client", "-t", tmuxName)
 		attachCmd.Stdin = os.Stdin
 		attachCmd.Stdout = os.Stdout
 		attachCmd.Stderr = os.Stderr
 		return attachCmd.Run()
 	}
-	attachCmd := tmuxCmd( "attach-session", "-t", tmuxName)
+	attachCmd := tmuxCmd("attach-session", "-t", tmuxName)
 	attachCmd.Stdin = os.Stdin
 	attachCmd.Stdout = os.Stdout
 	attachCmd.Stderr = os.Stderr
@@ -3985,80 +3987,79 @@ func handlePermissionHook() error {
 		}
 		pendingQuestions.Store(sessionName, pqs)
 
-		go func() {
-			defer func() { recover() }()
-			for qIdx, q := range hookData.ToolInput.Questions {
-				if q.Question == "" {
-					continue
-				}
-				// Build message with option descriptions
-				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+		// Send synchronously: this hook process is short-lived, so a goroutine
+		// would be killed on return before the Telegram send completes (the
+		// buttons would never arrive). A ~1s blocking send in a PreToolUse hook
+		// is fine.
+		for qIdx, q := range hookData.ToolInput.Questions {
+			if q.Question == "" {
+				continue
+			}
+			// Build message with option descriptions
+			msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
 
-				// Build inline keyboard buttons. multiSelect uses toggle buttons
-				// + a Submit row; single-select uses one button per option.
-				var buttons [][]InlineKeyboardButton
-				if q.MultiSelect {
-					buttons = buildMultiSelectKeyboard(sessionName, qIdx, totalQuestions, pqs.Questions[qIdx])
-				} else {
-					for i, opt := range q.Options {
-						if opt.Label == "" {
-							continue
-						}
-						// Callback data format: session:questionIndex:totalQuestions:optionIndex
-						// Telegram limits callback_data to 64 bytes
-						callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
-						if len(callbackData) > 64 {
-							callbackData = callbackData[:64]
-						}
-						label := opt.Label
-						if opt.Description != "" {
-							label += " — " + opt.Description
-						}
-						buttons = append(buttons, []InlineKeyboardButton{
-							{Text: truncButtonLabel(label), CallbackData: callbackData},
-						})
+			// Build inline keyboard buttons. multiSelect uses toggle buttons
+			// + a Submit row; single-select uses one button per option.
+			var buttons [][]InlineKeyboardButton
+			if q.MultiSelect {
+				buttons = buildMultiSelectKeyboard(sessionName, qIdx, totalQuestions, pqs.Questions[qIdx])
+			} else {
+				for i, opt := range q.Options {
+					if opt.Label == "" {
+						continue
 					}
+					// Callback data format: session:questionIndex:totalQuestions:optionIndex
+					// Telegram limits callback_data to 64 bytes
+					callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
+					if len(callbackData) > 64 {
+						callbackData = callbackData[:64]
+					}
+					label := opt.Label
+					if opt.Description != "" {
+						label += " — " + opt.Description
+					}
+					buttons = append(buttons, []InlineKeyboardButton{
+						{Text: truncButtonLabel(label), CallbackData: callbackData},
+					})
 				}
-
-				if len(buttons) > 0 {
-					sendMessageWithKeyboard(config, sessionGroupChatID(config, sessionName), topicID, msg, buttons)
-				}
-
-				// Store question in history
-				appendHistory(topicID, HistoryMessage{
-					ID:        nextMessageID(),
-					Timestamp: time.Now().Unix(),
-					From:      "claude",
-					Text:      msg,
-				})
 			}
-		}()
-		return nil
-	}
 
-	// Handle ExitPlanMode — read plan file and forward to Telegram
-	if hookData.ToolName == "ExitPlanMode" {
-		go func() {
-			defer func() { recover() }()
-			planText := readLatestPlanFile(hookData.Cwd)
-			if planText == "" {
-				sendMessage(config, sessionGroupChatID(config, sessionName), topicID, "📋 Plan mode completed (plan file not found)")
-				return
+			if len(buttons) > 0 {
+				sendMessageWithKeyboard(config, sessionGroupChatID(config, sessionName), topicID, msg, buttons)
 			}
-			// Truncate to Telegram's 4096 char limit (leave room for header)
-			if len(planText) > 3900 {
-				planText = planText[:3900] + "\n\n... (truncated)"
-			}
-			msg := fmt.Sprintf("📋 Plan ready:\n\n%s", planText)
-			sendMessage(config, sessionGroupChatID(config, sessionName), topicID, msg)
-			// Store in history
+
+			// Store question in history
 			appendHistory(topicID, HistoryMessage{
 				ID:        nextMessageID(),
 				Timestamp: time.Now().Unix(),
 				From:      "claude",
 				Text:      msg,
 			})
-		}()
+		}
+		return nil
+	}
+
+	// Handle ExitPlanMode — read plan file and forward to Telegram (synchronous,
+	// same reason as above).
+	if hookData.ToolName == "ExitPlanMode" {
+		planText := readLatestPlanFile(hookData.Cwd)
+		if planText == "" {
+			sendMessage(config, sessionGroupChatID(config, sessionName), topicID, "📋 Plan mode completed (plan file not found)")
+			return nil
+		}
+		// Truncate to Telegram's 4096 char limit (leave room for header)
+		if len(planText) > 3900 {
+			planText = planText[:3900] + "\n\n... (truncated)"
+		}
+		msg := fmt.Sprintf("📋 Plan ready:\n\n%s", planText)
+		sendMessage(config, sessionGroupChatID(config, sessionName), topicID, msg)
+		// Store in history
+		appendHistory(topicID, HistoryMessage{
+			ID:        nextMessageID(),
+			Timestamp: time.Now().Unix(),
+			From:      "claude",
+			Text:      msg,
+		})
 		return nil
 	}
 
