@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.26.0"
+const version = "1.27.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -4537,6 +4537,71 @@ func handleQuestionSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest)
 	encoder.Encode(APIResponse{OK: true})
 }
 
+// logNotify appends every Notification payload to ~/.ccc/notify.log so we can
+// reverse-engineer undocumented prompt types (rating / training-consent).
+func logNotify(notifType, message string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(home, ".ccc", "notify.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "[%s] type=%q msg=%q\n", time.Now().Format("2006-01-02 15:04:05"), notifType, message)
+}
+
+// handleNotifyHook auto-answers Claude Code's periodic interactive prompts that
+// would otherwise hang a headless agent (no human at its terminal). It detects
+// the session-rating prompt and the training-consent prompt by message text
+// (their notification_type is undocumented) and injects the answer into the
+// agent's OWN tmux: rating -> always "3" (Good); training -> allow. Every
+// notification is logged so unknown prompts can be wired precisely.
+func handleNotifyHook() error {
+	defer func() { recover() }()
+	raw, _ := io.ReadAll(os.Stdin)
+	var nd struct {
+		Cwd              string `json:"cwd"`
+		NotificationType string `json:"notification_type"`
+		Message          string `json:"message"`
+	}
+	if json.Unmarshal(raw, &nd) != nil {
+		return nil
+	}
+	logNotify(nd.NotificationType, nd.Message)
+
+	msg := strings.ToLower(nd.Message)
+	var keys []string
+	switch {
+	case strings.Contains(msg, "how is claude doing"):
+		// Session-rating prompt: 1:Bad 2:Fine 3:Good 0:Dismiss → always Good.
+		keys = []string{"3"}
+	case strings.Contains(msg, "training") || strings.Contains(msg, "improve") ||
+		strings.Contains(msg, "обуч"):
+		// Training/model-improvement consent → allow. The exact option keys are
+		// undocumented; "1" is typically the first (allow) option.
+		keys = []string{"1"}
+	default:
+		return nil
+	}
+
+	// Inject into the agent's own tmux. The hook runs on the agent's machine
+	// (server for local agents, the remote host for remote ones), so the tmux
+	// session is local — no relay needed. Derive the name from cwd.
+	tmuxName := tmuxSessionName(filepath.Base(nd.Cwd))
+	if !tmuxSessionExists(tmuxName) {
+		logNotify("(no-tmux)", tmuxName)
+		return nil
+	}
+	time.Sleep(400 * time.Millisecond) // let the prompt render/focus
+	for _, k := range keys {
+		tmuxCmd("send-keys", "-t", tmuxName, "-l", k).Run()
+		time.Sleep(120 * time.Millisecond)
+	}
+	return nil
+}
+
 func handlePermissionHook() error {
 	// Recover from any panic - hooks must never crash
 	defer func() {
@@ -5154,6 +5219,10 @@ func installHook() error {
 	// Add SessionStart hook that injects the CCC environment+tools briefing.
 	briefingAdded := addHookToEvent(hooks, "SessionStart", cccPath+" agent-briefing")
 
+	// Add Notification hook to auto-answer rating/training prompts (so headless
+	// agents don't hang on them).
+	notifyAdded := addHookToEvent(hooks, "Notification", cccPath+" hook-notify")
+
 	settings["hooks"] = hooks
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
@@ -5165,7 +5234,7 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded || preToolAdded || displayAdded || briefingAdded {
+	if stopAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded {
 		fmt.Println("✅ Claude hooks installed!")
 		if stopAdded {
 			fmt.Println("  + Stop hook (response capture)")
@@ -5178,6 +5247,9 @@ func installHook() error {
 		}
 		if briefingAdded {
 			fmt.Println("  + SessionStart hook (agent briefing)")
+		}
+		if notifyAdded {
+			fmt.Println("  + Notification hook (auto-answer rating/training prompts)")
 		}
 	} else {
 		fmt.Println("✅ Claude hooks already installed")
@@ -7975,6 +8047,13 @@ func main() {
 	case "hook-display":
 		// MessageDisplay: stream assistant deltas to Telegram (live mode).
 		if err := handleDisplayHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-notify":
+		// Notification: auto-answer rating/training prompts for headless agents.
+		if err := handleNotifyHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
