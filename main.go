@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.27.0"
+const version = "1.27.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2757,6 +2757,98 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 
 	_, err = io.Copy(out, fileResp.Body)
 	return err
+}
+
+var topicLocks sync.Map // threadID -> *sync.Mutex
+
+// topicLock returns a per-topic mutex so concurrent handlers for the same topic
+// (e.g. two voice messages in a row) stay ordered, while different topics run in
+// parallel and the main update loop never blocks.
+func topicLock(threadID int64) *sync.Mutex {
+	v, _ := topicLocks.LoadOrStore(threadID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// handleVoiceMessage downloads, transcribes and injects a voice message into its
+// agent. Runs in a goroutine (see the listen loop) so its multi-second
+// transcription never blocks the serial update loop / command handling.
+func handleVoiceMessage(chatID, threadID int64, senderTag, voiceFileID, username string) {
+	defer func() { recover() }()
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return
+	}
+	sessionName := getSessionByGroupTopic(config, chatID, threadID)
+	if sessionName == "" {
+		return
+	}
+	sessionInfo := config.Sessions[sessionName]
+	hostName := ""
+	if sessionInfo != nil {
+		hostName = sessionInfo.Host
+	}
+	_, projectName := parseSessionTarget(sessionName)
+	tmuxName := tmuxSessionName(extractProjectName(projectName))
+
+	sessionRunning := false
+	var address string
+	if hostName != "" {
+		address = getHostAddress(config, hostName)
+		if address != "" {
+			sessionRunning = sshTmuxHasSession(address, tmuxName)
+		}
+	} else {
+		sessionRunning = tmuxSessionExists(tmuxName)
+	}
+	if !sessionRunning {
+		return
+	}
+
+	sshAddr := ""
+	if hostName != "" {
+		sshAddr = address
+	}
+	if !isClaudeRunning(tmuxName, sshAddr) {
+		sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
+		if !restartClaudeInSession(tmuxName, sshAddr) {
+			sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
+			return
+		}
+		sendMessage(config, chatID, threadID, "✅ Session restarted")
+	}
+
+	sendMessage(config, chatID, threadID, "🎤 Transcribing...")
+	audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("voice_%d.ogg", time.Now().UnixNano()))
+	if err := downloadTelegramFile(config, voiceFileID, audioPath); err != nil {
+		sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
+		return
+	}
+	transcription, err := transcribeAudio(config, audioPath)
+	os.Remove(audioPath)
+	if err != nil {
+		sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Transcription failed: %v", err))
+		return
+	}
+	if transcription == "" {
+		return
+	}
+	fmt.Printf("[voice] @%s: %s\n", username, transcription)
+	sendMessage(config, chatID, threadID, fmt.Sprintf("📝 %s", transcription))
+	appendHistory(threadID, HistoryMessage{
+		ID:            nextMessageID(),
+		Timestamp:     time.Now().Unix(),
+		From:          "human",
+		Type:          "voice",
+		Transcription: transcription,
+		Username:      username,
+	})
+	markTelegramSent(threadID)
+	startContinuousTyping(config, chatID, threadID, sessionName)
+	if hostName != "" {
+		sshTmuxSendKeys(address, tmuxName, senderTag+transcription)
+	} else {
+		sendToTmux(tmuxName, senderTag+transcription)
+	}
 }
 
 // Transcribe audio file using configured command or fallback to whisper
@@ -6647,85 +6739,18 @@ func listen() error {
 			// stay attributable (empty for the primary admin — unchanged UX).
 			senderTag := humanTag(msg.From.ID, msg.From.FirstName, msg.From.Username)
 
-			// Handle voice messages
+			// Handle voice messages OFF the main loop: transcription takes
+			// seconds, and doing it inline blocks all other updates (commands,
+			// other agents) until it finishes. Run it in a goroutine, serialized
+			// per topic so two voices to the same agent keep their order.
 			if msg.Voice != nil && isGroup && threadID > 0 {
-				config, _ = loadConfig()
-				sessionName := getSessionByGroupTopic(config, chatID, threadID)
-				if sessionName != "" {
-					// Get session info to check if remote
-					sessionInfo := config.Sessions[sessionName]
-					hostName := ""
-					if sessionInfo != nil {
-						hostName = sessionInfo.Host
-					}
-
-					// Extract project name for tmux session
-					_, projectName := parseSessionTarget(sessionName)
-					tmuxName := tmuxSessionName(extractProjectName(projectName))
-
-					// Check if session is running
-					sessionRunning := false
-					var address string
-					if hostName != "" {
-						address = getHostAddress(config, hostName)
-						if address != "" {
-							sessionRunning = sshTmuxHasSession(address, tmuxName)
-						}
-					} else {
-						sessionRunning = tmuxSessionExists(tmuxName)
-					}
-
-					if sessionRunning {
-						// Check if Claude is actually running (not crashed to bash)
-						sshAddr := ""
-						if hostName != "" {
-							sshAddr = address
-						}
-						if !isClaudeRunning(tmuxName, sshAddr) {
-							// Auto-restart Claude
-							sendMessage(config, chatID, threadID, "🔄 Session interrupted, restarting...")
-							if !restartClaudeInSession(tmuxName, sshAddr) {
-								sendMessage(config, chatID, threadID, "❌ Failed to restart Claude. Use /continue to restart manually.")
-								continue
-							}
-							sendMessage(config, chatID, threadID, "✅ Session restarted")
-						}
-
-						sendMessage(config, chatID, threadID, "🎤 Transcribing...")
-						// Download and transcribe
-						audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("voice_%d.ogg", time.Now().UnixNano()))
-						if err := downloadTelegramFile(config, msg.Voice.FileID, audioPath); err != nil {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
-						} else {
-							transcription, err := transcribeAudio(config, audioPath)
-							os.Remove(audioPath)
-							if err != nil {
-								sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Transcription failed: %v", err))
-							} else if transcription != "" {
-								fmt.Printf("[voice] @%s: %s\n", msg.From.Username, transcription)
-								sendMessage(config, chatID, threadID, fmt.Sprintf("📝 %s", transcription))
-								// Store in history
-								appendHistory(threadID, HistoryMessage{
-									ID:            nextMessageID(),
-									Timestamp:     time.Now().Unix(),
-									From:          "human",
-									Type:          "voice",
-									Transcription: transcription,
-									Username:      msg.From.Username,
-								})
-								// Mark as sent to suppress prompt hook echo
-								markTelegramSent(threadID)
-								// Start typing indicator and send to appropriate tmux
-								startContinuousTyping(config, chatID, threadID, sessionName)
-								if hostName != "" {
-									sshTmuxSendKeys(address, tmuxName, senderTag+transcription)
-								} else {
-									sendToTmux(tmuxName, senderTag+transcription)
-								}
-							}
-						}
-					}
-				}
+				fileID, username := msg.Voice.FileID, msg.From.Username
+				go func() {
+					l := topicLock(threadID)
+					l.Lock()
+					defer l.Unlock()
+					handleVoiceMessage(chatID, threadID, senderTag, fileID, username)
+				}()
 				continue
 			}
 
