@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.27.1"
+const version = "1.28.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -5317,6 +5317,24 @@ func installHook() error {
 
 	settings["hooks"] = hooks
 
+	// Disable Claude Code's session-quality survey for headless agents: the
+	// "How is Claude doing this session?" rating prompt and its transcript-share
+	// follow-up are interactive TUI modals that block an unattended agent (they
+	// do NOT fire a Notification hook, so they can't be auto-answered). Setting
+	// CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 in the settings env block suppresses
+	// the whole survey flow while leaving telemetry intact. Takes effect for
+	// sessions started after this runs.
+	env, ok := settings["env"].(map[string]interface{})
+	if !ok {
+		env = map[string]interface{}{}
+	}
+	envAdded := false
+	if env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] != "1" {
+		env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] = "1"
+		envAdded = true
+	}
+	settings["env"] = env
+
 	newData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal settings: %w", err)
@@ -5326,7 +5344,7 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded {
+	if stopAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded || envAdded {
 		fmt.Println("✅ Claude hooks installed!")
 		if stopAdded {
 			fmt.Println("  + Stop hook (response capture)")
@@ -5342,6 +5360,9 @@ func installHook() error {
 		}
 		if notifyAdded {
 			fmt.Println("  + Notification hook (auto-answer rating/training prompts)")
+		}
+		if envAdded {
+			fmt.Println("  + env CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 (suppress rating/training prompts)")
 		}
 	} else {
 		fmt.Println("✅ Claude hooks already installed")
