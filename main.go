@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.28.0"
+const version = "1.29.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3352,24 +3352,35 @@ func handleChangeGroup(config *Config, chatID, threadID int64, alias string) {
 		sendMessage(config, chatID, threadID, "❌ No project session is mapped to this topic")
 		return
 	}
+	if err := changeGroupCore(config, sessionName, alias); err != nil {
+		sendMessage(config, chatID, threadID, "❌ "+err.Error())
+	}
+}
+
+// changeGroupCore moves a project session to another group: it creates a fresh
+// topic in the target group's chat, preserves history, updates config, and
+// closes the old topic (posting notices in both). Shared by the /changegroup
+// Telegram command and the `ccc changegroup` CLI. The old chat is derived from
+// the session's current group, so it works regardless of caller.
+func changeGroupCore(config *Config, sessionName, alias string) error {
 	info := config.Sessions[sessionName]
+	if info == nil {
+		return fmt.Errorf("session %q not found", sessionName)
+	}
 	targetChat := groupChatID(config, alias)
 	if targetChat == 0 {
-		sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Unknown group %q. Add it to ~/.ccc.json (groups) first.", alias))
-		return
+		return fmt.Errorf("unknown group %q (add it to ~/.ccc.json groups first)", alias)
 	}
 	if sessionGroup(info) == alias {
-		sendMessage(config, chatID, threadID, fmt.Sprintf("ℹ️ '%s' is already in group %q", sessionName, alias))
-		return
+		return fmt.Errorf("'%s' is already in group %q", sessionName, alias)
 	}
+	oldChat := groupChatID(config, sessionGroup(info))
+	oldTopic := info.TopicID
 
 	newTopic, err := createForumTopic(config, targetChat, sessionName)
 	if err != nil {
-		sendMessage(config, chatID, threadID, "❌ Failed to create topic in target group: "+err.Error())
-		return
+		return fmt.Errorf("create topic in target group: %w", err)
 	}
-
-	oldTopic := info.TopicID
 	if err := moveHistory(oldTopic, newTopic); err != nil {
 		fmt.Fprintf(os.Stderr, "changegroup: history move %d->%d: %v\n", oldTopic, newTopic, err)
 	}
@@ -3382,11 +3393,14 @@ func handleChangeGroup(config *Config, chatID, threadID int64, alias string) {
 
 	sendMessage(config, targetChat, newTopic,
 		fmt.Sprintf("📦 Project '%s' moved here. History preserved. Interact with the agent in this topic now.", sessionName))
-	sendMessage(config, chatID, oldTopic,
-		fmt.Sprintf("📦 Project '%s' moved to group %q. This topic is closed — use the new one.", sessionName, alias))
-	if err := closeForumTopic(config, chatID, oldTopic); err != nil {
-		fmt.Fprintf(os.Stderr, "changegroup: close old topic: %v\n", err)
+	if oldChat != 0 && oldTopic != 0 {
+		sendMessage(config, oldChat, oldTopic,
+			fmt.Sprintf("📦 Project '%s' moved to group %q. This topic is closed — use the new one.", sessionName, alias))
+		if err := closeForumTopic(config, oldChat, oldTopic); err != nil {
+			fmt.Fprintf(os.Stderr, "changegroup: close old topic: %v\n", err)
+		}
 	}
+	return nil
 }
 
 // getOrCreateTopic finds existing topic or creates new one
@@ -8089,6 +8103,23 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+
+	case "changegroup":
+		// Admin: move a session to another group. ccc changegroup <session> <alias>
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: ccc changegroup <session-name> <group-alias>")
+			os.Exit(1)
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := changeGroupCore(cfg, os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Moved %s to group %s\n", os.Args[2], os.Args[3])
 
 	case "hook-display":
 		// MessageDisplay: stream assistant deltas to Telegram (live mode).
