@@ -65,6 +65,8 @@ func onTimer(t scheduler.Timer) {
 	switch t.Kind {
 	case "deliver":
 		onDeliverTimer(t)
+	case "reminder":
+		onReminderTimer(t)
 	default:
 		onMailTimer(t)
 	}
@@ -872,6 +874,31 @@ func secretaryTools() []map[string]interface{} {
 				"contact_about": str,
 			}),
 		},
+		{
+			"name":        "reminder_add",
+			"description": "Set a reminder for yourself. When it fires, CCC injects your `text` into your prompt. `schedule` is an object with EXACTLY ONE of: {\"in_minutes\": N} (once, after N minutes); {\"at\": \"2026-06-25T18:00:00+03:00\"} (once, ISO8601 with timezone offset); {\"every_minutes\": N} (recurring every N minutes); {\"daily_at\": \"09:00\", \"tz\": \"Europe/Kyiv\"} (recurring daily at HH:MM in the given IANA timezone — tz is REQUIRED here). You always specify the timezone for clock-time schedules. Returns the reminder id. (Secretary only: pass `agent` to set it for another agent in your group.)",
+			"inputSchema": obj(map[string]interface{}{
+				"text": str,
+				"schedule": obj(map[string]interface{}{
+					"in_minutes":    map[string]interface{}{"type": "integer"},
+					"at":            str,
+					"every_minutes": map[string]interface{}{"type": "integer"},
+					"daily_at":      str,
+					"tz":            str,
+				}),
+				"agent": str,
+			}, "text", "schedule"),
+		},
+		{
+			"name":        "reminder_list",
+			"description": "List your reminders (id, text, schedule, next fire time). Secretary: lists all reminders for agents in your group; pass `agent` to filter to one.",
+			"inputSchema": obj(map[string]interface{}{"agent": str}),
+		},
+		{
+			"name":        "reminder_delete",
+			"description": "Delete one of your reminders by id (from reminder_list). Secretary: may delete any reminder of an agent in your group.",
+			"inputSchema": obj(map[string]interface{}{"id": str}, "id"),
+		},
 	}
 }
 
@@ -904,6 +931,15 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 		return resultText(resp, err)
 	case "update_self":
 		resp, err := relayRequest(APIRequest{Cmd: "agent.update_self", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+	case "reminder_add":
+		resp, err := relayRequest(APIRequest{Cmd: "reminder.add", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+	case "reminder_list":
+		resp, err := relayRequest(APIRequest{Cmd: "reminder.list", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+	case "reminder_delete":
+		resp, err := relayRequest(APIRequest{Cmd: "reminder.delete", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	default:
 		return toolErr("unknown tool: " + call.Name)

@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.30.0"
+const version = "1.31.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -708,6 +708,12 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleMailDeliverCmd(encoder, cfg, req)
 		case "mail.ack":
 			handleMailAckCmd(encoder, cfg, req)
+		case "reminder.add":
+			handleReminderAddCmd(encoder, cfg, req)
+		case "reminder.list":
+			handleReminderListCmd(encoder, cfg, req)
+		case "reminder.delete":
+			handleReminderDeleteCmd(encoder, cfg, req)
 		default:
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
