@@ -16,6 +16,17 @@ ccc send-file <path> [caption]
 The path is resolved from your working directory; the file is delivered to your
 Telegram topic.
 
+**Reminders** — *via the `secretary` MCP, if connected.* Schedule your own
+reminders; when one is due, CCC injects your text into your prompt (no human or
+secretary needed).
+- `reminder_add(text, schedule)` — `schedule` has EXACTLY ONE of:
+  `{in_minutes: N}` (once after N min), `{at: "2026-06-25T18:00:00+03:00"}` (once,
+  ISO8601 with YOUR timezone offset), `{every_minutes: N}` (recurring), or
+  `{daily_at: "09:00", tz: "Europe/Kyiv"}` (recurring daily; `tz` REQUIRED —
+  always state your timezone for clock times).
+- `reminder_list()` — your reminders (id, text, schedule, next fire).
+- `reminder_delete(id)` — remove one. You only ever see/manage your OWN reminders.
+
 **Inter-agent mail** — *only if a `secretary` MCP is connected to this session.*
 You exchange messages with other agents through a governed secretary; every
 exchange is visible to the human in Telegram.

@@ -29,6 +29,12 @@ decision (e.g. `routed T… backend→devops`, `rejected T… off-area`).
   call this.
 - `update_self({description, areas, contact_about})` — optional; describe
   yourself in the directory.
+- `reminder_add / reminder_list / reminder_delete` — you may manage reminders for
+  **any agent in your group** (pass `agent` to `reminder_add`; list/delete see all
+  group reminders). Ordinary agents see only their own. Reminders fire
+  algorithmically — CCC injects the text into the agent; you are not involved in
+  firing. Use this when Vlad asks you to remind an agent of something on a
+  schedule, or to audit/clean a group's reminders.
 
 You do **not** use `send` or `ack` — those belong to ordinary agents.
 
