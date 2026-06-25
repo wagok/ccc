@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kidandcat/ccc/internal/mail"
@@ -47,13 +48,108 @@ var mailScheduler *scheduler.Scheduler
 // elapsed while CCC was down) fire on start.
 func initMailScheduler() error {
 	home, _ := os.UserHomeDir()
-	s, err := scheduler.New(filepath.Join(home, ".ccc", "scheduler"), onMailTimer)
+	s, err := scheduler.New(filepath.Join(home, ".ccc", "scheduler"), onTimer)
 	if err != nil {
 		return err
 	}
 	mailScheduler = s
+	restoreDeliverSlot() // continue inter-send spacing across restarts
 	go s.Run(context.Background())
 	return nil
+}
+
+// onTimer is the scheduler's single fire callback. It routes a due timer to the
+// right handler by Kind. Mail deadline timers (delivery_timeout/escalation) keep
+// the default path; new Kinds (deliver, reminder, rl_continue) branch here.
+func onTimer(t scheduler.Timer) {
+	switch t.Kind {
+	case "deliver":
+		onDeliverTimer(t)
+	default:
+		onMailTimer(t)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Global spaced delivery queue (rate-limit mitigation)
+// ---------------------------------------------------------------------------
+// Secretary deliveries are sent at least deliverSpacingSecs apart, globally
+// across all groups, so a burst of forwarded letters doesn't wake many agents
+// at once and trip Anthropic's request rate limit. The queue IS the scheduler
+// (Kind="deliver"), so it is persistent and survives a CCC restart. Crucially,
+// the ack/reply deadlines are armed when the message is ACTUALLY sent (in
+// onDeliverTimer), not when it was enqueued.
+
+const deliverSpacingSecs = 30
+
+var (
+	deliverMu       sync.Mutex
+	lastDeliverSlot int64 // unix secs of the most recently scheduled delivery
+)
+
+// restoreDeliverSlot re-seeds the spacing cursor from any deliveries still
+// pending after a restart, so spacing continues uninterrupted.
+func restoreDeliverSlot() {
+	deliverMu.Lock()
+	defer deliverMu.Unlock()
+	for _, t := range mailScheduler.List() {
+		if t.Kind == "deliver" && t.FireAt > lastDeliverSlot {
+			lastDeliverSlot = t.FireAt
+		}
+	}
+}
+
+// enqueueDelivery schedules a delivery at the next free time slot: immediately
+// if the queue is idle, else deliverSpacingSecs after the previous one. Returns
+// the scheduled fire time (unix secs).
+func enqueueDelivery(to, ticket, text, sec, replyTo, from, subject string) int64 {
+	if mailScheduler == nil {
+		return time.Now().Unix()
+	}
+	deliverMu.Lock()
+	defer deliverMu.Unlock()
+	now := time.Now().Unix()
+	slot := now
+	if lastDeliverSlot+deliverSpacingSecs > slot {
+		slot = lastDeliverSlot + deliverSpacingSecs
+	}
+	lastDeliverSlot = slot
+	mailScheduler.Schedule(scheduler.Timer{
+		ID:     fmt.Sprintf("deliver:%s:%d", ticket, slot),
+		FireAt: slot,
+		Kind:   "deliver",
+		Agent:  to,
+		Ticket: ticket,
+		Prompt: text,
+		Meta:   map[string]string{"sec": sec, "reply_to": replyTo, "from": from, "subject": subject},
+	})
+	return slot
+}
+
+// onDeliverTimer performs the actual spaced send: inject the letter into the
+// recipient, journal the outcome, and (on success) arm the ack/reply deadlines
+// now — at real send time.
+func onDeliverTimer(t scheduler.Timer) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return
+	}
+	sec := t.Meta["sec"]
+	if sec == "" {
+		sec = mail.SecretaryAgent
+	}
+	werr := wakeAgent(cfg, t.Agent, t.Prompt)
+	event, detail := "delivered", ""
+	if werr != nil {
+		event, detail = "delivery_failed", werr.Error()
+	}
+	mail.LogEvent(sec, mail.JournalEntry{
+		Ticket: t.Ticket, Event: event, To: t.Agent,
+		From: t.Meta["from"], Subject: t.Meta["subject"], ReplyTo: t.Meta["reply_to"], Detail: detail,
+	})
+	if werr == nil {
+		armDeliveryTimers(t.Ticket, t.Meta["reply_to"], sec)
+	}
 }
 
 // onMailTimer fires when a delivery deadline elapses: it journals a timeout
@@ -460,23 +556,33 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		return
 	}
 
-	text := renderRecipientLetter(from, subject, body, replyTo, p.Ticket)
-	err := wakeAgent(cfg, p.To, text)
-
-	event, detail := "delivered", ""
-	if err != nil {
-		event, detail = "delivery_failed", err.Error()
-	}
-	mail.LogEvent(sec, mail.JournalEntry{
-		Ticket: p.Ticket, Event: event, To: p.To, From: from, Subject: subject, ReplyTo: replyTo, Detail: detail,
-	})
-	if err != nil {
-		encoder.Encode(APIResponse{OK: false, Error: "deliver: " + err.Error()})
+	// Fail fast on a truly-unknown recipient (no session at all) so the secretary
+	// gets an immediate error instead of a silent queue entry. A configured-but-
+	// stopped agent is still enqueued — onDeliverTimer's wakeAgent restarts it.
+	if toInfo := cfg.Sessions[p.To]; toInfo == nil || toInfo.Deleted {
+		mail.LogEvent(sec, mail.JournalEntry{
+			Ticket: p.Ticket, Event: "delivery_failed", To: p.To,
+			From: from, Subject: subject, ReplyTo: replyTo, Detail: "recipient has no active session",
+		})
+		encoder.Encode(APIResponse{OK: false, Error: "deliver: recipient " + p.To + " has no active session"})
 		return
 	}
-	// Delivery confirmed at the tmux level — arm the ack (and reply) deadlines.
-	armDeliveryTimers(p.Ticket, replyTo, sec)
-	encoder.Encode(APIResponse{OK: true})
+
+	text := renderRecipientLetter(from, subject, body, replyTo, p.Ticket)
+
+	// Enqueue on the global spaced delivery queue instead of sending inline:
+	// the actual send (and the ack/reply deadline arming) happens in
+	// onDeliverTimer at the spaced slot, so a burst of deliveries doesn't wake
+	// many agents at once and trip the API rate limit.
+	slot := enqueueDelivery(p.To, p.Ticket, text, sec, replyTo, from, subject)
+	wait := slot - time.Now().Unix()
+	if wait < 0 {
+		wait = 0
+	}
+	mail.LogEvent(sec, mail.JournalEntry{
+		Ticket: p.Ticket, Event: "queued", To: p.To, From: from, Subject: subject, ReplyTo: replyTo,
+	})
+	encoder.Encode(APIResponse{OK: true, Response: fmt.Sprintf("queued — will be delivered to %s in ~%ds (spaced to avoid rate limits)", p.To, wait)})
 }
 
 // pick returns a if non-empty, else b. Used to let an explicit payload field
@@ -723,7 +829,7 @@ func secretaryTools() []map[string]interface{} {
 	str := map[string]interface{}{"type": "string"}
 	return []map[string]interface{}{
 		{
-			"name": "send",
+			"name":        "send",
 			"description": "Send a letter to another agent THROUGH the secretary. The letter is always submitted to the secretary first, who validates and routes it. Fields: to (intended recipient), subject (theme), body, reply_to (which agent should receive the reply — an agent name, or omit for a one-way informational message), in_reply_to (ticket you are answering), needs_confirmation (when the reply is routed to a third agent, get a short note that it was sent), notes (extra instructions for the secretary). Returns a ticket id.",
 			"inputSchema": obj(map[string]interface{}{
 				"to":                 str,
