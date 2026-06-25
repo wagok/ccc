@@ -67,6 +67,8 @@ func onTimer(t scheduler.Timer) {
 		onDeliverTimer(t)
 	case "reminder":
 		onReminderTimer(t)
+	case "rl_continue":
+		onRateLimitContinue(t)
 	default:
 		onMailTimer(t)
 	}

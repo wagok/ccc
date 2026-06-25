@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.31.1"
+const version = "1.32.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -714,6 +714,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleReminderListCmd(encoder, cfg, req)
 		case "reminder.delete":
 			handleReminderDeleteCmd(encoder, cfg, req)
+		case "rl.recover":
+			handleRateLimitRecover(encoder, cfg, req)
 		default:
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
@@ -4714,6 +4716,41 @@ func handleNotifyHook() error {
 	return nil
 }
 
+// handleStopFailureHook fires when a turn ends due to an API error. If it looks
+// like a transient rate-limit/overload, it asks the server to schedule a delayed
+// "please continue" recovery (random 30–90s). Every payload is logged to
+// ~/.ccc/stopfailure.log so we can confirm the hook fires and refine matching.
+func handleStopFailureHook() error {
+	defer func() { recover() }()
+	raw, _ := io.ReadAll(os.Stdin)
+	if home, err := os.UserHomeDir(); err == nil {
+		if f, e := os.OpenFile(filepath.Join(home, ".ccc", "stopfailure.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); e == nil {
+			fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), string(raw))
+			f.Close()
+		}
+	}
+	var hd struct {
+		Cwd string `json:"cwd"`
+	}
+	if json.Unmarshal(raw, &hd) != nil || hd.Cwd == "" {
+		return nil
+	}
+	// Only auto-retry transient API errors; "please continue" won't help a hard
+	// failure (auth/billing) and could loop. The payload usually carries the text.
+	low := strings.ToLower(string(raw))
+	if !strings.Contains(low, "rate") && !strings.Contains(low, "limit") &&
+		!strings.Contains(low, "overload") && !strings.Contains(low, "temporarily") {
+		return nil
+	}
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+	callSocket(config, APIRequest{Cmd: "rl.recover", Cwd: hd.Cwd})
+	return nil
+}
+
 func handlePermissionHook() error {
 	// Recover from any panic - hooks must never crash
 	defer func() {
@@ -5335,6 +5372,9 @@ func installHook() error {
 	// agents don't hang on them).
 	notifyAdded := addHookToEvent(hooks, "Notification", cccPath+" hook-notify")
 
+	// Add StopFailure hook to auto-recover from transient API rate-limit errors.
+	stopFailAdded := addHookToEvent(hooks, "StopFailure", cccPath+" hook-stopfailure")
+
 	settings["hooks"] = hooks
 
 	// Disable Claude Code's session-quality survey for headless agents: the
@@ -5364,7 +5404,7 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded || envAdded {
+	if stopAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded || stopFailAdded || envAdded {
 		fmt.Println("✅ Claude hooks installed!")
 		if stopAdded {
 			fmt.Println("  + Stop hook (response capture)")
@@ -5380,6 +5420,9 @@ func installHook() error {
 		}
 		if notifyAdded {
 			fmt.Println("  + Notification hook (auto-answer rating/training prompts)")
+		}
+		if stopFailAdded {
+			fmt.Println("  + StopFailure hook (auto-recover from rate-limit errors)")
 		}
 		if envAdded {
 			fmt.Println("  + env CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 (suppress rating/training prompts)")
@@ -8137,6 +8180,13 @@ func main() {
 	case "hook-notify":
 		// Notification: auto-answer rating/training prompts for headless agents.
 		if err := handleNotifyHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-stopfailure":
+		// StopFailure: auto-recover an agent whose turn died on a rate-limit error.
+		if err := handleStopFailureHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
