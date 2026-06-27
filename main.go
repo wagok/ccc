@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.32.0"
+const version = "1.32.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo

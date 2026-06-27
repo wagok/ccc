@@ -437,6 +437,30 @@ func groupSecretaryFor(cfg *Config, sessionName string) string {
 	return mail.SecretaryName(sessionGroup(cfg.Sessions[sessionName]))
 }
 
+// resolveRecipient maps a mail recipient name to a real session name within a
+// group. Agents often address a peer by its short PROJECT name ("openarx-promo")
+// while the actual CCC session is host-prefixed ("msi:openarx-promo"); an exact
+// lookup then fails and delivery breaks. This resolves the short form to the
+// full session name within the group. Exact matches and unknown names pass
+// through unchanged.
+func resolveRecipient(cfg *Config, name, group string) string {
+	if name == "" {
+		return ""
+	}
+	if s := cfg.Sessions[name]; s != nil && !s.Deleted {
+		return name // already a real session name
+	}
+	for n, i := range cfg.Sessions {
+		if i == nil || i.Deleted || sessionGroup(i) != group {
+			continue
+		}
+		if _, proj := parseSessionTarget(n); proj == name {
+			return n
+		}
+	}
+	return name
+}
+
 func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 	from := resolveCaller(cfg, req.Host, req.Cwd)
 	if from == "" {
@@ -461,6 +485,12 @@ func handleMailSendCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: false, Error: "send: 'to' and 'subject' are required"})
 		return
 	}
+
+	// Normalize short project names to full session names within the sender's
+	// group, so the stored letter and all downstream delivery use a real name.
+	senderGroup := sessionGroup(cfg.Sessions[from])
+	p.To = resolveRecipient(cfg, p.To, senderGroup)
+	p.ReplyTo = resolveRecipient(cfg, p.ReplyTo, senderGroup)
 
 	letter := mail.Letter{
 		Ticket: mail.NewTicket(), From: from, To: p.To, Subject: p.Subject, Body: p.Body,
@@ -541,6 +571,10 @@ func handleMailDeliverCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: false, Error: "deliver: 'to' and 'ticket' are required"})
 		return
 	}
+	// Resolve a short project name ("openarx-promo") to the real host-prefixed
+	// session ("msi:openarx-promo") within the secretary's group, so delivery
+	// works whether the sender/secretary used the short or full form.
+	p.To = resolveRecipient(cfg, p.To, group)
 	// Group isolation: a secretary may only deliver to agents in its own group.
 	if toInfo := cfg.Sessions[p.To]; toInfo != nil && sessionGroup(toInfo) != group {
 		encoder.Encode(APIResponse{OK: false, Error: "deliver: recipient " + p.To + " is in another group — cross-group delivery is not allowed"})
