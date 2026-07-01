@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.32.1"
+const version = "1.33.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -716,6 +716,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleReminderDeleteCmd(encoder, cfg, req)
 		case "rl.recover":
 			handleRateLimitRecover(encoder, cfg, req)
+		case "briefing":
+			handleBriefingCmd(encoder, cfg, req)
 		default:
 			encoder.Encode(APIResponse{OK: false, Error: "unknown command"})
 		}
@@ -2334,25 +2336,45 @@ func handleAgentBriefing() error {
 		return nil // never block a session start
 	}
 	cwd, _ := os.Getwd()
+
+	// On a CLIENT the sessions/registry live on the server, so ask the server to
+	// build the briefing for this host+cwd and print what it returns. Otherwise
+	// the briefing would be empty for every remote agent (the local config has no
+	// sessions), and they never learn about send-file / mail / reminders.
+	if config.Mode == "client" {
+		if resp, err := callSocket(config, APIRequest{Cmd: "briefing", Cwd: cwd}); err == nil && resp != nil && resp.OK {
+			fmt.Print(resp.Response)
+		}
+		return nil
+	}
+
 	var sessionName string
-	var info *SessionInfo
 	for name, si := range config.Sessions {
 		if si == nil {
 			continue
 		}
 		if cwd == si.Path || strings.HasPrefix(cwd, si.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
-			sessionName, info = name, si
+			sessionName = name
 			break
 		}
 	}
 	if sessionName == "" {
 		return nil // not a CCC session — inject nothing
 	}
+	fmt.Print(buildAgentBriefing(config, sessionName))
+	return nil
+}
 
+// buildAgentBriefing renders the CCC environment+tools briefing for a session.
+// Shared by the server-local SessionStart path and the client relay handler.
+func buildAgentBriefing(config *Config, sessionName string) string {
+	info := config.Sessions[sessionName]
+	if info == nil {
+		return ""
+	}
 	// Secretaries follow their own operating manual; skip the ordinary brief.
 	if mail.IsSecretary(sessionName) {
-		fmt.Println("# CCC\n\nYou are the CCC secretary for this group — follow your own operating manual (CLAUDE.md). The ordinary-agent briefing below does not apply to you.")
-		return nil
+		return "# CCC\n\nYou are the CCC secretary for this group — follow your own operating manual (CLAUDE.md). The ordinary-agent briefing below does not apply to you.\n"
 	}
 
 	group := sessionGroup(info)
@@ -2388,9 +2410,18 @@ func handleAgentBriefing() error {
 		}
 		b.WriteString("Use `get_agent(name)` for a full card before writing.\n")
 	}
+	return b.String()
+}
 
-	fmt.Print(b.String())
-	return nil
+// handleBriefingCmd (server socket) returns the briefing for the caller's
+// host+cwd, so a client agent gets the same briefing a server-local one does.
+func handleBriefingCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	name := resolveSessionByHostCwd(cfg, req.Host, req.Cwd)
+	if name == "" {
+		encoder.Encode(APIResponse{OK: true, Response: ""}) // not a CCC session
+		return
+	}
+	encoder.Encode(APIResponse{OK: true, Response: buildAgentBriefing(cfg, name)})
 }
 
 func sendTypingAction(config *Config, chatID int64, threadID int64) {
