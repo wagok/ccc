@@ -53,7 +53,8 @@ func initMailScheduler() error {
 		return err
 	}
 	mailScheduler = s
-	restoreDeliverSlot() // continue inter-send spacing across restarts
+	restoreDeliverSlot()          // continue inter-send spacing across restarts
+	ensureSecretaryRestartTimer() // arm the daily maintenance restart
 	go s.Run(context.Background())
 	return nil
 }
@@ -69,6 +70,8 @@ func onTimer(t scheduler.Timer) {
 		onReminderTimer(t)
 	case "rl_continue":
 		onRateLimitContinue(t)
+	case "secretary_restart":
+		onSecretaryRestartTimer(t)
 	default:
 		onMailTimer(t)
 	}

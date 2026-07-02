@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kidandcat/ccc/internal/mail"
+	"github.com/kidandcat/ccc/internal/scheduler"
 )
 
 // Watchdog tuning. Variant 1 (skip-permissions autonomous secretary) means no
@@ -32,6 +33,107 @@ const (
 
 // secretaryRestarts tracks consecutive watchdog restarts per secretary identity.
 var secretaryRestarts = map[string]int{}
+
+// Scheduled secretary maintenance restart (daily, quiet hour). A fresh session
+// picks up Claude Code binary updates, the current default model, new hooks —
+// and heals poisoned contexts (degeneration loops like the "court" spam).
+// Secretaries are restart-safe by design: they reconcile from inbox/journal.
+const (
+	secretaryRestartTimerID = "secretary-restart"
+	secretaryRestartHour    = 1 // 01:30 UTC ≈ 04:30 Kyiv — quiet hour
+	secretaryRestartMinute  = 30
+)
+
+// nextDailyUTC returns the next unix time at hh:mm UTC strictly in the future.
+func nextDailyUTC(hh, mm int) int64 {
+	now := time.Now().UTC()
+	cand := time.Date(now.Year(), now.Month(), now.Day(), hh, mm, 0, 0, time.UTC)
+	if !cand.After(now) {
+		cand = cand.AddDate(0, 0, 1)
+	}
+	return cand.Unix()
+}
+
+// restartSecretarySession relaunches one secretary with a FRESH context: kills
+// its tmux (config untouched — killSession would mark it deleted), starts a new
+// session, dismisses any startup onboarding prompt, and nudges it to reconcile
+// so letters that arrived during the restart window are picked up immediately.
+func restartSecretarySession(cfg *Config, group string) error {
+	sec := mail.SecretaryName(group)
+	info := cfg.Sessions[sec]
+	if info == nil {
+		return fmt.Errorf("secretary for group %q not configured", group)
+	}
+	if err := launchSecretary(cfg, sec, info); err != nil {
+		return err
+	}
+	// Synchronous on purpose: `ccc secretary restart` is a short-lived CLI —
+	// a goroutine would be killed on exit before the nudge is sent.
+	tmux := tmuxSessionName(sec)
+	time.Sleep(8 * time.Second) // let claude boot
+	if out, err := tmuxCmd("capture-pane", "-t", tmux, "-p").Output(); err == nil {
+		pane := string(out)
+		if strings.Contains(pane, "Enter to confirm") || strings.Contains(pane, "try it") {
+			tmuxCmd("send-keys", "-t", tmux, "Escape").Run()
+			time.Sleep(time.Second)
+		}
+	}
+	sendToTmux(tmux, "You were restarted (scheduled maintenance). Reconcile now per your manual: check inbox/ for unrouted letters and journal.jsonl for anything awaiting ack/reply.")
+	return nil
+}
+
+// ensureSecretaryRestartTimer arms the daily maintenance-restart timer if it is
+// not already pending. Called on server start.
+func ensureSecretaryRestartTimer() {
+	if mailScheduler == nil {
+		return
+	}
+	if _, ok := mailScheduler.Get(secretaryRestartTimerID); ok {
+		return
+	}
+	mailScheduler.Schedule(scheduler.Timer{
+		ID:     secretaryRestartTimerID,
+		FireAt: nextDailyUTC(secretaryRestartHour, secretaryRestartMinute),
+		Kind:   "secretary_restart",
+	})
+}
+
+// onSecretaryRestartTimer fires the daily maintenance restart: every enabled,
+// currently-running, IDLE secretary is relaunched fresh. Busy ones are skipped
+// (they'll be caught tomorrow — the restart is routine, not urgent). Always
+// reschedules itself for the next day.
+func onSecretaryRestartTimer(t scheduler.Timer) {
+	defer func() {
+		if mailScheduler != nil {
+			t.FireAt = nextDailyUTC(secretaryRestartHour, secretaryRestartMinute)
+			mailScheduler.Schedule(t)
+		}
+	}()
+	cfg, err := loadConfig()
+	if err != nil {
+		return
+	}
+	for _, group := range append([]string{"default"}, namedGroups(cfg)...) {
+		sec := mail.SecretaryName(group)
+		if !secretaryEnabled(sec) {
+			continue
+		}
+		tmux := tmuxSessionName(sec)
+		if !tmuxSessionExists(tmux) {
+			continue // down — the watchdog's business, not maintenance's
+		}
+		if checkClaudeState(tmux, "") == "busy" {
+			fmt.Fprintf(os.Stderr, "maintenance: secretary %s busy, skipping restart this cycle\n", sec)
+			continue
+		}
+		if err := restartSecretarySession(cfg, group); err != nil {
+			fmt.Fprintf(os.Stderr, "maintenance: restart %s: %v\n", sec, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "maintenance: secretary %s restarted (fresh session)\n", sec)
+		time.Sleep(15 * time.Second) // stagger restarts, don't thrash all at once
+	}
+}
 
 // namedGroups returns the configured non-default group aliases.
 func namedGroups(cfg *Config) []string {
@@ -334,6 +436,15 @@ func secretaryCommand(args []string) error {
 		fmt.Printf("⏹  Secretary [%s] stopped (watchdog disabled).\n", group)
 		return nil
 
+	case "restart":
+		// Fresh-context relaunch (config/supervision untouched). Safe: a
+		// secretary keeps all state in inbox/journal files, not in context.
+		if err := restartSecretarySession(cfg, group); err != nil {
+			return fmt.Errorf("restart failed: %w", err)
+		}
+		fmt.Printf("🔄 Secretary [%s] restarted with a fresh session.\n", group)
+		return nil
+
 	case "status":
 		if len(args) <= 1 { // no alias -> show all secretaries
 			for _, g := range append([]string{"default"}, namedGroups(cfg)...) {
@@ -345,7 +456,7 @@ func secretaryCommand(args []string) error {
 		return nil
 
 	default:
-		return fmt.Errorf("usage: ccc secretary [start|stop|status] [group-alias]")
+		return fmt.Errorf("usage: ccc secretary [start|stop|restart|status] [group-alias]")
 	}
 }
 
