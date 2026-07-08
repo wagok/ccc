@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.35.0"
+const version = "1.35.2"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3710,6 +3710,12 @@ func runClaudeRaw(continueSession bool) error {
 	if cfg, err := loadConfig(); err == nil {
 		if cwd, err := os.Getwd(); err == nil {
 			if dir := claudeConfigDirForCwd(cfg, cwd); dir != "" {
+				// Pre-trust this folder in the account's config so the TUI folder-trust
+				// prompt (which --dangerously-skip-permissions does NOT suppress) never
+				// blocks a headless agent launched under a fresh account.
+				if err := ensureTrustedInConfigDir(filepath.Join(dir, ".claude.json"), cwd); err != nil {
+					fmt.Fprintf(os.Stderr, "ccc run: pre-trust %s in %s: %v\n", cwd, dir, err)
+				}
 				cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+dir)
 				fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", dir)
 			}
@@ -5542,6 +5548,15 @@ func installHook() error {
 		envAdded = true
 	}
 	settings["env"] = env
+
+	// Pre-accept Bypass Permissions mode so a fresh account config dir doesn't
+	// block headless agents on the one-time "Yes, I accept" prompt (which
+	// --dangerously-skip-permissions itself does not suppress). The default
+	// ~/.claude already has this; a secondary account dir needs it too.
+	if settings["skipDangerousModePermissionPrompt"] != true {
+		settings["skipDangerousModePermissionPrompt"] = true
+		envAdded = true
+	}
 
 	newData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {

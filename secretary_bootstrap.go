@@ -329,8 +329,15 @@ func bootstrapGroupSecretary(cfg *Config, group string) error {
 // rest of the user's claude config is kept byte-faithful; atomic rename.
 func ensureSecretaryTrusted(dir string) error {
 	home, _ := os.UserHomeDir()
-	path := filepath.Join(home, ".claude.json")
+	return ensureTrustedInConfigDir(filepath.Join(home, ".claude.json"), dir)
+}
 
+// ensureTrustedInConfigDir sets projects[dir].hasTrustDialogAccepted=true in the
+// given .claude.json (a specific CLAUDE_CONFIG_DIR's config file), so Claude Code
+// shows no folder-trust prompt for dir. This gate is NOT suppressed by
+// --dangerously-skip-permissions, so a fresh account config would otherwise
+// block every headless agent. Idempotent; atomic write.
+func ensureTrustedInConfigDir(path, dir string) error {
 	root := map[string]interface{}{}
 	if data, err := os.ReadFile(path); err == nil {
 		dec := json.NewDecoder(bytes.NewReader(data))
