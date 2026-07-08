@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.34.1"
+const version = "1.35.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3704,7 +3704,119 @@ func runClaudeRaw(continueSession bool) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	// If this agent's group is pinned to a subscription account, launch claude
+	// with that account's CLAUDE_CONFIG_DIR. Strict no-op otherwise: cmd.Env stays
+	// nil and claude inherits the default environment (~/.claude) exactly as before.
+	if cfg, err := loadConfig(); err == nil {
+		if cwd, err := os.Getwd(); err == nil {
+			if dir := claudeConfigDirForCwd(cfg, cwd); dir != "" {
+				cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+dir)
+				fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", dir)
+			}
+		}
+	}
+
 	return cmd.Run()
+}
+
+// accountDirForGroup returns the expanded CLAUDE_CONFIG_DIR for a group, or ""
+// when the group has no account pinned (→ default ~/.claude).
+func accountDirForGroup(cfg *Config, group string) string {
+	if cfg == nil {
+		return ""
+	}
+	gi := cfg.Groups[group]
+	if gi == nil || gi.Account == "" {
+		return ""
+	}
+	dir := cfg.Accounts[gi.Account]
+	if dir == "" {
+		return ""
+	}
+	return expandPath(dir)
+}
+
+// claudeConfigDirForCwd resolves the account config dir for the LOCAL session
+// owning cwd (matched by path). Returns "" for unknown/default → no override.
+func claudeConfigDirForCwd(cfg *Config, cwd string) string {
+	if cfg == nil {
+		return ""
+	}
+	want := filepath.Clean(cwd)
+	for _, si := range cfg.Sessions {
+		if si == nil || si.Deleted || si.Host != "" {
+			continue
+		}
+		p := filepath.Clean(si.Path)
+		if p == want || strings.HasPrefix(want, p+"/") {
+			return accountDirForGroup(cfg, sessionGroup(si))
+		}
+	}
+	return ""
+}
+
+// setGroupAccount pins (or clears) a group's subscription account. alias must be
+// a key in cfg.Accounts, or "default"/"none"/"" to clear (→ ~/.claude).
+func setGroupAccount(cfg *Config, group, alias string) (string, error) {
+	if group == "" {
+		return "", fmt.Errorf("no group for this topic")
+	}
+	if alias == "none" || alias == "default" {
+		alias = ""
+	}
+	if alias != "" {
+		if _, ok := cfg.Accounts[alias]; !ok {
+			return "", fmt.Errorf("unknown account %q (register it first: ccc account add %s <config-dir>)", alias, alias)
+		}
+	}
+	gi := cfg.Groups[group]
+	if gi == nil {
+		gi = &GroupInfo{ChatID: groupChatID(cfg, group)}
+		if cfg.Groups == nil {
+			cfg.Groups = map[string]*GroupInfo{}
+		}
+		cfg.Groups[group] = gi
+	}
+	gi.Account = alias
+	saveConfig(cfg)
+	if alias == "" {
+		return fmt.Sprintf("Group '%s' → default account (~/.claude). Restart its agents to apply.", group), nil
+	}
+	return fmt.Sprintf("Group '%s' → account '%s' (%s). Restart its agents to apply.", group, alias, cfg.Accounts[alias]), nil
+}
+
+// handleAccountCommand implements /account [alias] in a group topic (admin-only):
+// no arg shows the group's current account; an alias pins it.
+func handleAccountCommand(config *Config, chatID, threadID int64, arg string) {
+	sessionName := getSessionByGroupTopic(config, chatID, threadID)
+	if sessionName == "" {
+		sendMessage(config, chatID, threadID, "❌ No session mapped to this topic")
+		return
+	}
+	group := sessionGroup(config.Sessions[sessionName])
+	if arg == "" {
+		cur := "default (~/.claude)"
+		if gi := config.Groups[group]; gi != nil && gi.Account != "" {
+			cur = fmt.Sprintf("%s (%s)", gi.Account, config.Accounts[gi.Account])
+		}
+		avail := "none registered"
+		if len(config.Accounts) > 0 {
+			var names []string
+			for a := range config.Accounts {
+				names = append(names, a)
+			}
+			sort.Strings(names)
+			avail = strings.Join(names, ", ")
+		}
+		sendMessage(config, chatID, threadID, fmt.Sprintf("💳 Account for group *%s*: %s\nAvailable: %s\nUsage: /account <alias|default>", group, cur, avail))
+		return
+	}
+	msg, err := setGroupAccount(config, group, arg)
+	if err != nil {
+		sendMessage(config, chatID, threadID, "❌ "+err.Error())
+		return
+	}
+	sendMessage(config, chatID, threadID, "✅ "+msg+"\n(On the server: restart the group's sessions so they relaunch under the new account.)")
 }
 
 // startSession creates/attaches to a tmux session with Telegram topic
@@ -5355,7 +5467,12 @@ func addHookToEvent(hooks map[string]interface{}, eventName string, command stri
 
 func installHook() error {
 	home, _ := os.UserHomeDir()
+	// Honor CLAUDE_CONFIG_DIR so `CLAUDE_CONFIG_DIR=~/.claude-work ccc install`
+	// installs the CCC hooks into a secondary subscription-account config dir.
 	claudeDir := filepath.Join(home, ".claude")
+	if cd := os.Getenv("CLAUDE_CONFIG_DIR"); cd != "" {
+		claudeDir = expandPath(cd)
+	}
 	settingsPath := filepath.Join(claudeDir, "settings.json")
 	cccPath := filepath.Join(home, "bin", "ccc")
 
@@ -7221,6 +7338,17 @@ func listen() error {
 				continue
 			}
 
+			// /account [alias] - show or pin this group's subscription account (admin)
+			if strings.HasPrefix(text, "/account") && isGroup {
+				if msg.From.ID != config.ChatID {
+					continue // admin only
+				}
+				arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/account")))
+				handleAccountCommand(config, chatID, threadID, arg)
+				config, _ = loadConfig() // reload after the change
+				continue
+			}
+
 			// /mode [legacy|live] - show or set this topic's Claude-Code
 			// integration mode (live = streaming/buttons/typing; legacy = robust
 			// Stop-only). Admin-only; takes effect on the fly (hooks read config).
@@ -8200,6 +8328,64 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("✅ Moved %s to group %s\n", os.Args[2], os.Args[3])
+
+	case "account":
+		// ccc account list | add <alias> <config-dir> | set <group> <alias|default>
+		cfg, err := loadConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		sub := ""
+		if len(os.Args) > 2 {
+			sub = os.Args[2]
+		}
+		switch sub {
+		case "list":
+			fmt.Println("Accounts (alias -> config dir):")
+			if len(cfg.Accounts) == 0 {
+				fmt.Println("  (none)")
+			}
+			for a, d := range cfg.Accounts {
+				fmt.Printf("  %s -> %s\n", a, d)
+			}
+			fmt.Println("Group assignments:")
+			any := false
+			for g, gi := range cfg.Groups {
+				if gi != nil && gi.Account != "" {
+					fmt.Printf("  group %s -> %s\n", g, gi.Account)
+					any = true
+				}
+			}
+			if !any {
+				fmt.Println("  (all groups use the default account)")
+			}
+		case "add":
+			if len(os.Args) < 5 {
+				fmt.Fprintln(os.Stderr, "Usage: ccc account add <alias> <config-dir>")
+				os.Exit(1)
+			}
+			if cfg.Accounts == nil {
+				cfg.Accounts = map[string]string{}
+			}
+			cfg.Accounts[os.Args[3]] = os.Args[4]
+			saveConfig(cfg)
+			fmt.Printf("✅ Account '%s' -> %s\n", os.Args[3], os.Args[4])
+		case "set":
+			if len(os.Args) < 5 {
+				fmt.Fprintln(os.Stderr, "Usage: ccc account set <group> <alias|default>")
+				os.Exit(1)
+			}
+			msg, err := setGroupAccount(cfg, os.Args[3], os.Args[4])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ " + msg)
+		default:
+			fmt.Fprintln(os.Stderr, "Usage: ccc account list | add <alias> <config-dir> | set <group> <alias|default>")
+			os.Exit(1)
+		}
 
 	case "hook-display":
 		// MessageDisplay: stream assistant deltas to Telegram (live mode).

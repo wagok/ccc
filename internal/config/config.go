@@ -31,8 +31,9 @@ type SessionInfo struct {
 // GroupInfo stores a project-group (a separate Telegram group/channel). Groups
 // are added manually to the config (alias -> chat_id).
 type GroupInfo struct {
-	ChatID int64  `json:"chat_id"`
-	Name   string `json:"name,omitempty"` // optional human-friendly label
+	ChatID  int64  `json:"chat_id"`
+	Name    string `json:"name,omitempty"`    // optional human-friendly label
+	Account string `json:"account,omitempty"` // subscription-account alias (see Config.Accounts); empty = default
 }
 
 // HostInfo stores information about a remote host
@@ -73,6 +74,12 @@ type Config struct {
 	// (a separate Telegram group/channel). Added manually. The implicit
 	// "default" group is the original GroupID (see GroupChatID).
 	Groups map[string]*GroupInfo `json:"groups,omitempty"`
+
+	// Subscription accounts: alias -> Claude config directory (CLAUDE_CONFIG_DIR).
+	// A group whose GroupInfo.Account matches an alias here runs its agents under
+	// that config dir (separate login/usage limit). Empty/unset = the default
+	// ~/.claude. Lets different Telegram groups bill to different subscriptions.
+	Accounts map[string]string `json:"accounts,omitempty"`
 
 	// DefaultIntegrationMode is the fleet-wide default Claude-Code integration
 	// mode for sessions that don't override it. "" -> IntegrationLegacy.
