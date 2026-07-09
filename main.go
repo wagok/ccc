@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.35.2"
+const version = "1.36.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3716,6 +3716,12 @@ func runClaudeRaw(continueSession bool) error {
 				if err := ensureTrustedInConfigDir(filepath.Join(dir, ".claude.json"), cwd); err != nil {
 					fmt.Fprintf(os.Stderr, "ccc run: pre-trust %s in %s: %v\n", cwd, dir, err)
 				}
+				// Register the secretary MCP in this account's config dir so mail works.
+				// A fresh account config has no mcpServers, so without this the agent
+				// boots without the mail tool and silently can't send/deliver.
+				if err := ensureSecretaryMcpInConfigDir(filepath.Join(dir, ".claude.json")); err != nil {
+					fmt.Fprintf(os.Stderr, "ccc run: ensure secretary mcp in %s: %v\n", dir, err)
+				}
 				cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+dir)
 				fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", dir)
 			}
@@ -3789,6 +3795,89 @@ func setGroupAccount(cfg *Config, group, alias string) (string, error) {
 		return fmt.Sprintf("Group '%s' → default account (~/.claude). Restart its agents to apply.", group), nil
 	}
 	return fmt.Sprintf("Group '%s' → account '%s' (%s). Restart its agents to apply.", group, alias, cfg.Accounts[alias]), nil
+}
+
+// accountConfigDirOrDefault turns an account dir ("" = default) into a concrete path.
+func accountConfigDirOrDefault(dir string) string {
+	if dir != "" {
+		return dir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude")
+}
+
+// dirHasJSONL reports whether dir contains at least one *.jsonl (a Claude session).
+func dirHasJSONL(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			return true
+		}
+	}
+	return false
+}
+
+// migrateGroupContext copies each local agent session's Claude conversation history
+// from oldDir to newDir (two CLAUDE_CONFIG_DIR roots) and relaunches the sessions so
+// they resume WITH context under the group's new account. Without this, switching a
+// group's account starts every agent from a blank conversation. The group's secretary
+// is restarted fresh (it rebuilds from its mail files, not from chat history). This is
+// the automation behind `ccc account set <group> <alias> --migrate`.
+func migrateGroupContext(cfg *Config, group, oldDir, newDir string) error {
+	if oldDir == newDir {
+		fmt.Printf("migrate: config dir unchanged (%s) — nothing to migrate\n", oldDir)
+		return nil
+	}
+	fmt.Printf("migrate: %s  ->  %s\n", oldDir, newDir)
+	for name, info := range cfg.Sessions {
+		if info == nil || info.Deleted || info.Host != "" {
+			continue // skip deleted and remote (SSH) sessions
+		}
+		if sessionGroup(info) != group || strings.HasPrefix(name, "secretary") {
+			continue // secretary handled separately, below
+		}
+		enc := encodeProjectPath(info.Path)
+		src := filepath.Join(oldDir, "projects", enc)
+		dst := filepath.Join(newDir, "projects", enc)
+		if _, err := os.Stat(src); err == nil {
+			os.MkdirAll(filepath.Join(newDir, "projects"), 0755)
+			os.RemoveAll(dst)
+			if out, err := exec.Command("cp", "-rp", src, dst).CombinedOutput(); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate %s: copy history failed: %v: %s\n", name, err, out)
+			} else {
+				fmt.Printf("migrate %s: history copied\n", name)
+			}
+		} else {
+			fmt.Printf("migrate %s: no history at %s — relaunching fresh\n", name, src)
+		}
+		// -c only if the destination now holds a session; otherwise `claude -c` would
+		// fail with "No conversation found to continue".
+		continueSession := dirHasJSONL(dst)
+		tmux := tmuxSessionName(name)
+		if tmuxSessionExists(tmux) {
+			tmuxCmd("kill-session", "-t", tmux).Run()
+		}
+		if err := createTmuxSession(tmux, info.Path, continueSession); err != nil {
+			fmt.Fprintf(os.Stderr, "migrate %s: relaunch failed: %v\n", name, err)
+		} else {
+			mode := "fresh"
+			if continueSession {
+				mode = "with context (-c)"
+			}
+			fmt.Printf("migrate %s: relaunched %s\n", name, mode)
+		}
+	}
+	// Bring the group's secretary onto the new account too (fresh; Feature-1 auto-reg
+	// gives it the secretary MCP there). No-op error if the group has no secretary.
+	if err := restartSecretarySession(cfg, group); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: secretary restart: %v\n", err)
+	} else {
+		fmt.Printf("migrate: secretary for group %s restarted on new account\n", group)
+	}
+	return nil
 }
 
 // handleAccountCommand implements /account [alias] in a group topic (admin-only):
@@ -4386,11 +4475,14 @@ func extractProjectDirFromTranscript(transcriptPath string) string {
 	return rest
 }
 
-// encodeProjectPath encodes a filesystem path the same way Claude Code does:
-// replaces both "/" and "_" with "-".
+// encodeProjectPath encodes a filesystem path the same way Claude Code does for its
+// <config-dir>/projects/ dirs: replaces "/", "_" and "." with "-". Verified against real
+// dirs (…/GTaara_group/PM → -home-wlad-Projects-GTaara-group-PM; ~/.ccc/secretary-gtara
+// → -home-wlad--ccc-secretary-gtara).
 func encodeProjectPath(path string) string {
 	s := strings.ReplaceAll(path, "/", "-")
 	s = strings.ReplaceAll(s, "_", "-")
+	s = strings.ReplaceAll(s, ".", "-")
 	return s
 }
 
@@ -8388,17 +8480,33 @@ func main() {
 			fmt.Printf("✅ Account '%s' -> %s\n", os.Args[3], os.Args[4])
 		case "set":
 			if len(os.Args) < 5 {
-				fmt.Fprintln(os.Stderr, "Usage: ccc account set <group> <alias|default>")
+				fmt.Fprintln(os.Stderr, "Usage: ccc account set <group> <alias|default> [--migrate]")
 				os.Exit(1)
 			}
-			msg, err := setGroupAccount(cfg, os.Args[3], os.Args[4])
+			group, alias := os.Args[3], os.Args[4]
+			migrate := false
+			for _, a := range os.Args[5:] {
+				if a == "--migrate" {
+					migrate = true
+				}
+			}
+			// Capture the group's current config dir BEFORE the switch so we know
+			// where to copy history from when --migrate is set.
+			oldDir := accountConfigDirOrDefault(accountDirForGroup(cfg, group))
+			msg, err := setGroupAccount(cfg, group, alias)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Println("✅ " + msg)
+			if migrate {
+				newDir := accountConfigDirOrDefault(accountDirForGroup(cfg, group))
+				if err := migrateGroupContext(cfg, group, oldDir, newDir); err != nil {
+					fmt.Fprintf(os.Stderr, "migrate: %v\n", err)
+				}
+			}
 		default:
-			fmt.Fprintln(os.Stderr, "Usage: ccc account list | add <alias> <config-dir> | set <group> <alias|default>")
+			fmt.Fprintln(os.Stderr, "Usage: ccc account list | add <alias> <config-dir> | set <group> <alias|default> [--migrate]")
 			os.Exit(1)
 		}
 

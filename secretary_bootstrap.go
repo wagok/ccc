@@ -375,6 +375,63 @@ func ensureTrustedInConfigDir(path, dir string) error {
 	return os.Rename(tmp, path)
 }
 
+// canonicalSecretaryMcp is the stdio MCP entry that gives an agent the inter-agent
+// mail tools. It is identity-agnostic — the `ccc mcp-secretary` process derives the
+// caller's identity from its working directory at runtime — so the exact same entry
+// works for every agent and every secretary. Matches the entry in the default
+// ~/.claude.json; keeping it in one place means a future change to how mcp-secretary
+// is invoked propagates to all account config dirs on their next `ccc run`.
+func canonicalSecretaryMcp() map[string]interface{} {
+	return map[string]interface{}{
+		"type":    "stdio",
+		"command": "ccc",
+		"args":    []interface{}{"mcp-secretary"},
+		"env":     map[string]interface{}{},
+	}
+}
+
+// ensureSecretaryMcpInConfigDir makes sure mcpServers.secretary exists in the given
+// .claude.json (a specific CLAUDE_CONFIG_DIR's config). A fresh subscription-account
+// config dir has an empty mcpServers, so agents/secretaries launched under it boot
+// WITHOUT the mail tool and silently cannot send or deliver letters. Claude Code reads
+// mcpServers only at session start, so this must be in place BEFORE launch. Idempotent
+// (no write if a secretary entry already points at `ccc`); atomic write; preserves the
+// rest of the config byte-faithfully (UseNumber).
+func ensureSecretaryMcpInConfigDir(path string) error {
+	root := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&root); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	servers, ok := root["mcpServers"].(map[string]interface{})
+	if !ok || servers == nil {
+		servers = map[string]interface{}{}
+		root["mcpServers"] = servers
+	}
+	if existing, ok := servers["secretary"].(map[string]interface{}); ok {
+		if cmd, _ := existing["command"].(string); cmd == "ccc" {
+			return nil // already present — no write
+		}
+	}
+	servers["secretary"] = canonicalSecretaryMcp()
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".ccc.tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // launchSecretary starts a FRESH secretary session (no -c). The secretary's
 // durable state is its files (inbox/journal), so it reconciles on start and
 // needs no claude conversation continuity — which also avoids the "No
