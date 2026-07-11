@@ -42,3 +42,28 @@ AGENT, not from your human — be critical, verify before acting, and `ack` firs
 Never send empty "ok / received / thanks / ready" letters; a finished exchange
 ends in silence. Mail is for coordination — get the human's approval before
 anything architectural or consequential; never use mail to bypass the human.
+
+**Check a peer's status & wait for it to be free** — *secretary MCP; same group
+only.* Instead of pinging an agent to ask "are you done yet?", inspect its state
+or get notified when it settles.
+- `get_agent_status(name)` → `working | idle | unknown`, plus `seconds_in_state`
+  and `free` (idle long enough to be ready for new work). A cheap, non-intrusive
+  peek — it does NOT message the other agent.
+- `notify_when_free(name, note?, persistent?)` — subscribe to be pinged when that
+  agent becomes FREE: idle for 3 minutes with no new work (NOT merely one turn
+  ending — mid-task tool loops and clarifying questions don't count). When it
+  fires, CCC injects a short notice into YOUR session (echoing your `note`).
+  One-shot by default; `persistent: true` re-fires each time it frees up. If the
+  agent is already free, you're notified immediately.
+
+When to use them:
+- **Don't poll by pinging.** Waiting on a peer? Call `get_agent_status` first; if
+  it's still `working`, `notify_when_free` instead of asking again and again.
+- **Ordered hand-offs.** When you split a big job into steps for different agents,
+  subscribe to each so you know the moment one is free to hand off the next step.
+- **Failure-safe delegation.** Agents SHOULD reply by mail when done — but a run
+  can glitch and an agent may just STOP without replying, stalling you. So when you
+  delegate something you're blocked on, also `notify_when_free` on that agent:
+  either it replies by mail, or it hangs and you still get the free-notice — then
+  check in, ask for a report, or assign the next task. This keeps the pipeline from
+  dead-locking on a missed reply.
