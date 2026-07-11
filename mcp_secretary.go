@@ -72,6 +72,8 @@ func onTimer(t scheduler.Timer) {
 		onRateLimitContinue(t)
 	case "secretary_restart":
 		onSecretaryRestartTimer(t)
+	case "idle_notify":
+		onIdleNotifyTimer(t)
 	default:
 		onMailTimer(t)
 	}
@@ -905,6 +907,20 @@ func secretaryTools() []map[string]interface{} {
 			"inputSchema": obj(map[string]interface{}{"name": str}, "name"),
 		},
 		{
+			"name":        "get_agent_status",
+			"description": "Check whether an agent in your group is working or idle, precisely (from turn-boundary hooks, not screen-scraping). Returns status ('working' | 'idle' | 'unknown'), seconds_in_state, and free (true when it has been idle long enough to be considered ready for new work). Use before assigning work, or to poll a peer.",
+			"inputSchema": obj(map[string]interface{}{"name": str}, "name"),
+		},
+		{
+			"name":        "notify_when_free",
+			"description": "Ask CCC to ping YOU when another agent in your group becomes FREE — i.e. it has finished and stayed idle for a few minutes (not merely ended one turn; mid-task tool loops and clarifying questions won't trigger it). When it fires, CCC injects a message into your session so you can fetch the result or start dependent work. `name`: the agent to watch. `note` (optional): text echoed back to you when it fires (e.g. what you were waiting for). `persistent` (optional, default false): if false the subscription is one-shot; if true it fires every time that agent becomes free. If the agent is already free, you are notified immediately.",
+			"inputSchema": obj(map[string]interface{}{
+				"name":       str,
+				"note":       str,
+				"persistent": map[string]interface{}{"type": "boolean"},
+			}, "name"),
+		},
+		{
 			"name":        "update_self",
 			"description": "Publish/replace YOUR OWN agent card: what you do, your areas of responsibility, and when to contact you. Full replace — omitted fields are cleared. Identity is derived from your working directory; you can only edit your own card.",
 			"inputSchema": obj(map[string]interface{}{
@@ -967,6 +983,12 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 		return resultText(resp, err)
 	case "get_agent":
 		resp, err := relayRequest(APIRequest{Cmd: "agent.get", Payload: call.Arguments})
+		return resultText(resp, err)
+	case "get_agent_status":
+		resp, err := relayRequest(APIRequest{Cmd: "agent.status", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+	case "notify_when_free":
+		resp, err := relayRequest(APIRequest{Cmd: "subscribe.idle", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
 	case "update_self":
 		resp, err := relayRequest(APIRequest{Cmd: "agent.update_self", Cwd: cwd, Payload: call.Arguments})

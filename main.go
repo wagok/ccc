@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.36.0"
+const version = "1.37.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -702,6 +702,10 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleAgentGetCmd(encoder, cfg, req)
 		case "agent.update_self":
 			handleAgentUpdateSelfCmd(encoder, cfg, req)
+		case "agent.status":
+			handleAgentStatusCmd(encoder, cfg, req)
+		case "subscribe.idle":
+			handleSubscribeIdleCmd(encoder, cfg, req)
 		case "mail.send":
 			handleMailSendCmd(encoder, cfg, req)
 		case "mail.deliver":
@@ -2697,6 +2701,10 @@ func handleTypingSocketCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: false, Error: "session not found"})
 		return
 	}
+	// Record the agent's work-state edge (start/stop) for status queries and idle
+	// subscriptions. Independent of live-mode: the edge signal is meaningful even
+	// when the typing indicator is not shown.
+	recordAgentWorkEdge(cfg, session, req.Text)
 	live := isSessionLive(cfg, info)
 	switch req.Text {
 	case "start":
@@ -5603,6 +5611,11 @@ func installHook() error {
 	// Add Stop hook (doesn't overwrite existing hooks)
 	stopAdded := addHookToEvent(hooks, "Stop", cccPath+" hook")
 
+	// Add UserPromptSubmit hook: the precise "turn begins" edge. Feeds the live
+	// typing indicator AND agent work-state tracking (status=working, cancels the
+	// idle-notify timer). Pairs with the Stop hook which marks status=idle.
+	promptAdded := addHookToEvent(hooks, "UserPromptSubmit", cccPath+" hook-prompt")
+
 	// Add PreToolUse hook for AskUserQuestion forwarding
 	// Use timeout 300000ms (5min) to allow time for user to answer via Telegram
 	preToolAdded := addHookToEvent(hooks, "PreToolUse", cccPath+" hook-permission")
@@ -5659,8 +5672,11 @@ func installHook() error {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 
-	if stopAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded || stopFailAdded || envAdded {
+	if stopAdded || promptAdded || preToolAdded || displayAdded || briefingAdded || notifyAdded || stopFailAdded || envAdded {
 		fmt.Println("✅ Claude hooks installed!")
+		if promptAdded {
+			fmt.Println("  + UserPromptSubmit hook (turn-start / work-state)")
+		}
 		if stopAdded {
 			fmt.Println("  + Stop hook (response capture)")
 		}
