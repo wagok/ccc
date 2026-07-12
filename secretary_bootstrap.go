@@ -9,6 +9,7 @@ package main
 // startup; `ccc secretary start` triggers the first launch.
 
 import (
+	"bufio"
 	"bytes"
 	"embed"
 	"encoding/json"
@@ -42,6 +43,19 @@ const (
 	secretaryRestartTimerID = "secretary-restart"
 	secretaryRestartHour    = 1 // 01:30 UTC ≈ 04:30 Kyiv — quiet hour
 	secretaryRestartMinute  = 30
+)
+
+// Between the daily maintenance restarts a secretary can still wedge mid-day —
+// most often the "court" tool-call glitch, where `deliver` calls are emitted as
+// plain text and never execute, so letters land in inbox (event=received) but are
+// never `queued`. This health check catches that: a letter sitting unprocessed
+// past the threshold ⇒ the secretary is stuck ⇒ restart it fresh (which heals the
+// poisoned context and re-reconciles the inbox). Threshold is generous so a
+// secretary that is merely slow or awaiting the human isn't cut off prematurely.
+const (
+	secretaryHealthTimerID     = "secretary-health"
+	secretaryHealthCheckSecs   = 300 // scan every 5 min
+	secretaryStuckThresholdSec = 600 // inbox letter unqueued ≥10 min ⇒ wedged
 )
 
 // nextDailyUTC returns the next unix time at hh:mm UTC strictly in the future.
@@ -133,6 +147,129 @@ func onSecretaryRestartTimer(t scheduler.Timer) {
 		fmt.Fprintf(os.Stderr, "maintenance: secretary %s restarted (fresh session)\n", sec)
 		time.Sleep(15 * time.Second) // stagger restarts, don't thrash all at once
 	}
+}
+
+// ensureSecretaryHealthTimer arms the periodic wedged-secretary check if it is not
+// already pending. Called on server start.
+func ensureSecretaryHealthTimer() {
+	if mailScheduler == nil {
+		return
+	}
+	if _, ok := mailScheduler.Get(secretaryHealthTimerID); ok {
+		return
+	}
+	mailScheduler.Schedule(scheduler.Timer{
+		ID:     secretaryHealthTimerID,
+		FireAt: time.Now().Unix() + secretaryHealthCheckSecs,
+		Kind:   "secretary_health",
+	})
+}
+
+// onSecretaryHealthTimer scans every enabled, running secretary for a stuck inbox
+// and restarts any that are wedged. Busy secretaries are skipped (they may be
+// mid-processing — catch them next cycle). Always reschedules itself.
+func onSecretaryHealthTimer(t scheduler.Timer) {
+	defer func() {
+		if mailScheduler != nil {
+			t.FireAt = time.Now().Unix() + secretaryHealthCheckSecs
+			mailScheduler.Schedule(t)
+		}
+	}()
+	cfg, err := loadConfig()
+	if err != nil {
+		return
+	}
+	for _, group := range append([]string{"default"}, namedGroups(cfg)...) {
+		sec := mail.SecretaryName(group)
+		if !secretaryEnabled(sec) {
+			continue
+		}
+		tmux := tmuxSessionName(sec)
+		if !tmuxSessionExists(tmux) {
+			continue // down — the watchdog's business, not the health check's
+		}
+		stuck := secretaryStuckTickets(mail.MailboxDir(sec), secretaryStuckThresholdSec)
+		if len(stuck) == 0 {
+			continue
+		}
+		// Don't cut off a secretary that is actively working right now; if it's
+		// genuinely wedged it will be idle and caught this or the next cycle.
+		if checkClaudeState(tmux, "") == "busy" {
+			fmt.Fprintf(os.Stderr, "secretary_health: %s has %d stuck letter(s) but is busy — skipping this cycle\n", sec, len(stuck))
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "secretary_health: %s wedged — %d letter(s) unqueued ≥%dm (e.g. %s); auto-restarting\n",
+			sec, len(stuck), secretaryStuckThresholdSec/60, stuck[0])
+		if err := restartSecretarySession(cfg, group); err != nil {
+			fmt.Fprintf(os.Stderr, "secretary_health: restart %s: %v\n", sec, err)
+			continue
+		}
+		time.Sleep(15 * time.Second) // stagger, don't thrash all at once
+	}
+}
+
+// secretaryStuckTickets returns inbox tickets that have been sitting unprocessed
+// (no `queued`/`delivered` journal event) for longer than thresholdSecs — the
+// signature of a wedged secretary. File mtime is the arrival time; a healthy
+// secretary queues within seconds of waking, so an old-but-unqueued letter means
+// the deliver never executed.
+func secretaryStuckTickets(dir string, thresholdSecs int64) []string {
+	entries, err := os.ReadDir(filepath.Join(dir, "inbox"))
+	if err != nil {
+		return nil
+	}
+	now := time.Now().Unix()
+	old := map[string]bool{}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now-info.ModTime().Unix() >= thresholdSecs {
+			old[strings.TrimSuffix(e.Name(), ".json")] = true
+		}
+	}
+	if len(old) == 0 {
+		return nil
+	}
+	processed := journalProcessedTickets(filepath.Join(dir, "journal.jsonl"), old)
+	var stuck []string
+	for ticket := range old {
+		if !processed[ticket] {
+			stuck = append(stuck, ticket)
+		}
+	}
+	return stuck
+}
+
+// journalProcessedTickets scans journal.jsonl and returns the subset of `want`
+// tickets that have a `queued` or `delivered` event (i.e. the secretary did route
+// them). Bounded memory: only tracks the tickets asked about.
+func journalProcessedTickets(journalPath string, want map[string]bool) map[string]bool {
+	processed := map[string]bool{}
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return processed
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // journal lines carry subjects
+	for sc.Scan() {
+		var ev struct {
+			Ticket string `json:"ticket"`
+			Event  string `json:"event"`
+		}
+		if json.Unmarshal(sc.Bytes(), &ev) != nil {
+			continue
+		}
+		if want[ev.Ticket] && (ev.Event == "queued" || ev.Event == "delivered") {
+			processed[ev.Ticket] = true
+		}
+	}
+	return processed
 }
 
 // namedGroups returns the configured non-default group aliases.

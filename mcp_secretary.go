@@ -55,6 +55,7 @@ func initMailScheduler() error {
 	mailScheduler = s
 	restoreDeliverSlot()          // continue inter-send spacing across restarts
 	ensureSecretaryRestartTimer() // arm the daily maintenance restart
+	ensureSecretaryHealthTimer()  // arm the periodic wedged-secretary check
 	go s.Run(context.Background())
 	return nil
 }
@@ -72,6 +73,8 @@ func onTimer(t scheduler.Timer) {
 		onRateLimitContinue(t)
 	case "secretary_restart":
 		onSecretaryRestartTimer(t)
+	case "secretary_health":
+		onSecretaryHealthTimer(t)
 	case "idle_notify":
 		onIdleNotifyTimer(t)
 	default:
