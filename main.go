@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.38.0"
+const version = "1.39.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3707,33 +3707,45 @@ func runClaudeRaw(continueSession bool) error {
 		args = append(args, "-c")
 	}
 
+	// Resolve per-session launch tweaks from config: account config dir and the
+	// secretary model. Both key off the session that owns the current cwd.
+	var accountDir string
+	cfg, cfgErr := loadConfig()
+	cwd, cwdErr := os.Getwd()
+	if cfgErr == nil && cwdErr == nil {
+		accountDir = claudeConfigDirForCwd(cfg, cwd)
+		// Secretaries run on a lighter model: mail routing doesn't need Opus, it's
+		// cheaper, and a smaller model degenerates less (the "court" loop). Detected
+		// by the session that owns cwd, so ordinary agents keep the default model.
+		if name := resolveCaller(cfg, "", cwd); name != "" && mail.IsSecretary(name) {
+			args = append(args, "--model", secretaryModel)
+			fmt.Fprintf(os.Stderr, "ccc run: --model %s (secretary %s)\n", secretaryModel, name)
+		}
+	}
+
 	cmd := exec.Command(claudePath, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// If this agent's group is pinned to a subscription account, launch claude
-	// with that account's CLAUDE_CONFIG_DIR. Strict no-op otherwise: cmd.Env stays
-	// nil and claude inherits the default environment (~/.claude) exactly as before.
-	if cfg, err := loadConfig(); err == nil {
-		if cwd, err := os.Getwd(); err == nil {
-			if dir := claudeConfigDirForCwd(cfg, cwd); dir != "" {
-				// Pre-trust this folder in the account's config so the TUI folder-trust
-				// prompt (which --dangerously-skip-permissions does NOT suppress) never
-				// blocks a headless agent launched under a fresh account.
-				if err := ensureTrustedInConfigDir(filepath.Join(dir, ".claude.json"), cwd); err != nil {
-					fmt.Fprintf(os.Stderr, "ccc run: pre-trust %s in %s: %v\n", cwd, dir, err)
-				}
-				// Register the secretary MCP in this account's config dir so mail works.
-				// A fresh account config has no mcpServers, so without this the agent
-				// boots without the mail tool and silently can't send/deliver.
-				if err := ensureSecretaryMcpInConfigDir(filepath.Join(dir, ".claude.json")); err != nil {
-					fmt.Fprintf(os.Stderr, "ccc run: ensure secretary mcp in %s: %v\n", dir, err)
-				}
-				cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+dir)
-				fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", dir)
-			}
+	// If this agent's group is pinned to a subscription account, launch claude with
+	// that account's CLAUDE_CONFIG_DIR. Strict no-op otherwise: cmd.Env stays nil and
+	// claude inherits the default environment (~/.claude) exactly as before.
+	if accountDir != "" {
+		// Pre-trust this folder in the account's config so the TUI folder-trust
+		// prompt (which --dangerously-skip-permissions does NOT suppress) never
+		// blocks a headless agent launched under a fresh account.
+		if err := ensureTrustedInConfigDir(filepath.Join(accountDir, ".claude.json"), cwd); err != nil {
+			fmt.Fprintf(os.Stderr, "ccc run: pre-trust %s in %s: %v\n", cwd, accountDir, err)
 		}
+		// Register the secretary MCP in this account's config dir so mail works.
+		// A fresh account config has no mcpServers, so without this the agent
+		// boots without the mail tool and silently can't send/deliver.
+		if err := ensureSecretaryMcpInConfigDir(filepath.Join(accountDir, ".claude.json")); err != nil {
+			fmt.Fprintf(os.Stderr, "ccc run: ensure secretary mcp in %s: %v\n", accountDir, err)
+		}
+		cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+accountDir)
+		fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", accountDir)
 	}
 
 	return cmd.Run()

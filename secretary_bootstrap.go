@@ -45,6 +45,11 @@ const (
 	secretaryRestartMinute  = 30
 )
 
+// secretaryModel is the Claude model secretaries launch on (via `claude --model`).
+// Mail routing is light work — Sonnet is cheaper than Opus and degenerates less.
+// Applied in runClaudeRaw when the launched session is a secretary.
+const secretaryModel = "sonnet"
+
 // Between the daily maintenance restarts a secretary can still wedge mid-day —
 // most often the "court" tool-call glitch, where `deliver` calls are emitted as
 // plain text and never execute, so letters land in inbox (event=received) but are
