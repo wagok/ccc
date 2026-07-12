@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.37.1"
+const version = "1.37.2"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -5347,7 +5347,6 @@ func handlePromptHook() error {
 	}
 
 	if hookData.Prompt == "" {
-		fmt.Fprintf(os.Stderr, "hook-prompt: empty prompt\n")
 		return nil
 	}
 
@@ -5389,15 +5388,15 @@ func handlePromptHook() error {
 	}
 
 	if topicID == 0 || matchedGroup == 0 {
-		fmt.Fprintf(os.Stderr, "hook-prompt: no topic found for cwd=%s\n", hookData.Cwd)
 		return nil
 	}
 
 	_ = sessionName // typing-start now happens earlier (host-agnostic)
 
-	// Check if this prompt was just sent from Telegram (cooldown 10s)
+	// Check if this prompt was just sent from Telegram or injected by CCC
+	// (mail/reminder/wake all markTelegramSent). Cooldown 10s. Skip the echo so
+	// CCC-delivered prompts aren't mirrored back to the topic a second time.
 	if wasTelegramSent(topicID) {
-		fmt.Fprintf(os.Stderr, "hook-prompt: skipping (telegram cooldown) topic=%d\n", topicID)
 		return nil
 	}
 
@@ -5413,8 +5412,12 @@ func handlePromptHook() error {
 	// Send typing action
 	sendTypingAction(config, matchedGroup, topicID)
 
-	fmt.Fprintf(os.Stderr, "hook-prompt: sending local prompt to topic %d\n", topicID)
-	return sendMessage(config, matchedGroup, topicID, fmt.Sprintf("💬 %s", prompt))
+	// Genuine terminal-typed prompt (not from Telegram, not CCC-injected): mirror
+	// it to the topic so the human sees what was typed. Swallow any send error —
+	// a hook must exit 0 on success, or Claude Code surfaces a scary
+	// "UserPromptSubmit hook error" on every turn.
+	sendMessage(config, matchedGroup, topicID, fmt.Sprintf("💬 %s", prompt))
+	return nil
 }
 
 func handleOutputHook() error {
