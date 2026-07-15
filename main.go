@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.41.0"
+const version = "1.41.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -8261,6 +8261,8 @@ Your companion for Claude Code - control sessions remotely via Telegram and tmux
 USAGE:
     ccc                     Start/attach tmux session in current directory
     ccc -c                  Continue previous session
+    ccc --group <g> [--account <a>]   Start this dir's agent in a Telegram group
+                            and/or on a subscription account (see ACCOUNTS & GROUPS)
     ccc <message>           Send notification (if away mode is on)
 
 COMMANDS:
@@ -8278,6 +8280,19 @@ HOST MANAGEMENT (for remote sessions):
     host add <name> <addr> [dir]  Add remote host
     host del <name>               Remove remote host
     host list                     List configured hosts
+
+ACCOUNTS & GROUPS (server-local agents):
+    ccc --group <alias> --account <alias>   Create/launch this dir's agent in a
+                            Telegram group AND on a subscription account, one command.
+                            Both flags optional; unknown group/account = error, no-op.
+                            (Old manual way: ccc -> /changegroup <g> -> account
+                             set-session <name> <a> -> relaunch.)
+    account list                       List accounts + group and session assignments
+    account add <alias> <config-dir>   Register an account (a CLAUDE_CONFIG_DIR)
+    account set <group> <alias> [--migrate]   Pin a whole group to an account
+    account set-session <name> <alias>        Pin one session to an account
+    (New account first: CLAUDE_CONFIG_DIR=~/.claude-X claude  # then /login;
+     then CLAUDE_CONFIG_DIR=~/.claude-X ccc install; then account add <alias> ~/.claude-X)
 
 CLIENT MODE (for laptops):
     client                  Show client mode config

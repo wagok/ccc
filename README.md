@@ -132,6 +132,7 @@ That's it! You're ready to control Claude Code from Telegram.
 |---------|-------------|
 | `ccc` | Start/attach Claude session in current directory |
 | `ccc -c` | Continue previous session |
+| `ccc --group <alias> [--account <alias>]` | Start this dir's agent in a Telegram group / on a subscription account (see [Subscription Accounts & Groups](#subscription-accounts--groups)) |
 | `ccc "message"` | Send notification (if away mode on) |
 | `ccc doctor` | Check all dependencies and configuration |
 | `ccc config` | Show current configuration |
@@ -317,6 +318,42 @@ Now `/new myproject` creates `~/Projects/myproject`.
 /new ~/experiments/test     → ~/experiments/test
 /new /tmp/quicktest         → /tmp/quicktest
 ```
+
+### Subscription Accounts & Groups
+
+Agents can run on different Anthropic subscriptions (each a separate
+`CLAUDE_CONFIG_DIR` — its own login, usage limit, and history), and can be placed
+in a specific Telegram **group** (which shares one secretary / mail domain).
+An account can be pinned per **group** or per **individual session**.
+
+**1. Register a new account (one-time):**
+```bash
+# Log in with the new Anthropic account (browser); pick a dir name:
+CLAUDE_CONFIG_DIR=~/.claude-myacct claude        # then type /login inside, then quit
+CLAUDE_CONFIG_DIR=~/.claude-myacct ccc install   # install hooks into that config dir
+ccc account add myacct ~/.claude-myacct          # register the alias
+ccc account list                                 # verify
+```
+
+**2. Launch a new agent in a group and on that account — one command:**
+```bash
+cd ~/Projects/my-new-agent
+ccc --group openarx_ai --account myacct
+```
+This creates the agent's topic directly in the group's chat, pins the account, and
+launches it there — no follow-up steps. Both flags are optional (use just `--group`
+to place it in a group on the default account, or just `--account` to change only the
+account). Unknown group/account is rejected with no side effect.
+
+**Account commands:**
+```bash
+ccc account list                              # accounts + group and session assignments
+ccc account add <alias> <config-dir>          # register an account
+ccc account set <group> <alias> [--migrate]   # pin a whole group (--migrate moves history)
+ccc account set-session <name> <alias>        # pin one session (overrides its group)
+```
+Mail is unaffected by accounts: an agent on a separate account still uses its group's
+secretary and can message the other agents in that group.
 
 ### Transcription Setup
 
