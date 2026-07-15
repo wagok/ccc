@@ -69,6 +69,28 @@ func TestEnsureSecretaryMcpInConfigDir(t *testing.T) {
 	assertSecretaryEntry(t, missing)
 }
 
+func TestAccountDirForSession(t *testing.T) {
+	cfg := &Config{
+		Accounts: map[string]string{"work": "/home/x/.claude-work", "alt": "/home/x/.claude-alt"},
+		Groups:   map[string]*GroupInfo{"openarx_ai": {Account: "work"}},
+	}
+	cases := []struct {
+		name string
+		si   *SessionInfo
+		want string
+	}{
+		{"session override wins", &SessionInfo{Group: "openarx_ai", Account: "alt"}, "/home/x/.claude-alt"},
+		{"no override -> group account", &SessionInfo{Group: "openarx_ai"}, "/home/x/.claude-work"},
+		{"unknown alias -> group fallback", &SessionInfo{Group: "openarx_ai", Account: "ghost"}, "/home/x/.claude-work"},
+		{"no override, no group account -> empty", &SessionInfo{Group: "default"}, ""},
+	}
+	for _, c := range cases {
+		if got := accountDirForSession(cfg, c.si); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestDirHasJSONL(t *testing.T) {
 	dir := t.TempDir()
 	if dirHasJSONL(dir) {

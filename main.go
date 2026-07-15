@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.39.0"
+const version = "1.40.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3781,10 +3781,50 @@ func claudeConfigDirForCwd(cfg *Config, cwd string) string {
 		}
 		p := filepath.Clean(si.Path)
 		if p == want || strings.HasPrefix(want, p+"/") {
-			return accountDirForGroup(cfg, sessionGroup(si))
+			return accountDirForSession(cfg, si)
 		}
 	}
 	return ""
+}
+
+// accountDirForSession resolves the CLAUDE_CONFIG_DIR for one session: its own
+// Account override wins, else the session's group account, else "" (default
+// ~/.claude). Lets individual agents run on a separate account while staying in
+// their group's mail domain.
+func accountDirForSession(cfg *Config, si *SessionInfo) string {
+	if cfg == nil || si == nil {
+		return ""
+	}
+	if si.Account != "" {
+		if dir := cfg.Accounts[si.Account]; dir != "" {
+			return expandPath(dir)
+		}
+	}
+	return accountDirForGroup(cfg, sessionGroup(si))
+}
+
+// setSessionAccount pins (or clears) a single session's subscription account.
+// alias must be a key in cfg.Accounts, or "default"/"none"/"" to clear (→ inherit
+// the group's account).
+func setSessionAccount(cfg *Config, session, alias string) (string, error) {
+	if alias == "none" || alias == "default" {
+		alias = ""
+	}
+	if alias != "" {
+		if _, ok := cfg.Accounts[alias]; !ok {
+			return "", fmt.Errorf("unknown account %q (register it first: ccc account add %s <config-dir>)", alias, alias)
+		}
+	}
+	si := cfg.Sessions[session]
+	if si == nil {
+		return "", fmt.Errorf("no session named %q", session)
+	}
+	si.Account = alias
+	saveConfig(cfg)
+	if alias == "" {
+		return fmt.Sprintf("Session '%s' → inherits its group's account. Restart it (/continue) to apply.", session), nil
+	}
+	return fmt.Sprintf("Session '%s' → account '%s' (%s). Restart it (/continue) to apply.", session, alias, cfg.Accounts[alias]), nil
 }
 
 // setGroupAccount pins (or clears) a group's subscription account. alias must be
@@ -8498,6 +8538,17 @@ func main() {
 			if !any {
 				fmt.Println("  (all groups use the default account)")
 			}
+			fmt.Println("Session overrides:")
+			anyS := false
+			for s, si := range cfg.Sessions {
+				if si != nil && !si.Deleted && si.Account != "" {
+					fmt.Printf("  session %s -> %s (group %s)\n", s, si.Account, sessionGroup(si))
+					anyS = true
+				}
+			}
+			if !anyS {
+				fmt.Println("  (none)")
+			}
 		case "add":
 			if len(os.Args) < 5 {
 				fmt.Fprintln(os.Stderr, "Usage: ccc account add <alias> <config-dir>")
@@ -8536,8 +8587,19 @@ func main() {
 					fmt.Fprintf(os.Stderr, "migrate: %v\n", err)
 				}
 			}
+		case "set-session":
+			if len(os.Args) < 5 {
+				fmt.Fprintln(os.Stderr, "Usage: ccc account set-session <session> <alias|default>")
+				os.Exit(1)
+			}
+			msg, err := setSessionAccount(cfg, os.Args[3], os.Args[4])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ " + msg)
 		default:
-			fmt.Fprintln(os.Stderr, "Usage: ccc account list | add <alias> <config-dir> | set <group> <alias|default> [--migrate]")
+			fmt.Fprintln(os.Stderr, "Usage: ccc account list | add <alias> <config-dir> | set <group> <alias|default> [--migrate] | set-session <session> <alias|default>")
 			os.Exit(1)
 		}
 

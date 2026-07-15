@@ -16,6 +16,12 @@ type SessionInfo struct {
 	Deleted bool   `json:"deleted,omitempty"` // Soft-deleted (killed but topic preserved)
 	Group   string `json:"group,omitempty"`   // Project-group alias; "" = the default group
 
+	// Account overrides the group's subscription account for THIS session (an
+	// alias in Config.Accounts). Empty = inherit the group's account
+	// (GroupInfo.Account). Lets a few agents in a group run on a separate
+	// Anthropic account while staying in the group's mail domain / secretary.
+	Account string `json:"account,omitempty"`
+
 	// IntegrationMode selects the Claude-Code integration behavior for this
 	// session: "legacy" (Stop-only, transcript-JSONL capture — robust, change-
 	// resistant) or "live" (richer hook-driven streaming/buttons/typing).
