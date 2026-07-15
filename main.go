@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.40.0"
+const version = "1.40.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3702,25 +3702,43 @@ func runClaudeRaw(continueSession bool) error {
 		return fmt.Errorf("claude binary not found")
 	}
 
-	args := []string{"--dangerously-skip-permissions"}
-	if continueSession {
-		args = append(args, "-c")
-	}
-
 	// Resolve per-session launch tweaks from config: account config dir and the
-	// secretary model. Both key off the session that owns the current cwd.
-	var accountDir string
+	// secretary flag. Both key off the session that owns the current cwd.
+	var accountDir, secretaryName string
 	cfg, cfgErr := loadConfig()
 	cwd, cwdErr := os.Getwd()
 	if cfgErr == nil && cwdErr == nil {
 		accountDir = claudeConfigDirForCwd(cfg, cwd)
-		// Secretaries run on a lighter model: mail routing doesn't need Opus, it's
-		// cheaper, and a smaller model degenerates less (the "court" loop). Detected
-		// by the session that owns cwd, so ordinary agents keep the default model.
 		if name := resolveCaller(cfg, "", cwd); name != "" && mail.IsSecretary(name) {
-			args = append(args, "--model", secretaryModel)
-			fmt.Fprintf(os.Stderr, "ccc run: --model %s (secretary %s)\n", secretaryModel, name)
+			secretaryName = name
 		}
+	}
+
+	// If asked to continue but the effective config dir has no prior conversation
+	// for this project (e.g. an agent freshly moved onto another account), start
+	// fresh instead of failing with "No conversation found to continue".
+	if continueSession && cwdErr == nil {
+		effDir := accountDir
+		if effDir == "" {
+			home, _ := os.UserHomeDir()
+			effDir = filepath.Join(home, ".claude")
+		}
+		if !dirHasJSONL(filepath.Join(effDir, "projects", encodeProjectPath(cwd))) {
+			fmt.Fprintf(os.Stderr, "ccc run: no prior conversation in %s for %s — starting fresh (dropping -c)\n", effDir, cwd)
+			continueSession = false
+		}
+	}
+
+	args := []string{"--dangerously-skip-permissions"}
+	if continueSession {
+		args = append(args, "-c")
+	}
+	if secretaryName != "" {
+		// Secretaries run on a lighter model: mail routing doesn't need Opus, it's
+		// cheaper, and a smaller model degenerates less (the "court" loop). Ordinary
+		// agents keep the default model.
+		args = append(args, "--model", secretaryModel)
+		fmt.Fprintf(os.Stderr, "ccc run: --model %s (secretary %s)\n", secretaryModel, secretaryName)
 	}
 
 	cmd := exec.Command(claudePath, args...)
