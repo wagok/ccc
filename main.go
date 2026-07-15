@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.40.1"
+const version = "1.41.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3993,7 +3993,7 @@ func handleAccountCommand(config *Config, chatID, threadID int64, arg string) {
 }
 
 // startSession creates/attaches to a tmux session with Telegram topic
-func startSession(continueSession bool) error {
+func startSession(continueSession bool, group, account string) error {
 	// Get current directory name as session name
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -4009,17 +4009,47 @@ func startSession(continueSession bool) error {
 		return runClaudeRaw(continueSession)
 	}
 
-	// Create topic if it doesn't exist and we have a group configured
-	if config.GroupID != 0 {
-		if _, exists := config.Sessions[name]; !exists {
-			topicID, err := createForumTopic(config, config.GroupID, name)
+	// Validate optional --group / --account flags up front.
+	if account != "" {
+		if _, ok := config.Accounts[account]; !ok {
+			return fmt.Errorf("unknown account %q (register it first: ccc account add %s <config-dir>)", account, account)
+		}
+	}
+	groupField := ""
+	targetChat := config.GroupID // default group's chat
+	if group != "" && group != "default" {
+		if c := groupChatID(config, group); c != 0 {
+			targetChat, groupField = c, group
+		} else {
+			return fmt.Errorf("unknown group %q (add it to ~/.ccc.json groups first)", group)
+		}
+	}
+
+	if si, exists := config.Sessions[name]; !exists || si == nil {
+		// New session: create its topic directly in the target group's chat, and
+		// pin the account from the start — so the very first launch is in the right
+		// group on the right account (no /changegroup + set-session + /continue).
+		if targetChat != 0 {
+			topicID, err := createForumTopic(config, targetChat, name)
 			if err == nil {
 				config.Sessions[name] = &SessionInfo{
-					TopicID: topicID,
-					Path:    cwd,
+					TopicID: topicID, Path: cwd, Group: groupField, Account: account,
 				}
 				saveConfig(config)
-				fmt.Printf("📱 Created Telegram topic: %s\n", name)
+				fmt.Printf("📱 Created session %q (topic %d, group=%q, account=%q)\n", name, topicID, groupField, account)
+			}
+		}
+	} else {
+		// Existing session: apply the flags if given (account applies on this
+		// (re)launch; a group change recreates the topic in the target chat).
+		if account != "" && si.Account != account {
+			si.Account = account
+			saveConfig(config)
+			fmt.Printf("💳 Session %q → account %q\n", name, account)
+		}
+		if group != "" && sessionGroup(si) != groupField {
+			if err := changeGroupCore(config, name, group); err != nil {
+				fmt.Fprintf(os.Stderr, "changegroup: %v\n", err)
 			}
 		}
 	}
@@ -8307,9 +8337,45 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			if err := startSession(false); err != nil {
+			if err := startSession(false, "", ""); err != nil {
 				os.Exit(1)
 			}
+		}
+		return
+	}
+
+	// Flag-style start: `ccc [--group <alias>] [--account <alias>] [-c]` — create
+	// (or reuse) this dir's session directly in a group / on an account, one shot.
+	if os.Args[1] == "--group" || os.Args[1] == "--account" {
+		var group, account string
+		cont := false
+		a := os.Args[1:]
+		for i := 0; i < len(a); i++ {
+			switch a[i] {
+			case "--group":
+				if i+1 < len(a) {
+					group = a[i+1]
+					i++
+				}
+			case "--account":
+				if i+1 < len(a) {
+					account = a[i+1]
+					i++
+				}
+			case "-c":
+				cont = true
+			}
+		}
+		config, _ := loadOrCreateConfig()
+		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
+			fmt.Fprintln(os.Stderr, "note: --group/--account apply to server-local agents; ignored in client mode")
+			if err := startClientSession(config, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		} else if err := startSession(cont, group, account); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -8323,7 +8389,7 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			if err := startSession(true); err != nil {
+			if err := startSession(true, "", ""); err != nil {
 				os.Exit(1)
 			}
 		}
