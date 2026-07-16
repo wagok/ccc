@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.42.0"
+const version = "1.42.1"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3714,15 +3714,29 @@ func runClaudeRaw(continueSession bool) error {
 		}
 	}
 
-	// If asked to continue but the effective config dir has no prior conversation
-	// for this project (e.g. an agent freshly moved onto another account), start
-	// fresh instead of failing with "No conversation found to continue".
-	if continueSession && cwdErr == nil {
-		effDir := accountDir
-		if effDir == "" {
-			home, _ := os.UserHomeDir()
-			effDir = filepath.Join(home, ".claude")
+	// Effective config dir this launch uses (account override, else default ~/.claude).
+	effDir := accountDir
+	if effDir == "" {
+		home, _ := os.UserHomeDir()
+		effDir = filepath.Join(home, ".claude")
+	}
+
+	// Suppress the ~20 claude.ai team-scope connectors a corporate login auto-pulls
+	// — noise for headless CCC agents. Config-dir level (all projects at once), so it
+	// also covers switching account via /login WITHOUT changing folder (the default
+	// ~/.claude case, not just CLAUDE_CONFIG_DIR-routed agents). Server-local only: a
+	// client machine's ~/.claude is the operator's personal Claude Code config, which
+	// CCC never touches.
+	if cfgErr == nil && cfg != nil && cfg.Mode != "client" {
+		if err := ensureConnectorsDisabledInConfigDir(filepath.Join(effDir, "settings.json")); err != nil {
+			fmt.Fprintf(os.Stderr, "ccc run: disable connectors in %s: %v\n", effDir, err)
 		}
+	}
+
+	// If asked to continue but effDir has no prior conversation for this project
+	// (e.g. an agent freshly moved onto another account), start fresh instead of
+	// failing with "No conversation found to continue".
+	if continueSession && cwdErr == nil {
 		if !dirHasJSONL(filepath.Join(effDir, "projects", encodeProjectPath(cwd))) {
 			fmt.Fprintf(os.Stderr, "ccc run: no prior conversation in %s for %s — starting fresh (dropping -c)\n", effDir, cwd)
 			continueSession = false
@@ -3761,12 +3775,6 @@ func runClaudeRaw(continueSession bool) error {
 		// boots without the mail tool and silently can't send/deliver.
 		if err := ensureSecretaryMcpInConfigDir(filepath.Join(accountDir, ".claude.json")); err != nil {
 			fmt.Fprintf(os.Stderr, "ccc run: ensure secretary mcp in %s: %v\n", accountDir, err)
-		}
-		// Secondary-account agents are headless CCC agents that only need their
-		// stdio/project MCPs — suppress the ~20 claude.ai team-scope connectors a
-		// corporate login auto-pulls (config-dir level, all projects at once).
-		if err := ensureConnectorsDisabledInConfigDir(filepath.Join(accountDir, "settings.json")); err != nil {
-			fmt.Fprintf(os.Stderr, "ccc run: disable connectors in %s: %v\n", accountDir, err)
 		}
 		cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+accountDir)
 		fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", accountDir)
