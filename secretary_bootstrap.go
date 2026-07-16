@@ -574,6 +574,38 @@ func ensureSecretaryMcpInConfigDir(path string) error {
 	return os.Rename(tmp, path)
 }
 
+// ensureConnectorsDisabledInConfigDir sets disableClaudeAiConnectors:true in a
+// secondary account's settings.json so CCC headless agents on that account don't
+// auto-load the ~20 claude.ai team-scope connectors that a corporate login pulls.
+// Config-dir level → applies to every project/agent on the account, no per-project
+// disabling. Only ever called for a non-default account dir (never the operator's
+// own ~/.claude). Idempotent; atomic; preserves the rest of settings.json.
+func ensureConnectorsDisabledInConfigDir(path string) error {
+	root := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&root); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if v, _ := root["disableClaudeAiConnectors"].(bool); v {
+		return nil // already disabled — no write
+	}
+	root["disableClaudeAiConnectors"] = true
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".ccc.tmp"
+	if err := os.WriteFile(tmp, out, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // launchSecretary starts a FRESH secretary session (no -c). The secretary's
 // durable state is its files (inbox/journal), so it reconciles on start and
 // needs no claude conversation continuity — which also avoids the "No

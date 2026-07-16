@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.41.1"
+const version = "1.42.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -3761,6 +3761,12 @@ func runClaudeRaw(continueSession bool) error {
 		// boots without the mail tool and silently can't send/deliver.
 		if err := ensureSecretaryMcpInConfigDir(filepath.Join(accountDir, ".claude.json")); err != nil {
 			fmt.Fprintf(os.Stderr, "ccc run: ensure secretary mcp in %s: %v\n", accountDir, err)
+		}
+		// Secondary-account agents are headless CCC agents that only need their
+		// stdio/project MCPs — suppress the ~20 claude.ai team-scope connectors a
+		// corporate login auto-pulls (config-dir level, all projects at once).
+		if err := ensureConnectorsDisabledInConfigDir(filepath.Join(accountDir, "settings.json")); err != nil {
+			fmt.Fprintf(os.Stderr, "ccc run: disable connectors in %s: %v\n", accountDir, err)
 		}
 		cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+accountDir)
 		fmt.Fprintf(os.Stderr, "ccc run: CLAUDE_CONFIG_DIR=%s (group account)\n", accountDir)

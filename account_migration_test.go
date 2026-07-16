@@ -91,6 +91,43 @@ func TestAccountDirForSession(t *testing.T) {
 	}
 }
 
+func TestEnsureConnectorsDisabledInConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	// Seed settings.json with unrelated keys to prove they survive.
+	os.WriteFile(path, []byte(`{"model":"sonnet","theme":"dark"}`), 0600)
+
+	if err := ensureConnectorsDisabledInConfigDir(path); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	got := readJSON(t, path)
+	if got["disableClaudeAiConnectors"] != true {
+		t.Errorf("flag not set: %v", got["disableClaudeAiConnectors"])
+	}
+	if got["model"] != "sonnet" || got["theme"] != "dark" {
+		t.Errorf("unrelated settings lost: %v", got)
+	}
+
+	// Idempotent.
+	if err := ensureConnectorsDisabledInConfigDir(path); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if readJSON(t, path)["disableClaudeAiConnectors"] != true {
+		t.Error("flag lost on second call")
+	}
+
+	// Missing file: created with the flag.
+	missing := filepath.Join(dir, "sub", "settings.json")
+	os.MkdirAll(filepath.Dir(missing), 0755)
+	if err := ensureConnectorsDisabledInConfigDir(missing); err != nil {
+		t.Fatalf("missing: %v", err)
+	}
+	if readJSON(t, missing)["disableClaudeAiConnectors"] != true {
+		t.Error("flag not set on new file")
+	}
+}
+
 func TestDirHasJSONL(t *testing.T) {
 	dir := t.TempDir()
 	if dirHasJSONL(dir) {
