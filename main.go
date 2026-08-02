@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.42.3"
+const version = "1.43.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -84,7 +84,9 @@ type TelegramPhoto struct {
 type CallbackQuery struct {
 	ID   string `json:"id"`
 	From struct {
-		ID int64 `json:"id"`
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		FirstName string `json:"first_name"`
 	} `json:"from"`
 	Message *TelegramMessage `json:"message"`
 	Data    string           `json:"data"`
@@ -2068,9 +2070,10 @@ func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName, a
 		if len(chosen) > 0 {
 			summary = strings.Join(chosen, ", ")
 		}
+		who := callbackTag(config, cb)
 		editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID,
-			cb.Message.Text+"\n\n☑️ Submitted: "+summary)
-		appendHistoryDedup(cb.Message.MessageThreadID, "human", "Selected: "+summary)
+			cb.Message.Text+"\n\n☑️ "+who+"Submitted: "+summary)
+		appendHistoryDedup(cb.Message.MessageThreadID, "human", who+"Selected: "+summary)
 	}
 }
 
@@ -4502,6 +4505,16 @@ func resolveSessionByHostCwd(cfg *Config, host, cwd string) string {
 // humanTag returns a sender prefix to prepend to a human message injected into
 // an agent, so the agent can always tell which person is speaking — including
 // the owner and in multi-human groups. Every human message is tagged.
+// callbackTag names the person behind a button press, so an answer in a
+// multi-human group stays attributable. Empty for the admin — their presses
+// read exactly as before.
+func callbackTag(config *Config, cb *CallbackQuery) string {
+	if cb == nil || cb.From.ID == config.ChatID {
+		return ""
+	}
+	return humanTag(cb.From.ID, cb.From.FirstName, cb.From.Username)
+}
+
 func humanTag(fromID int64, firstName, username string) string {
 	name := firstName
 	if name == "" {
@@ -7145,10 +7158,16 @@ func listen() error {
 				fmt.Fprintf(os.Stderr, "[callback] recv data=%q from=%d msg=%v markup=%v\n",
 					cb.Data, cb.From.ID, cb.Message != nil, hasMarkup)
 
-				// Only accept from authorized user
+				// Authorization mirrors plain messages: the admin may press
+				// anything, and other people in the (private) group may answer a
+				// question inside a group topic. A question posted to a topic is
+				// addressed to whoever is in that topic, not only to the admin.
 				if cb.From.ID != config.ChatID {
-					fmt.Fprintf(os.Stderr, "[callback] ignored: from=%d is not the admin (chat_id=%d)\n", cb.From.ID, config.ChatID)
-					continue
+					inTopic := cb.Message != nil && cb.Message.Chat.Type == "supergroup" && cb.Message.MessageThreadID > 0
+					if !inTopic {
+						fmt.Fprintf(os.Stderr, "[callback] ignored: from=%d outside a group topic\n", cb.From.ID)
+						continue
+					}
 				}
 
 				answerCallbackQuery(config, cb.ID)
@@ -7172,16 +7191,20 @@ func listen() error {
 				}
 				if parsed {
 
+					// In a multi-human group the answer is only meaningful with the
+					// person attached to it — empty for the admin, unchanged UX.
+					who := callbackTag(config, cb)
+
 					// Edit message to show selection and remove buttons
 					if cb.Message != nil {
 						originalText := cb.Message.Text
-						newText := fmt.Sprintf("%s\n\n✓ Selected option %d", originalText, optionIndex+1)
+						newText := fmt.Sprintf("%s\n\n✓ %sSelected option %d", originalText, who, optionIndex+1)
 						editMessageRemoveKeyboard(config, cb.Message.Chat.ID, cb.Message.MessageID, newText)
 					}
 
 					// Store answer in history
 					if cb.Message != nil {
-						appendHistoryDedup(cb.Message.MessageThreadID, "human", fmt.Sprintf("Selected option %d", optionIndex+1))
+						appendHistoryDedup(cb.Message.MessageThreadID, "human", fmt.Sprintf("%sSelected option %d", who, optionIndex+1))
 					}
 
 					// Resolve tmux session name and check local/remote. On a

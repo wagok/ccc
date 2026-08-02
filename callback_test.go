@@ -77,3 +77,33 @@ func TestParseChoiceCallback(t *testing.T) {
 		t.Fatal("non-numeric callback data should not parse")
 	}
 }
+
+// An answer from someone other than the admin has to carry their name, or a
+// multi-human group cannot tell who answered. The admin stays untagged.
+func TestCallbackTag(t *testing.T) {
+	cfg := &Config{ChatID: 111}
+
+	admin := &CallbackQuery{}
+	admin.From.ID = 111
+	admin.From.FirstName = "Vlad"
+	admin.From.Username = "Wagok"
+	if got := callbackTag(cfg, admin); got != "" {
+		t.Fatalf("admin press = %q, want no tag", got)
+	}
+
+	other := &CallbackQuery{}
+	other.From.ID = 222
+	other.From.FirstName = "Serhii"
+	other.From.Username = "serhii"
+	if got, want := callbackTag(cfg, other), "[from Serhii (@serhii)] "; got != want {
+		t.Fatalf("other press = %q, want %q", got, want)
+	}
+
+	// No username set — fall back to the display name alone.
+	noUser := &CallbackQuery{}
+	noUser.From.ID = 333
+	noUser.From.FirstName = "Ira"
+	if got, want := callbackTag(cfg, noUser), "[from Ira] "; got != want {
+		t.Fatalf("no-username press = %q, want %q", got, want)
+	}
+}
