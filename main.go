@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.42.2"
+const version = "1.42.3"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -2016,6 +2016,9 @@ func cleanOptionLabel(text string) string {
 // list, Right -> Submit tab, Enter).
 func handleMultiSelectCallback(config *Config, cb *CallbackQuery, sessionName, action string) {
 	if cb.Message == nil || cb.Message.ReplyMarkup == nil {
+		// The keyboard IS the state here, so without it there is nothing to
+		// toggle or submit — say so instead of returning silently.
+		fmt.Fprintf(os.Stderr, "[callback] multiselect %q for %s: no keyboard on the message\n", action, sessionName)
 		return
 	}
 	kb := cb.Message.ReplyMarkup.InlineKeyboard
@@ -7135,8 +7138,16 @@ func listen() error {
 			// Handle callback queries (button presses from inline keyboards)
 			if update.CallbackQuery != nil {
 				cb := update.CallbackQuery
+				// Every button press is logged on arrival: a press that goes
+				// nowhere used to leave no trace at all, which made the whole
+				// path undiagnosable from the outside.
+				hasMarkup := cb.Message != nil && cb.Message.ReplyMarkup != nil
+				fmt.Fprintf(os.Stderr, "[callback] recv data=%q from=%d msg=%v markup=%v\n",
+					cb.Data, cb.From.ID, cb.Message != nil, hasMarkup)
+
 				// Only accept from authorized user
 				if cb.From.ID != config.ChatID {
+					fmt.Fprintf(os.Stderr, "[callback] ignored: from=%d is not the admin (chat_id=%d)\n", cb.From.ID, config.ChatID)
 					continue
 				}
 
@@ -7150,11 +7161,16 @@ func listen() error {
 				// Parse right-anchored so session names containing ':' (host:project)
 				// still resolve correctly.
 				if n := len(parts); n >= 5 && (parts[n-1] == "m" || parts[n-1] == "x") {
+					fmt.Fprintf(os.Stderr, "[callback] multiselect action=%q session=%q\n", parts[n-1], strings.Join(parts[:n-4], ":"))
 					handleMultiSelectCallback(config, cb, strings.Join(parts[:n-4], ":"), parts[n-1])
 					continue
 				}
 
-				if sessionName, questionIndex, totalQuestions, optionIndex, parsed := parseChoiceCallback(config, cb.Data); parsed {
+				sessionName, questionIndex, totalQuestions, optionIndex, parsed := parseChoiceCallback(config, cb.Data)
+				if !parsed {
+					fmt.Fprintf(os.Stderr, "[callback] unparseable data=%q\n", cb.Data)
+				}
+				if parsed {
 
 					// Edit message to show selection and remove buttons
 					if cb.Message != nil {
@@ -7207,7 +7223,7 @@ func listen() error {
 							time.Sleep(50 * time.Millisecond)
 						}
 						sendTmuxKeys("Enter")
-						fmt.Printf("[callback] Selected option %d for %s (question %d/%d)\n", optionIndex, sessionName, questionIndex+1, totalQuestions)
+						fmt.Fprintf(os.Stderr, "[callback] Selected option %d for %s (question %d/%d)\n", optionIndex, sessionName, questionIndex+1, totalQuestions)
 
 						// Mark answered in pending questions (for API sync)
 						if val, ok := pendingQuestions.Load(sessionName); ok {
@@ -7223,12 +7239,12 @@ func listen() error {
 							time.Sleep(300 * time.Millisecond)
 							sendTmuxKeys("Enter")
 							pendingQuestions.Delete(sessionName)
-							fmt.Printf("[callback] Auto-submitted answers for %s\n", sessionName)
+							fmt.Fprintf(os.Stderr, "[callback] Auto-submitted answers for %s\n", sessionName)
 						}
 					} else {
 						// Silence here used to hide a parsing bug: log the miss so a
 						// button press that goes nowhere leaves a trace.
-						fmt.Printf("[callback] no live tmux session %q for %s (data=%q)\n", tmuxName, sessionName, cb.Data)
+						fmt.Fprintf(os.Stderr, "[callback] no live tmux session %q for %s (data=%q)\n", tmuxName, sessionName, cb.Data)
 					}
 				}
 				continue
