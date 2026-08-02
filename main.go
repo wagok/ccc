@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.42.1"
+const version = "1.42.2"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -1893,6 +1893,62 @@ func multiSelectSubmitKeys(selected []bool, n int) []string {
 		}
 	}
 	return append(keys, "Right", "Enter")
+}
+
+// parseChoiceCallback splits single-select callback_data into its fields.
+// Current format is "<session>:<qIdx>:<total>:<optIdx>"; the pre-total legacy
+// format is "<session>:<qIdx>:<optIdx>".
+//
+// The session name itself may contain ':' (a remote agent is "host:project"),
+// so the split has to be right-anchored — parts[0] would yield just the host.
+// Both formats end in a fixed number of integers, so prefer the reading whose
+// session half is a session we actually know, and fall back to the current
+// format otherwise.
+func parseChoiceCallback(config *Config, data string) (session string, qIdx, total, optIdx int, ok bool) {
+	parts := strings.Split(data, ":")
+	n := len(parts)
+
+	// trailing returns the last k parts as ints, and the rest rejoined.
+	trailing := func(k int) (string, []int, bool) {
+		if n < k+1 {
+			return "", nil, false
+		}
+		vals := make([]int, k)
+		for i, s := range parts[n-k:] {
+			v, err := strconv.Atoi(s)
+			if err != nil {
+				return "", nil, false
+			}
+			vals[i] = v
+		}
+		return strings.Join(parts[:n-k], ":"), vals, true
+	}
+
+	known := func(s string) bool {
+		if config == nil {
+			return false
+		}
+		_, exists := config.Sessions[s]
+		return exists
+	}
+
+	// Preferred: current 3-int format, then legacy 2-int, each confirmed
+	// against the session registry so the two can't be confused.
+	if s, v, valid := trailing(3); valid && known(s) {
+		return s, v[0], v[1], v[2], true
+	}
+	if s, v, valid := trailing(2); valid && known(s) {
+		return s, v[0], 0, v[1], true
+	}
+	// Unknown session (renamed or removed): still parse, newest format first,
+	// so the keystrokes at least reach a live tmux session of that name.
+	if s, v, valid := trailing(3); valid {
+		return s, v[0], v[1], v[2], true
+	}
+	if s, v, valid := trailing(2); valid {
+		return s, v[0], 0, v[1], true
+	}
+	return "", 0, 0, 0, false
 }
 
 // injectTmuxKeys sends raw key names (e.g. "Down", "Enter", "Right") to a
@@ -7098,16 +7154,7 @@ func listen() error {
 					continue
 				}
 
-				if len(parts) >= 3 {
-					sessionName := parts[0]
-					questionIndex, _ := strconv.Atoi(parts[1])
-					var totalQuestions, optionIndex int
-					if len(parts) == 4 {
-						totalQuestions, _ = strconv.Atoi(parts[2])
-						optionIndex, _ = strconv.Atoi(parts[3])
-					} else {
-						optionIndex, _ = strconv.Atoi(parts[2])
-					}
+				if sessionName, questionIndex, totalQuestions, optionIndex, parsed := parseChoiceCallback(config, cb.Data); parsed {
 
 					// Edit message to show selection and remove buttons
 					if cb.Message != nil {
@@ -7178,6 +7225,10 @@ func listen() error {
 							pendingQuestions.Delete(sessionName)
 							fmt.Printf("[callback] Auto-submitted answers for %s\n", sessionName)
 						}
+					} else {
+						// Silence here used to hide a parsing bug: log the miss so a
+						// button press that goes nowhere leaves a trace.
+						fmt.Printf("[callback] no live tmux session %q for %s (data=%q)\n", tmuxName, sessionName, cb.Data)
 					}
 				}
 				continue
