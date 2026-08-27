@@ -120,6 +120,14 @@ func recordAgentWorkEdge(cfg *Config, session, edge string) {
 			mailScheduler.Cancel(idleTimerID(session)) // agent resumed -> not idle
 		}
 	case "stop":
+		// A turn that died on an exhausted quota also ends with a stop edge.
+		// Reporting that as "idle" would be a lie: the agent is not available,
+		// it is parked until the allowance returns — and notify_when_free would
+		// fire on an agent that cannot accept work.
+		if _, blocked := quotaBlockActive(accountKeyForSession(cfg, session), now); blocked {
+			writeAgentStatus(session, "rate_limited", now)
+			return
+		}
 		writeAgentStatus(session, "idle", now)
 		// Arm the quiescence timer only if someone is actually waiting.
 		if mailScheduler != nil && idleHasSubscribers(session) {
@@ -233,6 +241,14 @@ func handleAgentStatusCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		out["status"] = st.Status
 		out["seconds_in_state"] = secs
 		out["free"] = st.Status == "idle" && secs >= idleQuietSecs
+		// Say WHEN a parked agent comes back, so a caller can plan instead of
+		// polling a peer that is guaranteed not to answer.
+		if b, blocked := quotaBlockActive(accountKeyForSession(cfg, p.Name), now); blocked {
+			out["status"] = "rate_limited"
+			out["free"] = false
+			out["blocked_until"] = b.ResetAt
+			out["note"] = "account allowance exhausted (" + b.Reason + "); resumes automatically"
+		}
 	} else {
 		out["status"] = "unknown"
 		out["note"] = "no work-edge recorded yet — the agent has not started or stopped a turn since status tracking began"

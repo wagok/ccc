@@ -71,6 +71,8 @@ func onTimer(t scheduler.Timer) {
 		onReminderTimer(t)
 	case "rl_continue":
 		onRateLimitContinue(t)
+	case "rl_quota":
+		onQuotaReset(t)
 	case "secretary_restart":
 		onSecretaryRestartTimer(t)
 	case "secretary_health":

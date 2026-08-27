@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.43.0"
+const version = "1.44.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -5171,18 +5171,16 @@ func handleStopFailureHook() error {
 	if json.Unmarshal(raw, &hd) != nil || hd.Cwd == "" {
 		return nil
 	}
-	// Only auto-retry transient API errors; "please continue" won't help a hard
-	// failure (auth/billing) and could loop. The payload usually carries the text.
-	low := strings.ToLower(string(raw))
-	if !strings.Contains(low, "rate") && !strings.Contains(low, "limit") &&
-		!strings.Contains(low, "overload") && !strings.Contains(low, "temporarily") {
-		return nil
-	}
 	config, err := loadConfig()
 	if err != nil || config == nil {
 		return nil
 	}
-	callSocket(config, APIRequest{Cmd: "rl.recover", Cwd: hd.Cwd})
+	// Forward the whole payload and let the server classify: an exhausted quota,
+	// a transient throttle and an expired login each need a different response,
+	// and only the server knows which account the agent shares its allowance
+	// with. Keeping the decision server-side also means a client host with an
+	// older binary gets the fixed behaviour without being redeployed.
+	callSocket(config, APIRequest{Cmd: "rl.recover", Cwd: hd.Cwd, Payload: json.RawMessage(raw)})
 	return nil
 }
 
