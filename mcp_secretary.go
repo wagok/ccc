@@ -913,7 +913,7 @@ func secretaryTools() []map[string]interface{} {
 		},
 		{
 			"name":        "get_agent_status",
-			"description": "Check whether an agent in your group is working or idle, precisely (from turn-boundary hooks, not screen-scraping). Returns status ('working' | 'idle' | 'unknown'), seconds_in_state, and free (true when it has been idle long enough to be considered ready for new work). Use before assigning work, or to poll a peer.",
+			"description": "Check whether an agent in your group is working or idle, precisely (from turn-boundary hooks, not screen-scraping). Returns status ('working' | 'idle' | 'unknown'), seconds_in_state, and free (true when it has been idle long enough to be considered ready for new work). Use before assigning work, or to poll a peer. If you have a standing notify_when_free subscription on that agent, it is reported back under `your_subscription` (with its age and how to cancel it).",
 			"inputSchema": obj(map[string]interface{}{"name": str}, "name"),
 		},
 		{
@@ -924,6 +924,11 @@ func secretaryTools() []map[string]interface{} {
 				"note":       str,
 				"persistent": map[string]interface{}{"type": "boolean"},
 			}, "name"),
+		},
+		{
+			"name":        "notify_cancel",
+			"description": "Cancel a standing notify_when_free subscription you created. `name` (optional): cancel the subscription(s) watching that agent; omit it to cancel all of yours. A persistent subscription keeps firing every time its target settles, so cancel it once the thing you were waiting for has arrived — otherwise it outlives its own topic. (Your subscriptions expire on their own after 14 days; this cancels one immediately.)",
+			"inputSchema": obj(map[string]interface{}{"name": str}),
 		},
 		{
 			"name":        "update_self",
@@ -992,6 +997,10 @@ func handleToolCall(params json.RawMessage, cwd string) map[string]interface{} {
 	case "get_agent_status":
 		resp, err := relayRequest(APIRequest{Cmd: "agent.status", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)
+	case "notify_cancel":
+		resp, err := relayRequest(APIRequest{Cmd: "unsubscribe.idle", Cwd: cwd, Payload: call.Arguments})
+		return resultText(resp, err)
+
 	case "notify_when_free":
 		resp, err := relayRequest(APIRequest{Cmd: "subscribe.idle", Cwd: cwd, Payload: call.Arguments})
 		return resultText(resp, err)

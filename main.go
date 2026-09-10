@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.44.0"
+const version = "1.45.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -708,6 +708,8 @@ func handleSocketConnection(conn net.Conn, cfg *Config) {
 			handleAgentStatusCmd(encoder, cfg, req)
 		case "subscribe.idle":
 			handleSubscribeIdleCmd(encoder, cfg, req)
+		case "unsubscribe.idle":
+			handleUnsubscribeIdleCmd(encoder, cfg, req)
 		case "mail.send":
 			handleMailSendCmd(encoder, cfg, req)
 		case "mail.deliver":
@@ -8389,6 +8391,8 @@ ACCOUNTS & GROUPS (server-local agents):
                             Both flags optional; unknown group/account = error, no-op.
                             (Old manual way: ccc -> /changegroup <g> -> account
                              set-session <name> <a> -> relaunch.)
+    subs list                          List standing notify_when_free subscriptions
+    subs clear <subscriber> [target]   Cancel an agent's subscription(s) on its behalf
     account list                       List accounts + group and session assignments
     account add <alias> <config-dir>   Register an account (a CLAUDE_CONFIG_DIR)
     account set <group> <alias> [--migrate]   Pin a whole group to an account
@@ -8707,6 +8711,14 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("✅ Moved %s to group %s\n", os.Args[2], os.Args[3])
+
+	case "subs":
+		// ccc subs list | clear <subscriber> [target]
+		// Operator view of the standing notify_when_free subscriptions. These live
+		// outside the reminder store, so `reminder_list` never showed them and a
+		// forgotten one had to be cleared by hand from ~/.ccc/idle-subs.
+		subsCommand(os.Args[2:])
+		return
 
 	case "account":
 		// ccc account list | add <alias> <config-dir> | set <group> <alias|default>

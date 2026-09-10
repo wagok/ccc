@@ -29,6 +29,14 @@ import (
 
 const idleQuietSecs = 180 // 3 minutes of no new work = agent is free
 
+// idleSubMaxAgeSecs bounds how long a persistent subscription stays armed.
+// A persistent subscription re-fires every time its target settles, so a
+// forgotten one nags its subscriber indefinitely — and every persistent
+// subscription that ever existed here was eventually abandoned rather than
+// cancelled. Expiring one tells the subscriber it lapsed, so a still-relevant
+// wait can be renewed deliberately instead of outliving its own topic.
+const idleSubMaxAgeSecs = 14 * 24 * 3600 // 14 days
+
 var agentStateMu sync.Mutex
 
 func agentStatusDir() string {
@@ -189,6 +197,24 @@ func idleHasSubscribers(target string) bool {
 	return len(idleSubsForTarget(target)) > 0
 }
 
+// idleSubsForSubscriber returns the subscriptions an agent itself created, so it
+// can see and cancel its own standing waits.
+func idleSubsForSubscriber(subscriber string) []idleSub {
+	var out []idleSub
+	for _, s := range listIdleSubs() {
+		if s.Subscriber == subscriber {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// Expired reports whether a persistent subscription has outlived idleSubMaxAgeSecs.
+// One-shot subscriptions never expire: they are removed the first time they fire.
+func (s idleSub) Expired(now int64) bool {
+	return s.Persistent() && s.Created > 0 && now-s.Created > idleSubMaxAgeSecs
+}
+
 // onIdleNotifyTimer fires when an agent has stayed idle for the full quiet period.
 // It notifies every subscriber of that agent and removes the one-shot ones.
 func onIdleNotifyTimer(t scheduler.Timer) {
@@ -203,11 +229,29 @@ func onIdleNotifyTimer(t scheduler.Timer) {
 	if st, ok := readAgentStatus(target); ok && st.Status != "idle" {
 		return
 	}
+	now := time.Now().Unix()
 	subs := idleSubsForTarget(target)
 	for _, s := range subs {
+		// An expired subscription is retired here rather than fired: this is the
+		// moment it would have nagged, so it is also the moment to say it lapsed.
+		if s.Expired(now) {
+			deleteIdleSub(s.ID)
+			msg := fmt.Sprintf("⌛ Your standing notify_when_free subscription on %s expired after %d days and has been removed. Re-subscribe if you are still waiting on it.",
+				target, idleSubMaxAgeSecs/86400)
+			if s.Note != "" {
+				msg += "\nIts note was: " + s.Note
+			}
+			if err := wakeAgent(cfg, s.Subscriber, msg); err != nil {
+				fmt.Fprintf(os.Stderr, "idle_notify: expiry notice to %s: %v\n", s.Subscriber, err)
+			}
+			continue
+		}
 		msg := fmt.Sprintf("🔔 Agent %s is now free — idle for %d min, ready for a new task or a result check.", target, idleQuietSecs/60)
 		if s.Note != "" {
 			msg += "\nYour note: " + s.Note
+		}
+		if s.Persistent() {
+			msg += fmt.Sprintf("\n(Standing subscription — it keeps firing until you call notify_cancel(\"%s\").)", target)
 		}
 		if err := wakeAgent(cfg, s.Subscriber, msg); err != nil {
 			fmt.Fprintf(os.Stderr, "idle_notify: wake %s: %v\n", s.Subscriber, err)
@@ -229,12 +273,35 @@ func handleAgentStatusCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
 		encoder.Encode(APIResponse{OK: false, Error: "get_agent_status: missing 'name'"})
 		return
 	}
-	callerGroup := sessionGroup(cfg.Sessions[resolveCaller(cfg, req.Host, req.Cwd)])
+	caller := resolveCaller(cfg, req.Host, req.Cwd)
+	callerGroup := sessionGroup(cfg.Sessions[caller])
 	if sessionGroup(cfg.Sessions[p.Name]) != callerGroup {
 		encoder.Encode(APIResponse{OK: false, Error: "get_agent_status: " + p.Name + " is not in your group"})
 		return
 	}
 	out := map[string]interface{}{"agent": p.Name}
+	// Report the caller's own standing subscription on this agent. Without this
+	// an agent has no way to discover what it is subscribed to, which is how a
+	// forgotten persistent subscription goes on firing for weeks unrecognised.
+	for _, s := range idleSubsForSubscriber(caller) {
+		if s.Target != p.Name {
+			continue
+		}
+		info := map[string]interface{}{
+			"persistent": s.Persistent(),
+			"created":    s.Created,
+			"age_days":   (time.Now().Unix() - s.Created) / 86400,
+		}
+		if s.Note != "" {
+			info["note"] = s.Note
+		}
+		if s.Persistent() {
+			info["cancel_with"] = fmt.Sprintf("notify_cancel(%q)", p.Name)
+			info["expires_in_days"] = (s.Created + idleSubMaxAgeSecs - time.Now().Unix()) / 86400
+		}
+		out["your_subscription"] = info
+		break
+	}
 	if st, ok := readAgentStatus(p.Name); ok {
 		now := time.Now().Unix()
 		secs := now - st.Since
@@ -335,7 +402,118 @@ func handleSubscribeIdleCmd(encoder *json.Encoder, cfg *Config, req APIRequest) 
 
 func (s idleSub) Persistent() bool { return !s.OneShot }
 
+// handleUnsubscribeIdleCmd cancels the caller's own standing subscriptions.
+// With a name, it cancels the ones on that agent; without, all of them. An
+// agent could previously create a persistent subscription but never retract it,
+// so a wait outlived its topic with no lever on either side to stop it.
+func handleUnsubscribeIdleCmd(encoder *json.Encoder, cfg *Config, req APIRequest) {
+	subscriber := resolveCaller(cfg, req.Host, req.Cwd)
+	if subscriber == "" {
+		encoder.Encode(APIResponse{OK: false, Error: "notify_cancel: caller cwd matches no agent"})
+		return
+	}
+	var p struct {
+		Name string `json:"name"`
+	}
+	if len(req.Payload) > 0 {
+		json.Unmarshal(req.Payload, &p)
+	}
+
+	var cancelled []string
+	for _, s := range idleSubsForSubscriber(subscriber) {
+		if p.Name != "" && s.Target != p.Name {
+			continue
+		}
+		deleteIdleSub(s.ID)
+		cancelled = append(cancelled, s.Target)
+	}
+	// A target with no remaining subscribers needs no quiescence timer.
+	for _, t := range cancelled {
+		if mailScheduler != nil && !idleHasSubscribers(t) {
+			mailScheduler.Cancel(idleTimerID(t))
+		}
+	}
+
+	if len(cancelled) == 0 {
+		scope := "you have no standing subscriptions"
+		if p.Name != "" {
+			scope = "you were not subscribed to " + p.Name
+		}
+		encoder.Encode(APIResponse{OK: true, Result: mustJSON(map[string]interface{}{
+			"cancelled": 0, "note": scope,
+		})})
+		return
+	}
+	encoder.Encode(APIResponse{OK: true, Result: mustJSON(map[string]interface{}{
+		"cancelled": len(cancelled), "targets": cancelled,
+	})})
+}
+
 func mustJSON(v interface{}) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// subsCommand implements `ccc subs list | clear <subscriber> [target]` — the
+// operator view of standing idle subscriptions. Agents cancel their own with
+// notify_cancel; this is the lever for clearing one on an agent's behalf.
+func subsCommand(args []string) {
+	sub := "list"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "list":
+		all := listIdleSubs()
+		if len(all) == 0 {
+			fmt.Println("No standing idle subscriptions.")
+			return
+		}
+		now := time.Now().Unix()
+		fmt.Printf("Standing idle subscriptions (%d):\n", len(all))
+		for _, s := range all {
+			kind := "one-shot"
+			if s.Persistent() {
+				kind = "persistent"
+			}
+			age := (now - s.Created) / 86400
+			flag := ""
+			if s.Expired(now) {
+				flag = "  ⌛ EXPIRED (retires on next fire)"
+			}
+			fmt.Printf("  %s -> %s  [%s, %dd old]%s\n", s.Subscriber, s.Target, kind, age, flag)
+			if s.Note != "" {
+				fmt.Printf("      note: %s\n", s.Note)
+			}
+		}
+
+	case "clear":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "Usage: ccc subs clear <subscriber> [target]")
+			os.Exit(1)
+		}
+		subscriber, target := args[1], ""
+		if len(args) > 2 {
+			target = args[2]
+		}
+		n := 0
+		for _, s := range idleSubsForSubscriber(subscriber) {
+			if target != "" && s.Target != target {
+				continue
+			}
+			deleteIdleSub(s.ID)
+			fmt.Printf("removed: %s -> %s\n", s.Subscriber, s.Target)
+			n++
+		}
+		if n == 0 {
+			fmt.Printf("Nothing to clear for %s.\n", subscriber)
+			return
+		}
+		fmt.Printf("Cleared %d subscription(s).\n", n)
+		fmt.Println("Takes effect immediately — subscriptions are read from disk on every idle check.")
+
+	default:
+		fmt.Fprintln(os.Stderr, "Usage: ccc subs list | clear <subscriber> [target]")
+		os.Exit(1)
+	}
 }

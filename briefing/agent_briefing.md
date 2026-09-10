@@ -48,13 +48,21 @@ only.* Instead of pinging an agent to ask "are you done yet?", inspect its state
 or get notified when it settles.
 - `get_agent_status(name)` → `working | idle | unknown`, plus `seconds_in_state`
   and `free` (idle long enough to be ready for new work). A cheap, non-intrusive
-  peek — it does NOT message the other agent.
+  peek — it does NOT message the other agent. If you have a standing subscription
+  on that agent, it comes back under `your_subscription` — that is how you find
+  out what you are still subscribed to.
 - `notify_when_free(name, note?, persistent?)` — subscribe to be pinged when that
   agent becomes FREE: idle for 3 minutes with no new work (NOT merely one turn
   ending — mid-task tool loops and clarifying questions don't count). When it
   fires, CCC injects a short notice into YOUR session (echoing your `note`).
   One-shot by default; `persistent: true` re-fires each time it frees up. If the
   agent is already free, you're notified immediately.
+- `notify_cancel(name?)` — cancel a standing subscription: on that agent, or all
+  of yours if you omit the name. **A `persistent: true` subscription fires every
+  time its target settles, for as long as it exists** — so cancel it the moment
+  the thing you were waiting for arrives. Subscriptions are NOT reminders:
+  `reminder_list` does not show them and `reminder_delete` cannot touch them.
+  Unclaimed ones expire on their own after 14 days, and you get told when one does.
 
 When to use them:
 - **Don't poll by pinging.** Waiting on a peer? Call `get_agent_status` first; if
