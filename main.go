@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.45.0"
+const version = "1.47.3"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -56,7 +56,11 @@ type TelegramMessage struct {
 	Photo          []TelegramPhoto   `json:"photo,omitempty"`
 	Document       *TelegramDocument `json:"document,omitempty"`
 	Caption        string            `json:"caption,omitempty"`
-	ReplyMarkup    *struct {
+	// RichMessage carries Telegram's structured message format (paragraphs,
+	// tables, styled runs). Such a message has NO "text" field at all, so it read
+	// as empty and was dropped — see richMessageText.
+	RichMessage json.RawMessage `json:"rich_message,omitempty"`
+	ReplyMarkup *struct {
 		InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
 	} `json:"reply_markup,omitempty"`
 }
@@ -2141,13 +2145,17 @@ func finalizeStream(cfg *Config, st *streamState, final string) {
 	if final == "" {
 		final = st.text
 	}
-	chunks := splitMessage(final, telegramTextLimit)
+	// Split on block boundaries: the finished answer is valid Markdown, and a
+	// character-count cut lands inside tables and code fences.
+	chunks := splitMarkdownBlocks(final, telegramTextLimit)
 	if len(chunks) == 0 {
 		return
 	}
-	editStreamMessage(cfg, st.chatID, st.msgID, chunks[0])
+	// One edit on complete text — unlike a per-delta conversion, the Markdown
+	// here is whole, so it converts cleanly or falls back to what is shown.
+	editRichOrPlain(cfg, st.chatID, st.msgID, chunks[0])
 	for _, c := range chunks[1:] {
-		sendMessage(cfg, st.chatID, st.threadID, c)
+		sendRichOrPlain(cfg, st.chatID, st.threadID, c)
 	}
 }
 
@@ -4960,7 +4968,9 @@ func handleHook() error {
 		}
 	}
 
-	return sendMessage(config, sessionGroupChatID(config, sessionName), topicID, final)
+	// The agent's answer is the one message whose structure carries meaning —
+	// tables, code and headings. Everything else CCC sends is a short notice.
+	return sendRichOrPlain(config, sessionGroupChatID(config, sessionName), topicID, final)
 }
 
 // handleDisplayHook handles the MessageDisplay hook: in live mode it forwards
@@ -6769,7 +6779,7 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 			fmt.Printf("[remote] from=%s session=%s\n", fromHost, name)
 			histFrom, histText := parseRemoteMessagePrefix(message)
 			appendHistoryDedup(info.TopicID, histFrom, histText)
-			return sendMessage(config, groupChatID(config, sessionGroup(info)), info.TopicID, message)
+			return sendRichOrPlain(config, groupChatID(config, sessionGroup(info)), info.TopicID, message)
 		}
 		// Subdirectory match: projectPath is under this session's path
 		if strings.HasPrefix(projectPath, info.Path+"/") {
@@ -6791,7 +6801,7 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 		fmt.Printf("[remote] from=%s session=%s (subdir match)\n", fromHost, subdirMatch)
 		histFrom, histText := parseRemoteMessagePrefix(message)
 		appendHistoryDedup(subdirInfo.TopicID, histFrom, histText)
-		return sendMessage(config, groupChatID(config, sessionGroup(subdirInfo)), subdirInfo.TopicID, message)
+		return sendRichOrPlain(config, groupChatID(config, sessionGroup(subdirInfo)), subdirInfo.TopicID, message)
 	}
 
 	// No matching session found - auto-create topic (fallback for client-initiated sessions)
@@ -6805,14 +6815,14 @@ func handleRemoteMessage(fromHost string, cwd string, encodedProjectDir string, 
 	if err != nil {
 		// Fallback to private chat if topic creation fails
 		fmt.Fprintf(os.Stderr, "Failed to create topic: %v\n", err)
-		return sendMessage(config, config.ChatID, 0, fmt.Sprintf("[%s] %s", fromHost, message))
+		return sendRichOrPlain(config, config.ChatID, 0, fmt.Sprintf("[%s] %s", fromHost, message))
 	}
 
 	fmt.Printf("[remote] created/reused topic %d for session %s\n", topicID, fullName)
 	// Store forwarded message in history (with dedup)
 	histFrom, histText := parseRemoteMessagePrefix(message)
 	appendHistoryDedup(topicID, histFrom, histText)
-	return sendMessage(config, sessionGroupChatID(config, fullName), topicID, message)
+	return sendRichOrPlain(config, sessionGroupChatID(config, fullName), topicID, message)
 }
 
 // parseRemoteMessagePrefix determines the sender and clean text from a
@@ -7138,6 +7148,21 @@ func listen() error {
 			time.Sleep(time.Second)
 			continue
 		}
+		// Keep each update's raw JSON next to the typed one (same order), so an
+		// update we end up dropping can be reported with what it actually
+		// contained. TelegramMessage only models the fields we handle, so a
+		// message carrying anything else parses into an empty struct and used to
+		// vanish with no trace at all — indistinguishable from never arriving.
+		var rawUpdates struct {
+			Result []json.RawMessage `json:"result"`
+		}
+		json.Unmarshal(body, &rawUpdates)
+		rawOf := func(i int) json.RawMessage {
+			if i < len(rawUpdates.Result) {
+				return rawUpdates.Result[i]
+			}
+			return nil
+		}
 
 		if !updates.OK {
 			fmt.Fprintf(os.Stderr, "Telegram API error: %s\n", updates.Description)
@@ -7145,8 +7170,16 @@ func listen() error {
 			continue
 		}
 
-		for _, update := range updates.Result {
+		for ui, update := range updates.Result {
 			offset = update.UpdateID + 1
+
+			// An update we model neither as a message nor a button press —
+			// edited_message is the common one — would otherwise be discarded
+			// without a word.
+			if update.CallbackQuery == nil && update.Message.MessageID == 0 {
+				logDroppedUpdate(config, "unhandled update type", 0, 0, rawOf(ui))
+				continue
+			}
 
 			// Handle callback queries (button presses from inline keyboards)
 			if update.CallbackQuery != nil {
@@ -7504,6 +7537,21 @@ func listen() error {
 
 			text := strings.TrimSpace(msg.Text)
 			if text == "" {
+				// A structured message carries its content in rich_message, and
+				// an attachment type CCC does not model still has its caption.
+				// Either is real text the agent should receive.
+				if t := strings.TrimSpace(richMessageText(msg.RichMessage)); t != "" {
+					text = t
+				} else if t := strings.TrimSpace(msg.Caption); t != "" {
+					text = t
+				}
+			}
+			if text == "" {
+				// Nothing we can forward to an agent. Say so instead of dropping
+				// it silently: from Telegram the message looks delivered, and
+				// without this line there is no way to tell a message CCC cannot
+				// read from one that never arrived.
+				logDroppedUpdate(config, "no text CCC can read", msg.Chat.ID, msg.MessageThreadID, rawOf(ui))
 				continue
 			}
 
@@ -9046,4 +9094,268 @@ func main() {
 			}
 		}
 	}
+}
+
+// logDroppedUpdate records a Telegram update CCC could not act on. It writes the
+// raw update to ~/.ccc/dropped-updates.jsonl and a one-line summary naming the
+// keys it carried, so "the message is in Telegram but never reached the agent"
+// is answerable from the logs instead of by guesswork. When the drop happened in
+// an agent's topic the человек is told there too — silence reads as delivery.
+func logDroppedUpdate(config *Config, reason string, chatID, threadID int64, raw json.RawMessage) {
+	keys := "?"
+	if len(raw) > 0 {
+		var probe map[string]json.RawMessage
+		if json.Unmarshal(raw, &probe) == nil {
+			// Name the message's own fields when there is a message; otherwise
+			// the update's, which is what identifies an edited_message and kin.
+			if m, ok := probe["message"]; ok {
+				var inner map[string]json.RawMessage
+				if json.Unmarshal(m, &inner) == nil {
+					probe = inner
+				}
+			}
+			var names []string
+			for k := range probe {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			keys = strings.Join(names, ",")
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[dropped] %s chat=%d thread=%d fields=[%s]\n", reason, chatID, threadID, keys)
+
+	if home, err := os.UserHomeDir(); err == nil && len(raw) > 0 {
+		if f, e := os.OpenFile(filepath.Join(home, ".ccc", "dropped-updates.jsonl"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); e == nil {
+			var compact bytes.Buffer
+			if json.Compact(&compact, raw) != nil {
+				compact.Write(raw)
+			}
+			fmt.Fprintf(f, "{\"ts\":%d,\"reason\":%q,\"raw\":%s}\n", time.Now().Unix(), reason, compact.String())
+			f.Close()
+		}
+	}
+
+	// Tell the human in the topic they sent it to, so an undeliverable message
+	// is visibly undelivered rather than apparently fine.
+	if config != nil && chatID != 0 && threadID > 0 {
+		sendMessage(config, chatID, threadID, fmt.Sprintf(
+			"⚠️ This message was NOT delivered to the agent — CCC could not read any text in it (fields: %s).\nSend it as plain text, or as a caption on a photo/document.", keys))
+	}
+}
+
+// richTextRun renders one node of Telegram's rich-message text union as
+// Markdown. A node is a bare string, a styled object wrapping another node
+// under "text", or a list of nodes — styling nests arbitrarily, so this
+// recurses. Styles Markdown cannot express pass through as plain text rather
+// than inventing syntax the agent would have to guess at.
+func richTextRun(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []interface{}:
+		var b strings.Builder
+		for _, item := range t {
+			b.WriteString(richTextRun(item))
+		}
+		return b.String()
+	case map[string]interface{}:
+		inner, ok := t["text"]
+		if !ok {
+			return ""
+		}
+		body := richTextRun(inner)
+		if body == "" {
+			return ""
+		}
+		style, _ := t["type"].(string)
+		switch style {
+		case "bold":
+			return "**" + body + "**"
+		case "italic":
+			return "_" + body + "_"
+		case "code":
+			return "`" + body + "`"
+		case "strikethrough":
+			return "~~" + body + "~~"
+		case "text_link", "link", "url":
+			if href, ok := t["url"].(string); ok && href != "" {
+				return "[" + body + "](" + href + ")"
+			}
+		}
+		return body
+	}
+	return ""
+}
+
+// richBlockCellText renders one table cell.
+func richBlockCellText(v interface{}) string {
+	// A cell's own text may itself be styled, and a literal pipe would break the
+	// Markdown table it lands in.
+	return strings.ReplaceAll(strings.TrimSpace(richTextRun(v)), "|", "\\|")
+}
+
+// richMessageText renders a rich_message as Markdown — the format agents
+// already read and write. Telegram sends this structure instead of "text" for
+// anything with headings, tables, lists or code; CCC modelled only "text", so
+// such a message looked empty and was discarded without a trace.
+func richMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var rm struct {
+		Blocks []map[string]interface{} `json:"blocks"`
+	}
+	if json.Unmarshal(raw, &rm) != nil {
+		return ""
+	}
+
+	var out []string
+	for _, block := range rm.Blocks {
+		kind, _ := block["type"].(string)
+		switch kind {
+		case "divider":
+			out = append(out, "---")
+			continue
+		case "section_heading", "heading":
+			if txt := strings.TrimSpace(richTextRun(block["text"])); txt != "" {
+				out = append(out, "## "+txt)
+			}
+			continue
+		case "preformatted", "code":
+			lang, _ := block["language"].(string)
+			// A code block's body must stay verbatim — styling markers inside it
+			// would be read as literal characters by whoever runs the code.
+			body := richPlainRun(block["text"])
+			out = append(out, "```"+lang+"\n"+body+"\n```")
+			continue
+		case "block_quotation", "pull_quotation", "blockquote":
+			txt := strings.TrimSpace(richTextRun(block["text"]))
+			if txt == "" {
+				txt = strings.TrimSpace(richNestedBlocks(block["blocks"]))
+			}
+			if txt == "" {
+				continue
+			}
+			var q []string
+			for _, line := range strings.Split(txt, "\n") {
+				q = append(q, "> "+line)
+			}
+			out = append(out, strings.Join(q, "\n"))
+			continue
+		case "details":
+			title := strings.TrimSpace(richTextRun(block["title"]))
+			if title == "" {
+				title = "Details"
+			}
+			body := strings.TrimSpace(richTextRun(block["text"]))
+			if body == "" {
+				body = strings.TrimSpace(richNestedBlocks(block["blocks"]))
+			}
+			out = append(out, "<details><summary>"+title+"</summary>\n\n"+body+"\n</details>")
+			continue
+		}
+
+		// Tables carry their meaning in the columns, so keep them as Markdown
+		// tables (header row + separator) rather than flattening to one line.
+		if cells, ok := block["cells"].([]interface{}); ok && len(cells) > 0 {
+			var rows [][]string
+			width := 0
+			for _, row := range cells {
+				cols, ok := row.([]interface{})
+				if !ok {
+					continue
+				}
+				var parts []string
+				for _, c := range cols {
+					parts = append(parts, richBlockCellText(c))
+				}
+				if len(parts) > width {
+					width = len(parts)
+				}
+				rows = append(rows, parts)
+			}
+			if width == 0 {
+				continue
+			}
+			var table []string
+			for i, r := range rows {
+				for len(r) < width {
+					r = append(r, "")
+				}
+				table = append(table, "| "+strings.Join(r, " | ")+" |")
+				if i == 0 {
+					table = append(table, "|"+strings.Repeat(" --- |", width))
+				}
+			}
+			out = append(out, strings.Join(table, "\n"))
+			continue
+		}
+
+		if items, ok := block["items"].([]interface{}); ok {
+			ordered, _ := block["is_ordered"].(bool)
+			var list []string
+			for i, it := range items {
+				txt := strings.TrimSpace(richTextRun(it))
+				if txt == "" {
+					// A list item is a block container, not a text node.
+					if m, ok := it.(map[string]interface{}); ok {
+						txt = strings.TrimSpace(richNestedBlocks(m["blocks"]))
+					}
+				}
+				if txt == "" {
+					continue
+				}
+				if ordered {
+					list = append(list, fmt.Sprintf("%d. %s", i+1, txt))
+				} else {
+					list = append(list, "- "+txt)
+				}
+			}
+			if len(list) > 0 {
+				out = append(out, strings.Join(list, "\n"))
+			}
+			continue
+		}
+
+		if txt := strings.TrimSpace(richTextRun(block["text"])); txt != "" {
+			out = append(out, txt)
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
+// richPlainRun extracts a node's text with no Markdown markers, for contexts
+// where markers would be read literally (code blocks).
+func richPlainRun(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []interface{}:
+		var b strings.Builder
+		for _, item := range t {
+			b.WriteString(richPlainRun(item))
+		}
+		return b.String()
+	case map[string]interface{}:
+		if inner, ok := t["text"]; ok {
+			return richPlainRun(inner)
+		}
+	}
+	return ""
+}
+
+// richNestedBlocks renders a nested block list (a quote's body, a list item, a
+// details pane). Telegram nests real blocks there rather than a text node, so
+// without this such a block reads as empty.
+func richNestedBlocks(v interface{}) string {
+	items, ok := v.([]interface{})
+	if !ok || len(items) == 0 {
+		return ""
+	}
+	nested, err := json.Marshal(map[string]interface{}{"blocks": items})
+	if err != nil {
+		return ""
+	}
+	return richMessageText(nested)
 }
