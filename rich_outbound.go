@@ -114,7 +114,15 @@ func markdownToRichBlocks(text string) []richBlock {
 		if joined == "" {
 			return
 		}
-		blocks = append(blocks, richBlock{"type": "paragraph", "text": mdInline(joined)})
+		inline := mdInline(joined)
+		// Inline styling counts as structure. Bold, code and links are what an
+		// agent uses most, and leaving them out meant the common message — prose
+		// with a few **emphases** and `identifiers` — still arrived showing its
+		// raw markers.
+		if _, plain := inline.(string); !plain {
+			structured = true
+		}
+		blocks = append(blocks, richBlock{"type": "paragraph", "text": inline})
 	}
 
 	for i := 0; i < len(lines); i++ {

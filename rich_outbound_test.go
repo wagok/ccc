@@ -160,3 +160,40 @@ func TestSplitMarkdownBlocksShortTextUntouched(t *testing.T) {
 		t.Errorf("short text should pass through unchanged, got %q", got)
 	}
 }
+
+// The common agent message is prose with a few emphases and identifiers and no
+// headings or tables at all. Treating only block-level constructs as structure
+// left exactly those messages showing their raw ** and ` markers.
+func TestInlineOnlyTextStillConverts(t *testing.T) {
+	for _, md := range []string{
+		"Проверил **три величины** — сходятся.",
+		"Смотри `handleHook` в main.go.",
+		"Готово, см. [отчёт](https://x.dev).",
+		"Это ~~не~~ важно.",
+	} {
+		blocks := markdownToRichBlocks(md)
+		if blocks == nil {
+			t.Errorf("inline formatting should convert, got nil for %q", md)
+			continue
+		}
+		if len(blocks) != 1 || blocks[0]["type"] != "paragraph" {
+			t.Errorf("expected one paragraph for %q, got %v", md, blocks)
+		}
+		if _, plain := blocks[0]["text"].(string); plain {
+			t.Errorf("styling was flattened away for %q", md)
+		}
+	}
+}
+
+// Prose with no markers at all gains nothing from a block tree.
+func TestTrulyPlainTextStaysPlain(t *testing.T) {
+	for _, md := range []string{
+		"Готово, проверил.",
+		"Всё сходится: 302 809 помечено, over-reach 0.",
+		"Отправил письмо агенту openarx и жду ответа.",
+	} {
+		if got := markdownToRichBlocks(md); got != nil {
+			t.Errorf("plain prose should stay plain, got blocks for %q: %v", md, got)
+		}
+	}
+}

@@ -419,7 +419,9 @@ func wakeAgent(cfg *Config, agentName, text string) error {
 	tmuxName := tmuxSessionName(extractProjectName(projectName))
 
 	if info.TopicID > 0 {
-		sendMessage(cfg, groupChatID(cfg, sessionGroup(info)), info.TopicID, text)
+		// A letter is agent-authored prose with the same formatting as any other
+		// answer, so it gets the same treatment on the way to the human.
+		sendRichOrPlain(cfg, groupChatID(cfg, sessionGroup(info)), info.TopicID, text)
 	}
 	appendHistory(info.TopicID, HistoryMessage{
 		ID:        nextMessageID(),

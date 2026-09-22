@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.47.3"
+const version = "1.47.5"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -6717,13 +6717,13 @@ func send(message string) error {
 				continue
 			}
 			if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
-				return sendMessage(config, groupChatID(config, sessionGroup(info)), info.TopicID, message)
+				return sendRichOrPlain(config, groupChatID(config, sessionGroup(info)), info.TopicID, message)
 			}
 		}
 	}
 
 	// Fallback to private chat
-	return sendMessage(config, config.ChatID, 0, message)
+	return sendRichOrPlain(config, config.ChatID, 0, message)
 }
 
 // handleRemoteMessage handles messages forwarded from remote clients via --from flag
