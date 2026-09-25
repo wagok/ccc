@@ -29,7 +29,7 @@ import (
 	"github.com/kidandcat/ccc/internal/mail"
 )
 
-const version = "1.47.5"
+const version = "1.48.0"
 
 // Type aliases for backward compatibility during migration
 type SessionInfo = config.SessionInfo
@@ -4545,7 +4545,7 @@ func humanTag(fromID int64, firstName, username string) string {
 // 1. Determines project path from args or cwd
 // 2. Registers session on server via SSH (creates Telegram topic)
 // 3. Creates/attaches tmux session with claude
-func startClientSession(config *Config, args []string) error {
+func startClientSession(config *Config, args []string, group, account string) error {
 	// Check for -c flag
 	continueSession := false
 	filteredArgs := []string{}
@@ -4604,10 +4604,22 @@ func startClientSession(config *Config, args []string) error {
 	name := filepath.Base(projectPath)
 	tmuxName := tmuxSessionName(name)
 
-	// Register session on server (creates Telegram topic)
+	// Register session on server (creates Telegram topic). The group and
+	// account travel with the registration so a remote agent starts in the right
+	// place, instead of landing in the default group to be moved afterwards.
 	fmt.Printf("Registering session on server...\n")
 	cmd := fmt.Sprintf("ccc register-session %s %s",
 		shellQuote(config.HostName), shellQuote(projectPath))
+	if group != "" || account != "" {
+		g := group
+		if g == "" {
+			g = "default" // positional: the server reads account from slot 5
+		}
+		cmd += " " + shellQuote(g)
+		if account != "" {
+			cmd += " " + shellQuote(account)
+		}
+	}
 
 	output, err := runSSH(config.Server, cmd, 10*time.Second)
 	if err != nil {
@@ -8433,9 +8445,11 @@ HOST MANAGEMENT (for remote sessions):
     host del <name>               Remove remote host
     host list                     List configured hosts
 
-ACCOUNTS & GROUPS (server-local agents):
+ACCOUNTS & GROUPS:
     ccc --group <alias> --account <alias>   Create/launch this dir's agent in a
                             Telegram group AND on a subscription account, one command.
+                            Works on the server AND from a client host (msi, dell17):
+                            the client passes both to the server at registration.
                             Both flags optional; unknown group/account = error, no-op.
                             (Old manual way: ccc -> /changegroup <g> -> account
                              set-session <name> <a> -> relaunch.)
@@ -8501,7 +8515,7 @@ func main() {
 		// No args: start/attach tmux session with topic
 		config, _ := loadOrCreateConfig()
 		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
-			if err := startClientSession(config, nil); err != nil {
+			if err := startClientSession(config, nil, "", ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -8537,8 +8551,7 @@ func main() {
 		}
 		config, _ := loadOrCreateConfig()
 		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
-			fmt.Fprintln(os.Stderr, "note: --group/--account apply to server-local agents; ignored in client mode")
-			if err := startClientSession(config, nil); err != nil {
+			if err := startClientSession(config, nil, group, account); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -8553,7 +8566,7 @@ func main() {
 	if os.Args[1] == "-c" {
 		config, _ := loadOrCreateConfig()
 		if config.Mode == "client" && config.Server != "" && config.HostName != "" {
-			if err := startClientSession(config, []string{"-c"}); err != nil {
+			if err := startClientSession(config, []string{"-c"}, "", ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -8695,15 +8708,26 @@ func main() {
 		}
 
 	case "register-session":
-		// Internal command: register a session from a remote client
-		// Usage: ccc register-session <host> <path>
-		// Returns: topic_id on success, error on failure
+		// Internal command: register a session from a remote client.
+		// Usage: ccc register-session <host> <path> [group] [account]
+		// Returns: topic_id on success, error on failure.
+		// group/account are optional and let a remote agent be created directly
+		// in the right group — the server-local path has done this since the
+		// --group flag landed, while a client could only ever land in the
+		// default group and be moved afterwards.
 		if len(os.Args) < 4 {
-			fmt.Fprintf(os.Stderr, "Usage: ccc register-session <host> <path>\n")
+			fmt.Fprintf(os.Stderr, "Usage: ccc register-session <host> <path> [group] [account]\n")
 			os.Exit(1)
 		}
 		host := os.Args[2]
 		path := os.Args[3]
+		group, account := "", ""
+		if len(os.Args) > 4 {
+			group = os.Args[4]
+		}
+		if len(os.Args) > 5 {
+			account = os.Args[5]
+		}
 
 		config, err := loadConfig()
 		if err != nil {
@@ -8714,7 +8738,7 @@ func main() {
 		// Generate session name: host:projectDir
 		fullName := host + ":" + filepath.Base(path)
 
-		topicID, err := getOrCreateTopic(config, fullName, path, host)
+		topicID, err := registerRemoteSession(config, fullName, path, host, group, account)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -9081,7 +9105,7 @@ func main() {
 			config, _ := loadOrCreateConfig()
 			if config.Mode == "client" && config.Server != "" && config.HostName != "" {
 				// Client mode: start session
-				if err := startClientSession(config, filteredArgs); err != nil {
+				if err := startClientSession(config, filteredArgs, "", ""); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 					os.Exit(1)
 				}
@@ -9358,4 +9382,71 @@ func richNestedBlocks(v interface{}) string {
 		return ""
 	}
 	return richMessageText(nested)
+}
+
+// registerRemoteSession registers a session for a remote client, optionally
+// placing it in a group and pinning an account from the start.
+//
+// getOrCreateTopic always works within the default group, which is all a client
+// could ever reach: a remote agent had to be created there and moved afterwards
+// with /changegroup, while a server-local agent has been able to start in the
+// right group since the --group flag landed. This closes that gap so both sides
+// create an agent the same way.
+func registerRemoteSession(config *Config, fullName, path, host, group, account string) (int64, error) {
+	if account != "" {
+		if _, ok := config.Accounts[account]; !ok {
+			return 0, fmt.Errorf("unknown account %q (register it first: ccc account add %s <config-dir>)", account, account)
+		}
+	}
+	groupField, targetChat := "", int64(0)
+	if group != "" && group != "default" {
+		targetChat = groupChatID(config, group)
+		if targetChat == 0 {
+			return 0, fmt.Errorf("unknown group %q (add it to ~/.ccc.json groups first)", group)
+		}
+		groupField = group
+	}
+
+	info, exists := config.Sessions[fullName]
+	if !exists || info == nil {
+		if targetChat == 0 {
+			// No group asked for — the existing default-group path already does
+			// exactly the right thing.
+			return getOrCreateTopic(config, fullName, path, host)
+		}
+		topicID, err := createForumTopic(config, targetChat, fullName)
+		if err != nil {
+			return 0, err
+		}
+		config.Sessions[fullName] = &SessionInfo{
+			TopicID: topicID, Path: path, Host: host, Group: groupField, Account: account,
+		}
+		if err := saveConfig(config); err != nil {
+			return 0, err
+		}
+		fmt.Fprintf(os.Stderr, "📱 Created %q (topic %d, group=%q, account=%q)\n", fullName, topicID, groupField, account)
+		return topicID, nil
+	}
+
+	// Existing session: settle the topic first, then apply whatever was asked
+	// for — the same order the server-local path uses.
+	topicID, err := getOrCreateTopic(config, fullName, path, host)
+	if err != nil {
+		return 0, err
+	}
+	if account != "" && info.Account != account {
+		info.Account = account
+		saveConfig(config)
+		fmt.Fprintf(os.Stderr, "💳 %q → account %q\n", fullName, account)
+	}
+	if group != "" && sessionGroup(info) != groupField {
+		if err := changeGroupCore(config, fullName, group); err != nil {
+			return 0, fmt.Errorf("changegroup: %w", err)
+		}
+		if si := config.Sessions[fullName]; si != nil {
+			topicID = si.TopicID
+		}
+		fmt.Fprintf(os.Stderr, "📦 %q → group %q (topic %d)\n", fullName, group, topicID)
+	}
+	return topicID, nil
 }
